@@ -180,40 +180,6 @@ def _get_availability_events(
 
 
 # ------------------------------------------------------------------
-# Helper: get calendar folder ID
-# ------------------------------------------------------------------
-
-def _get_calendar_folder_id(client: OWAClient) -> str | None:
-    """Get the calendar folder ID via GetFolder."""
-    payload = {
-        '__type': 'GetFolderJsonRequest:#Exchange',
-        'Header': {
-            '__type': 'JsonRequestHeaders:#Exchange',
-            'RequestServerVersion': 'Exchange2013',
-        },
-        'Body': {
-            '__type': 'GetFolderRequest:#Exchange',
-            'FolderShape': {
-                '__type': 'FolderResponseShape:#Exchange',
-                'BaseShape': 'IdOnly',
-            },
-            'FolderIds': [
-                {'__type': 'DistinguishedFolderId:#Exchange', 'Id': 'calendar'}
-            ],
-        },
-    }
-
-    data = client.request("GetFolder", payload)
-    for msg in client.extract_items(data):
-        if "Folders" in msg:
-            for f in msg["Folders"]:
-                fid = f.get("FolderId", {}).get("Id")
-                if fid:
-                    return fid
-    return None
-
-
-# ------------------------------------------------------------------
 # Helper: get own calendar events (from find-free-time.py)
 # ------------------------------------------------------------------
 
@@ -239,7 +205,7 @@ def _get_calendar_events(
                     'BaseShape': 'AllProperties',
                 },
                 'ParentFolderIds': [
-                    {'__type': 'FolderId:#Exchange', 'Id': folder_id}
+                    OWAClient.folder_id_dict(folder_id)
                 ],
                 'Traversal': 'Shallow',
                 'Paging': {
@@ -362,7 +328,7 @@ def find_free_time(
             all_busy = _get_availability_events(client, client.user_email, sd, ed)
         else:
             # Fallback to FindItem (misses recurring event occurrences)
-            folder_id = _get_calendar_folder_id(client)
+            folder_id = client.get_folder_id("calendar")
             if not folder_id:
                 return json.dumps({"error": "Could not find calendar folder. Session may have expired."})
             all_busy = _get_calendar_events(client, folder_id, sd, ed)

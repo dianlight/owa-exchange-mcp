@@ -1,13 +1,12 @@
 """Authentication tool for the Exchange MCP server.
 
-Provides a `login` tool that handles credential setup, browser-based SSO
-login, and 2FA — all from within the MCP session.  Session cookies are
-encrypted at rest with the master password.
+Provides a `login` tool that handles credential setup and 2FA login against
+the server's shared, persistent browser session (see browser_session.py).
 
 The login flow is non-blocking for 2FA:
 1. First call starts browser login in the background and returns immediately
    with instructions to approve 2FA on the mobile app.
-2. Second call checks the background task result and loads cookies on success.
+2. Second call checks the background task result.
 """
 
 import asyncio
@@ -30,30 +29,42 @@ def _get_client(ctx: Context) -> OWAClient:
 
 
 def _session_is_valid(client: OWAClient) -> bool:
-    """Quick check: can we reach the inbox?"""
+    """Quick check: can we reach the inbox?
+
+    Uses FindFolder rather than GetFolder: this OWA deployment's GetFolder
+    action returns a flattened, non-EWS response with no ResponseMessages
+    envelope, so extract_items() on it is always empty regardless of
+    session state.
+    """
     try:
-        client._ensure_loaded()
         payload = {
-            "__type": "GetFolderJsonRequest:#Exchange",
+            "__type": "FindFolderJsonRequest:#Exchange",
             "Header": {
                 "__type": "JsonRequestHeaders:#Exchange",
                 "RequestServerVersion": "Exchange2013",
             },
             "Body": {
-                "__type": "GetFolderRequest:#Exchange",
+                "__type": "FindFolderRequest:#Exchange",
                 "FolderShape": {
                     "__type": "FolderResponseShape:#Exchange",
                     "BaseShape": "IdOnly",
                 },
-                "FolderIds": [
+                "ParentFolderIds": [
                     {
                         "__type": "DistinguishedFolderId:#Exchange",
                         "Id": "inbox",
                     }
                 ],
+                "Traversal": "Shallow",
+                "Paging": {
+                    "__type": "IndexedPageView:#Exchange",
+                    "BasePoint": "Beginning",
+                    "Offset": 0,
+                    "MaxEntriesReturned": 1,
+                },
             },
         }
-        data = client.request("GetFolder", payload)
+        data = client.request("FindFolder", payload)
         items = client.extract_items(data)
         return bool(items)
     except Exception:
@@ -69,9 +80,9 @@ async def login(
 ) -> str:
     """Authenticate to Exchange OWA (handles credential setup and 2FA login).
 
-    Call this tool when the session has expired or before first use.
-    It performs browser-based SSO login with 2FA mobile push approval.
-    Session cookies are encrypted at rest with the master password.
+    Call this tool when the session has expired or before first use. Login
+    runs on the MCP server's shared persistent browser session, with mobile
+    push 2FA approval.
 
     **Two-call 2FA flow**: The first call starts the browser login in the
     background and returns immediately asking you to tell the user to approve
@@ -79,8 +90,8 @@ async def login(
     the user approves — the second call picks up the result.
 
     Args:
-        master_password: Decrypts stored credentials (and cookies), or encrypts
-            new ones if username/password are also provided.
+        master_password: Decrypts stored credentials, or encrypts new ones
+            if username/password are also provided.
         username: Email address. Provide together with password for first-time
             credential setup (replaces `login.py --setup`).
         password: Account password. Required together with username for setup.
@@ -110,48 +121,20 @@ async def login(
         except Exception as e:
             return json.dumps({"success": False, "error": f"Background login failed: {e}"})
 
-        if result.get("success"):
-            from exchange_mcp.auth import encrypt_cookie_file
-
-            cookies_str = result.pop("cookies")
-            try:
-                encrypt_cookie_file(cookies_str, master_password, client.cookie_file)
-                client.load_cookies_from_string(cookies_str)
-                if _session_is_valid(client):
-                    return json.dumps({"success": True, "message": "Logged in and session verified. Cookies encrypted."})
-                else:
-                    return json.dumps({"success": True, "message": "Cookies saved but session verification failed. Try again."})
-            except Exception as e:
-                return json.dumps({"success": True, "message": f"Login succeeded but cookie handling failed: {e}"})
-        else:
-            return json.dumps(result)
+        if result.get("success") and _session_is_valid(client):
+            return json.dumps({"success": True, "message": "Logged in and session verified."})
+        return json.dumps(result)
 
     # ------------------------------------------------------------------
     # No pending task — normal login flow
     # ------------------------------------------------------------------
 
-    # 1. Check if already authenticated (cookies already in memory)
+    # 1. Check if already authenticated
     if _session_is_valid(client):
         return json.dumps({"success": True, "message": "Session is already active."})
 
-    # 2. Verify playwright is available
-    try:
-        import playwright  # noqa: F401
-    except ImportError:
-        return json.dumps({
-            "success": False,
-            "error": "playwright is not installed. Run: pip install playwright && playwright install chromium",
-        })
-
-    # 3. Resolve credentials
-    from exchange_mcp.auth import (
-        encrypt_credentials,
-        decrypt_credentials,
-        CREDS_FILE,
-        decrypt_cookie_file,
-        encrypt_cookie_file,
-        perform_login,
-    )
+    # 2. Resolve credentials
+    from exchange_mcp.auth import encrypt_credentials, decrypt_credentials, CREDS_FILE, perform_login
 
     if username and password:
         # First-time setup: encrypt and save credentials
@@ -173,26 +156,9 @@ async def login(
     # Store user email on the client for availability queries
     client.user_email = username
 
-    # 4. Try restoring session from encrypted cookies on disk
-    cookies_str = decrypt_cookie_file(master_password, client.cookie_file)
-    if cookies_str:
-        try:
-            client.load_cookies_from_string(cookies_str)
-            if _session_is_valid(client):
-                return json.dumps({
-                    "success": True,
-                    "message": "Session restored from encrypted cookies.",
-                })
-        except Exception:
-            pass
-
-    # 5. Start browser login in background (non-blocking for 2FA)
+    # 3. Start browser login in background (non-blocking for 2FA)
     app_ctx.pending_login = asyncio.create_task(
-        perform_login(
-            username=username,
-            password=password,
-            owa_url=client.owa_url,
-        )
+        perform_login(client.browser, username, password)
     )
 
     return json.dumps({

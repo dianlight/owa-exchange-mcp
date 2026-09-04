@@ -79,11 +79,37 @@ Add to your MCP client config. Replace `https://owa.example.com` with your OWA U
 | Variable | Required | Description |
 |---|---|---|
 | `EXCHANGE_OWA_URL` | Yes | Base URL of your OWA instance |
-| `EXCHANGE_COOKIE_FILE` | No | Path to session cookies file (default: `session-cookies.txt`) |
+| `EXCHANGE_MASTER_PASSWORD` | No | If set, the server logs in automatically at startup using stored encrypted credentials (waits through 2FA before serving) |
+| `EXCHANGE_BROWSER_PROFILE_DIR` | No | Path to the persistent browser profile directory (default: `.browser-profile/` next to the package) |
+| `EXCHANGE_HEADLESS` | No | Set to `false`/`0` to run the browser with a visible window (same effect as `--show-browser`) |
+
+## Architecture
+
+Every OWA call — not just login — goes through one persistent, real Chromium
+instance instead of a plain HTTP client, because OWA now requires signals
+(a fresh per-page CSRF canary, browser-like headers, a real TLS/JS
+fingerprint) that a hand-rolled HTTP session can no longer fake. The browser
+launches once at server startup, backed by an on-disk profile so the session
+(and Microsoft's "stay signed in" cookie) survives restarts. Each tool call
+opens its own tab against that same session, does its work, and closes the
+tab. If the browser crashes or the OWA session expires, it recovers
+automatically on the next call.
+
+Pass `--show-browser` (or set `EXCHANGE_HEADLESS=false`) to run with a
+visible window instead of headless, useful for watching the login flow or
+debugging a stuck call.
 
 ## Login
 
-### Option A: Via MCP tool (recommended)
+### Option A: Automatic at startup (recommended)
+
+Set `EXCHANGE_MASTER_PASSWORD` in your MCP client config's `env` block. The
+server decrypts stored credentials and logs in before it starts serving
+tool calls (blocking through any 2FA approval, up to ~90 seconds). Run
+`python3 login.py --setup` once beforehand to store the encrypted
+credentials.
+
+### Option B: Via MCP tool
 
 The `login` tool handles credential setup and authentication within the MCP session — no separate terminal needed.
 
@@ -97,20 +123,18 @@ Subsequent logins (decrypts stored credentials):
 login(master_password="...")
 ```
 
-### Option B: Via CLI
+### Option C: Via CLI
 
 ```bash
 python3 login.py --setup   # First time: save encrypted credentials
 python3 login.py            # Login with 2FA
 ```
 
-Both methods:
-1. Open a headless browser to your OWA URL
-2. Submit credentials
-3. Wait for 2FA approval (up to 90 seconds)
-4. Save encrypted session cookies to `session-cookies.txt`
-
-Credentials and session cookies are encrypted at rest with AES-256 (PBKDF2 key derivation, 480k iterations).
+All methods drive the same persistent browser profile: submit credentials,
+wait for 2FA approval (up to 90 seconds), and leave the session live in that
+profile for the MCP server to pick up. Credentials are encrypted at rest
+with AES-256 (PBKDF2 key derivation, 480k iterations); the browser profile
+itself holds the live session (cookies) the way a real browser would.
 
 ## Tools (30)
 
@@ -178,7 +202,8 @@ Credentials and session cookies are encrypted at rest with AES-256 (PBKDF2 key d
 login.py                  # Browser-based 2FA login (standalone CLI)
 exchange_mcp/
   server.py               # FastMCP server entry point
-  owa_client.py           # OWA HTTP client
+  browser_session.py      # Persistent Chromium context shared by every OWA call
+  owa_client.py           # OWA API client (delegates transport to BrowserSession)
   auth.py                 # Async login logic (shared by MCP tool)
   tools/
     email.py              # Email tools
@@ -197,9 +222,9 @@ Every Exchange / OWA deployment has its own authentication setup — some requir
 
 ## Security
 
-- Credentials and session cookies encrypted with AES-256-Fernet
+- Credentials encrypted at rest with AES-256-Fernet (PBKDF2, 480,000 iterations)
 - Master password never stored
-- PBKDF2 with 480,000 iterations for key derivation
-- Credential and cookie files have `0600` permissions
-- Cookies decrypted into memory only — never written to disk as plaintext (via MCP tool)
-- Session cookies never transmitted except to your OWA server
+- Credential files have `0600` permissions
+- The browser profile directory holds the live session the same way a
+  logged-in browser normally would; treat it like a browser profile
+  (don't share it, exclude it from backups you'd share)

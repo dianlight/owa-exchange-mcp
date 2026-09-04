@@ -24,8 +24,18 @@
           "required": true
         },
         {
-          "name": "EXCHANGE_COOKIE_FILE",
-          "description": "Path to session cookies file (default: session-cookies.txt)",
+          "name": "EXCHANGE_BROWSER_PROFILE_DIR",
+          "description": "Path to the persistent browser profile directory (default: .browser-profile)",
+          "required": false
+        },
+        {
+          "name": "EXCHANGE_MASTER_PASSWORD",
+          "description": "Master password to auto-login at startup using stored encrypted credentials",
+          "required": false
+        },
+        {
+          "name": "EXCHANGE_HEADLESS",
+          "description": "Set to false/0 to run the browser with a visible window (for debugging)",
           "required": false
         }
       ]

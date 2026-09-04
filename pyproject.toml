@@ -11,15 +11,13 @@ classifiers = [
 ]
 dependencies = [
     "mcp>=1.0.0",
-    "requests>=2.28.0",
+    "cryptography",
+    "playwright",
 ]
 
 [project.urls]
 Homepage = "https://github.com/nhype/owa-exchange-mcp"
 Repository = "https://github.com/nhype/owa-exchange-mcp"
-
-[project.optional-dependencies]
-auth = ["cryptography", "playwright"]
 
 [project.scripts]
 exchange-mcp-server = "exchange_mcp.server:main"

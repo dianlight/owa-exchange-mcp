@@ -47,59 +47,32 @@ def _get_change_key(client: OWAClient, item_id: str) -> str | None:
     return None
 
 
-def _extract_email_summary(item: dict) -> dict:
-    """Extract a summary dict from a FindItem result item."""
-    item_type = item.get("__type", "Message:#Exchange")
-    is_meeting = any(
-        t in item_type
-        for t in ("MeetingRequest", "MeetingResponse", "MeetingCancellation")
-    )
+def _extract_conversation_summary(conv: dict) -> dict:
+    """Extract a summary dict from a FindConversation result item (one row per thread).
 
-    # Resolve sender from From -> Organizer -> Sender
-    from_data = item.get("From", {}).get("Mailbox", {})
-    if not from_data:
-        from_data = item.get("Organizer", {}).get("Mailbox", {})
-    if not from_data:
-        from_data = item.get("Sender", {}).get("Mailbox", {})
+    item_ids are scoped to the folder being listed; the API doesn't document
+    whether they're oldest-first or newest-first, so item_id below is a
+    best-effort "most recent message in this thread" pointer (last entry).
+    """
+    item_ids = conv.get("ItemIds") or conv.get("GlobalItemIds") or []
+    unread = conv.get("UnreadCount", 0)
 
-    email = {
-        "subject": item.get("Subject", "(No subject)"),
-        "from": from_data.get("EmailAddress", ""),
-        "from_name": from_data.get("Name", ""),
-        "date": item.get(
-            "DateTimeSent",
-            item.get("DateTimeReceived", item.get("DateTimeCreated", "")),
-        ),
-        "is_read": item.get("IsRead", False),
-        "has_attachments": item.get("HasAttachments", False),
-        "item_id": item.get("ItemId", {}).get("Id", ""),
-        "size": item.get("Size", 0),
-        "is_meeting": is_meeting,
-        "type": "Meeting" if is_meeting else "Email",
-        "preview": item.get("Preview", ""),
-        "has_links": False,
+    return {
+        "conversation_id": conv.get("ConversationId", {}).get("Id", ""),
+        "subject": conv.get("ConversationTopic") or "(No subject)",
+        "senders": conv.get("UniqueSenders", []),
+        "date": conv.get("LastDeliveryTime", ""),
+        "is_read": unread == 0,
+        "unread_count": unread,
+        "message_count": conv.get("MessageCount", 0),
+        "has_attachments": conv.get("HasAttachments", False),
+        "item_id": item_ids[-1].get("Id", "") if item_ids else "",
+        "item_ids": [i.get("Id", "") for i in item_ids],
+        "size": conv.get("Size", 0),
+        "categories": conv.get("Categories", []),
+        "importance": conv.get("Importance", "Normal"),
+        "preview": conv.get("Preview", ""),
     }
-
-    # Basic recipients from DisplayTo/DisplayCc
-    email["to"] = (
-        [t.strip() for t in item.get("DisplayTo", "").split(";") if t.strip()]
-        if item.get("DisplayTo")
-        else []
-    )
-    email["cc"] = (
-        [c.strip() for c in item.get("DisplayCc", "").split(";") if c.strip()]
-        if item.get("DisplayCc")
-        else []
-    )
-
-    if is_meeting:
-        email["location"] = item.get("Location", "")
-        email["start"] = item.get(
-            "Start", item.get("StartWallClock", item.get("ReminderDueBy", ""))
-        )
-        email["end"] = item.get("End", item.get("EndWallClock", ""))
-
-    return email
 
 
 def _get_item_details(client: OWAClient, item_id: str) -> dict:
@@ -281,16 +254,22 @@ def get_emails(
     ids_only: bool = False,
     ctx: Context = None,
 ) -> str:
-    """Get emails from a mailbox folder.
+    """Get emails from a mailbox folder, grouped by conversation/thread.
+
+    Each result row is one conversation (subject, participants, message
+    count, unread count, last delivery time) rather than one row per
+    message. Pass the returned item_id to get_email/include_body to read
+    the latest message in a specific thread.
 
     Args:
         folder: Folder name (Inbox, Sent, Drafts, Deleted, Junk, or custom name).
-        limit: Maximum number of emails to return (default 10, max 50).
-        offset: Number of emails to skip for pagination.
-        include_body: If True, fetch full body for each email (slower).
-        unread_only: If True, only return unread emails.
-        ids_only: If True, return only item IDs and dates (compact, for bulk ops).
-            Max limit raised to 500 in this mode.
+        limit: Maximum number of conversations to return (default 10, max 50).
+        offset: Number of conversations to skip for pagination.
+        include_body: If True, fetch the latest message's full body for each
+            conversation (slower).
+        unread_only: If True, only return conversations with unread messages.
+        ids_only: If True, return only conversation/item IDs and dates
+            (compact, for bulk ops). Max limit raised to 500 in this mode.
     """
     try:
         client = _get_client(ctx)
@@ -305,75 +284,36 @@ def get_emails(
         if not folder_id:
             return json.dumps({"error": f"Folder '{folder}' not found."})
 
-        # Build FindItem payload
-        if ids_only:
-            item_shape = {
-                "__type": "ItemResponseShape:#Exchange",
-                "BaseShape": "IdOnly",
-                "AdditionalProperties": [
-                    {
-                        "__type": "PropertyUri:#Exchange",
-                        "FieldURI": "DateTimeReceived",
-                    },
-                    {
-                        "__type": "PropertyUri:#Exchange",
-                        "FieldURI": "Subject",
-                    },
-                ],
-            }
-        else:
-            item_shape = {
-                "__type": "ItemResponseShape:#Exchange",
-                "BaseShape": "AllProperties",
-            }
+        # FindConversation's server-side paging has been observed to not
+        # always respect MaxEntriesReturned, so we over-fetch and clamp
+        # offset/limit/unread_only client-side instead of trusting it.
+        fetch_count = min(max(limit * 4, 50), 200)
 
         find_body = {
-            "__type": "FindItemRequest:#Exchange",
-            "ItemShape": item_shape,
-            "ParentFolderIds": [
-                {"__type": "FolderId:#Exchange", "Id": folder_id}
-            ],
-            "Traversal": "Shallow",
+            "__type": "FindConversationRequest:#Exchange",
+            "ParentFolderId": {
+                "__type": "TargetFolderId:#Exchange",
+                "BaseFolderId": OWAClient.folder_id_dict(folder_id),
+            },
+            "ConversationShape": {
+                "__type": "ConversationResponseShape:#Exchange",
+                "BaseShape": "IdOnly",
+            },
+            # Required by the modern Outlook backend: without it,
+            # FindConversation rejects the request as "no query string,
+            # traversal not allowed" even though this is a plain listing.
+            "ShapeName": "ReactConversationListView",
+            "ViewFilter": "All",
             "Paging": {
                 "__type": "IndexedPageView:#Exchange",
                 "BasePoint": "Beginning",
-                "Offset": offset,
-                "MaxEntriesReturned": limit,
+                "Offset": 0,
+                "MaxEntriesReturned": fetch_count,
             },
-            "SortOrder": [
-                {
-                    "__type": "SortResults:#Exchange",
-                    "Order": "Descending",
-                    "Path": {
-                        "__type": "PropertyUri:#Exchange",
-                        "FieldURI": "DateTimeReceived",
-                    },
-                }
-            ],
         }
 
-        # Add filter for unread only
-        if unread_only:
-            find_body["Restriction"] = {
-                "__type": "RestrictionType:#Exchange",
-                "Item": {
-                    "__type": "IsEqualTo:#Exchange",
-                    "FieldURIOrConstant": {
-                        "__type": "FieldURIOrConstantType:#Exchange",
-                        "Item": {
-                            "__type": "ConstantValueType:#Exchange",
-                            "Value": "false",
-                        },
-                    },
-                    "Path": {
-                        "__type": "PropertyUri:#Exchange",
-                        "FieldURI": "IsRead",
-                    },
-                },
-            }
-
         payload = {
-            "__type": "FindItemJsonRequest:#Exchange",
+            "__type": "FindConversationJsonRequest:#Exchange",
             "Header": {
                 "__type": "JsonRequestHeaders:#Exchange",
                 "RequestServerVersion": "Exchange2013",
@@ -381,15 +321,19 @@ def get_emails(
             "Body": find_body,
         }
 
-        data = client.request("FindItem", payload)
+        data = client.request("FindConversation", payload)
 
-        items = []
-        for msg in client.extract_items(data):
-            if "RootFolder" in msg and "Items" in msg["RootFolder"]:
-                items = msg["RootFolder"]["Items"]
-                break
+        # FindConversation's response envelope is {"Body": {"Conversations":
+        # [...]}}, not the classic {"Body": {"ResponseMessages": {"Items":
+        # [...]}}} - extract_items() doesn't apply here.
+        conversations = (data.get("Body") or {}).get("Conversations") or []
 
-        if not items:
+        if unread_only:
+            conversations = [c for c in conversations if c.get("UnreadCount", 0) > 0]
+
+        conversations = conversations[offset:offset + limit]
+
+        if not conversations:
             return json.dumps(
                 {"item_ids": [], "count": 0} if ids_only
                 else {"emails": [], "count": 0}
@@ -397,31 +341,28 @@ def get_emails(
 
         if ids_only:
             result = []
-            for item in items:
+            for conv in conversations:
+                item_ids = conv.get("ItemIds") or conv.get("GlobalItemIds") or []
                 result.append({
-                    "item_id": item.get("ItemId", {}).get("Id", ""),
-                    "date": item.get("DateTimeReceived", ""),
-                    "subject": item.get("Subject", ""),
+                    "conversation_id": conv.get("ConversationId", {}).get("Id", ""),
+                    "item_id": item_ids[-1].get("Id", "") if item_ids else "",
+                    "date": conv.get("LastDeliveryTime", ""),
+                    "subject": conv.get("ConversationTopic", ""),
                 })
             return json.dumps({"item_ids": result, "count": len(result)})
 
         emails = []
-        for item in items:
-            email = _extract_email_summary(item)
+        for conv in conversations:
+            email = _extract_conversation_summary(conv)
 
             if include_body and email["item_id"]:
                 details = _get_item_details(client, email["item_id"])
+                email["from"] = details["from"]
+                email["from_name"] = details["from_name"]
                 email["to"] = details["to"]
                 email["cc"] = details["cc"]
                 email["body"] = details["body"]
                 email["has_links"] = details.get("has_links", False)
-
-                if email.get("is_meeting"):
-                    email["location"] = details.get("location", "")
-                    email["start"] = details.get("start", "") or email.get("start", "")
-                    email["end"] = details.get("end", "") or email.get("end", "")
-                    email["required_attendees"] = details.get("required_attendees", [])
-                    email["optional_attendees"] = details.get("optional_attendees", [])
 
             emails.append(email)
 
@@ -777,10 +718,7 @@ def move_email(
                 "ItemIds": items,
                 "ToFolderId": {
                     "__type": "TargetFolderId:#Exchange",
-                    "BaseFolderId": {
-                        "__type": "FolderId:#Exchange",
-                        "Id": folder_id,
-                    },
+                    "BaseFolderId": OWAClient.folder_id_dict(folder_id),
                 },
             },
         }

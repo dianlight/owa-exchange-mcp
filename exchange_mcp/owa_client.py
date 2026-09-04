@@ -1,18 +1,12 @@
-"""Centralized OWA HTTP client for Exchange API.
+"""Centralized OWA client for Exchange API.
 
-Extracts and unifies the duplicated request/cookie/session patterns
-from all standalone scripts into a single reusable client.
+Delegates all transport to a BrowserSession (real Chromium tabs) instead
+of a raw HTTP client, because OWA now requires signals (fresh per-page
+canary, Sec-Fetch headers, real TLS/JS fingerprint) that a hand-rolled
+requests.Session replaying exported cookies can't replicate.
 """
 
-import os
-import requests
-from pathlib import Path
-
-
-class SessionExpiredError(Exception):
-    """Raised when the OWA session has expired (HTTP 401/440 or HTML redirect)."""
-    pass
-
+from exchange_mcp.browser_session import BrowserSession, SessionExpiredError  # noqa: F401
 
 # Map common folder names (English + Russian) to OWA distinguished folder IDs
 DISTINGUISHED_FOLDERS = {
@@ -32,261 +26,82 @@ DISTINGUISHED_FOLDERS = {
     "календарь": "calendar",
 }
 
+# Full set of Exchange distinguished folder IDs, used to tell apart a
+# distinguished ID (own resolved value, or one passed straight through
+# by a caller e.g. "msgfolderroot") from a real opaque FolderId when
+# building request payloads. Not all of these appear in
+# DISTINGUISHED_FOLDERS above - that dict only maps user-facing names
+# (incl. Russian aliases) to the ones get_folder_id() commonly resolves.
+_DISTINGUISHED_IDS = set(DISTINGUISHED_FOLDERS.values()) | {
+    "msgfolderroot", "root", "contacts", "tasks", "notes",
+    "journal", "searchfolders", "publicfoldersroot", "favorites",
+}
+
 
 class OWAClient:
-    """HTTP client for OWA (Outlook Web Access) JSON API.
+    """Public API for OWA JSON calls, folder/name resolution, and attachment downloads.
 
-    Handles cookie loading, CSRF token extraction, request construction,
-    session expiry detection, and automatic cookie reload on first failure.
+    All requests go through a shared BrowserSession: each call opens its own
+    tab, performs the fetch, and closes it. Session expiry triggers one
+    automatic re-login attempt (silent if the persistent profile is still
+    signed in, or using cached credentials) before retrying the call once.
     """
 
-    def __init__(
-        self,
-        cookie_file: str | None = None,
-        owa_url: str | None = None,
-    ):
-        self.cookie_file = Path(
-            cookie_file
-            or os.environ.get("EXCHANGE_COOKIE_FILE", "")
-            or str(Path(__file__).parent.parent / "session-cookies.txt")
-        )
-        self.owa_url = (
-            owa_url
-            or os.environ.get("EXCHANGE_OWA_URL", "")
-        ).rstrip("/")
-        if not self.owa_url:
-            raise ValueError(
-                "OWA URL not configured. Set the EXCHANGE_OWA_URL environment variable."
-            )
-        self._cookies: dict[str, str] = {}
-        self._canary: str = ""
-        self._session = requests.Session()
-        self._loaded = False
+    def __init__(self, browser_session: BrowserSession):
+        self.browser = browser_session
+        self.owa_url = browser_session.owa_url
         self.user_email: str = ""
 
-    # ------------------------------------------------------------------
-    # Cookie / session helpers
-    # ------------------------------------------------------------------
-
-    def _load_cookies(self) -> None:
-        """Read session-cookies.txt (name=value per line) and extract X-OWA-CANARY."""
-        if not self.cookie_file.exists():
-            raise SessionExpiredError(
-                f"Cookie file not found: {self.cookie_file}. Call the login tool first."
-            )
-
-        raw = self.cookie_file.read_text().strip()
-
-        # Detect encrypted cookie file (Fernet tokens start with gAAAAA)
-        if raw.startswith("gAAAAA"):
-            raise SessionExpiredError(
-                "Cookie file is encrypted. Call the login tool to decrypt and restore the session."
-            )
-
-        cookies: dict[str, str] = {}
-        for line in raw.split("\n"):
-            if "=" in line:
-                name, value = line.split("=", 1)
-                cookies[name] = value
-
-        if not cookies:
-            raise SessionExpiredError("Cookie file is empty. Call the login tool first.")
-
-        self._cookies = cookies
-        self._canary = cookies.get("X-OWA-CANARY", "")
-        self._session = requests.Session()
-        self._session.cookies.update(cookies)
-        self._loaded = True
-
-    def _ensure_loaded(self) -> None:
-        """Load cookies on first use."""
-        if not self._loaded:
-            self._load_cookies()
-
-    def reload_cookies(self) -> None:
-        """Force-reload cookies from disk (e.g. after re-login).
-
-        Preserves the existing in-memory session if reloading fails
-        (e.g. cookie file is encrypted or missing).
-        """
-        old_cookies = self._cookies
-        old_canary = self._canary
-        old_session = self._session
-        old_loaded = self._loaded
-        try:
-            self._loaded = False
-            self._load_cookies()
-        except SessionExpiredError:
-            # Restore previous state to avoid corrupting a valid in-memory session
-            self._cookies = old_cookies
-            self._canary = old_canary
-            self._session = old_session
-            self._loaded = old_loaded
-            raise
-
-    def load_cookies_from_string(self, cookies_str: str) -> None:
-        """Load cookies from a decrypted name=value string (one per line).
-
-        Used by the login tool to inject cookies directly into memory
-        without writing plaintext to disk.
-        """
-        cookies: dict[str, str] = {}
-        for line in cookies_str.strip().split("\n"):
-            if "=" in line:
-                name, value = line.split("=", 1)
-                cookies[name] = value
-
-        if not cookies:
-            raise SessionExpiredError("No cookies in provided data.")
-
-        self._cookies = cookies
-        self._canary = cookies.get("X-OWA-CANARY", "")
-        self._session = requests.Session()
-        self._session.cookies.update(cookies)
-        self._loaded = True
+    @property
+    def cookie_file(self):
+        """Backward-compat alias: session state now lives in the browser profile dir, not a cookie file."""
+        return self.browser.profile_dir
 
     # ------------------------------------------------------------------
-    # Core request method
+    # Core request methods
     # ------------------------------------------------------------------
 
     def request(self, action: str, payload: dict, *, timeout: int = 30) -> dict:
-        """POST to /owa/service.svc?action={action}&EP=1&ID=-1&AC=1.
+        """POST to /owa/service.svc?action={action}&EP=1&ID=-1&AC=1 via a browser tab.
 
-        On session expiry (401, 440, or text/html response), reloads cookies
-        once and retries. If that also fails, raises SessionExpiredError.
-
-        Returns the parsed JSON response dict.
+        On session expiry (401, 440, or text/html response), attempts one
+        re-login and retries. If that also fails, raises SessionExpiredError.
         """
-        self._ensure_loaded()
-
         for attempt in range(2):
             try:
-                data = self._do_request(action, payload, timeout=timeout)
-                return data
+                return self._to_json(self.browser.post_json(action, payload, timeout=timeout))
             except SessionExpiredError:
                 if attempt == 0:
-                    # Try reloading cookies (user may have re-logged in)
-                    try:
-                        self.reload_cookies()
-                    except SessionExpiredError:
-                        pass  # Keep in-memory state, retry anyway
+                    self.browser.ensure_logged_in()
                 else:
                     raise
 
-        # Should not reach here, but just in case
-        raise SessionExpiredError("Session expired. Run login.py to login again.")
+        raise SessionExpiredError("Session expired. Call the login tool to log in again.")
 
-    def _do_request(self, action: str, payload: dict, *, timeout: int = 30) -> dict:
-        """Execute a single OWA API request (no retry)."""
-        url = f"{self.owa_url}/owa/service.svc?action={action}&EP=1&ID=-1&AC=1"
-
-        # Prefer our explicitly-tracked canary (updated on every response)
-        # over the session cookie jar, which can hold stale domain-less entries.
-        canary = self._canary or self._session.cookies.get("X-OWA-CANARY")
-
-        headers = {
-            "Content-Type": "application/json; charset=utf-8",
-            "Action": action,
-            "X-OWA-CANARY": canary,
-            "X-Requested-With": "XMLHttpRequest",
-        }
-
-        try:
-            resp = self._session.post(url, json=payload, headers=headers, timeout=timeout)
-        except requests.exceptions.RequestException as exc:
-            raise SessionExpiredError(f"Request failed: {exc}") from exc
-
-        # Keep cached canary in sync if OWA rotated it
-        new_canary = resp.cookies.get("X-OWA-CANARY")
-        if new_canary:
-            self._canary = new_canary
-            self._session.cookies.set("X-OWA-CANARY", new_canary)
-
-        # Detect session expiry
-        if resp.status_code in (401, 440):
-            raise SessionExpiredError("Session expired (HTTP {}).".format(resp.status_code))
-
-        if "text/html" in resp.headers.get("Content-Type", ""):
-            # Extract a snippet from HTML for diagnostics (login redirects vs API errors)
-            body_snippet = resp.text[:300] if resp.text else ""
-            raise SessionExpiredError(
-                f"Session expired or invalid action (HTML response, HTTP {resp.status_code}). "
-                f"Snippet: {body_snippet}"
-            )
-
-        # Parse JSON
-        try:
-            return resp.json()
-        except (ValueError, requests.exceptions.JSONDecodeError) as exc:
-            raise SessionExpiredError(
-                f"Unexpected response (HTTP {resp.status_code}). "
-                "Session may have expired."
-            ) from exc
-
-    def request_header_payload(
-        self, action: str, payload: dict, *, timeout: int = 30
-    ) -> dict:
-        """POST with payload in x-owa-urlpostdata header (empty body).
+    def request_header_payload(self, action: str, payload: dict, *, timeout: int = 30) -> dict:
+        """POST with payload in the X-OWA-UrlPostData header (empty body).
 
         Some OWA actions (CreateFolder, DeleteFolder, RenameFolder, etc.)
-        require the JSON payload to be sent as a URL-encoded string in the
-        ``x-owa-urlpostdata`` header instead of the POST body.  This method
-        handles that pattern with the same retry logic as ``request()``.
+        require the JSON payload to be sent as a URL-encoded string in that
+        header instead of the POST body. Same retry logic as ``request()``.
         """
-        self._ensure_loaded()
-
         for attempt in range(2):
             try:
-                return self._do_request_header_payload(
-                    action, payload, timeout=timeout
-                )
+                return self._to_json(self.browser.post_header_payload(action, payload, timeout=timeout))
             except SessionExpiredError:
                 if attempt == 0:
-                    try:
-                        self.reload_cookies()
-                    except SessionExpiredError:
-                        pass
+                    self.browser.ensure_logged_in()
                 else:
                     raise
 
-        raise SessionExpiredError("Session expired. Run login.py to login again.")
+        raise SessionExpiredError("Session expired. Call the login tool to log in again.")
 
-    def _do_request_header_payload(
-        self, action: str, payload: dict, *, timeout: int = 30
-    ) -> dict:
-        """Execute a single OWA API request with payload in header."""
-        import json as _json
-        from urllib.parse import quote
-
-        url = f"{self.owa_url}/owa/service.svc?action={action}&EP=1&ID=-1&AC=1"
-        canary = self._canary or self._session.cookies.get("X-OWA-CANARY")
-
-        url_post_data = quote(_json.dumps(payload, separators=(",", ":")))
-
-        headers = {
-            "Content-Type": "application/json; charset=UTF-8",
-            "Action": action,
-            "X-OWA-CANARY": canary,
-            "X-OWA-UrlPostData": url_post_data,
-            "X-Requested-With": "XMLHttpRequest",
-        }
-
-        try:
-            resp = self._session.post(url, headers=headers, timeout=timeout)
-        except requests.exceptions.RequestException as exc:
-            raise SessionExpiredError(f"Request failed: {exc}") from exc
-
-        new_canary = resp.cookies.get("X-OWA-CANARY")
-        if new_canary:
-            self._canary = new_canary
-            self._session.cookies.set("X-OWA-CANARY", new_canary)
-
+    @staticmethod
+    def _to_json(resp) -> dict:
         if resp.status_code in (401, 440):
-            raise SessionExpiredError(
-                "Session expired (HTTP {}).".format(resp.status_code)
-            )
+            raise SessionExpiredError(f"Session expired (HTTP {resp.status_code}).")
 
-        if "text/html" in resp.headers.get("Content-Type", ""):
+        if "text/html" in resp.headers.get("content-type", ""):
             body_snippet = resp.text[:300] if resp.text else ""
             raise SessionExpiredError(
                 f"Session expired or invalid action (HTML response, HTTP {resp.status_code}). "
@@ -295,54 +110,32 @@ class OWAClient:
 
         try:
             return resp.json()
-        except (ValueError, requests.exceptions.JSONDecodeError) as exc:
+        except (ValueError, TypeError) as exc:
             raise SessionExpiredError(
-                f"Unexpected response (HTTP {resp.status_code}). "
-                "Session may have expired."
+                f"Unexpected response (HTTP {resp.status_code}). Session may have expired."
             ) from exc
 
     # ------------------------------------------------------------------
     # File download (attachments)
     # ------------------------------------------------------------------
 
-    def download_file(
-        self, attachment_id: str, *, timeout: int = 60
-    ) -> tuple[bytes, str, str]:
+    def download_file(self, attachment_id: str, *, timeout: int = 60) -> tuple[bytes, str, str]:
         """Download a file attachment by its AttachmentId.
-
-        Uses the OWA GetFileAttachment endpoint (direct GET).
 
         Returns:
             (content_bytes, filename, content_type)
         """
-        self._ensure_loaded()
-
-        from urllib.parse import quote
-
-        canary = self._canary or self._session.cookies.get("X-OWA-CANARY")
-        url = (
-            f"{self.owa_url}/owa/service.svc/s/GetFileAttachment"
-            f"?id={quote(attachment_id)}&X-OWA-CANARY={quote(canary)}"
-        )
-
-        try:
-            resp = self._session.get(url, timeout=timeout)
-        except requests.exceptions.RequestException as exc:
-            raise SessionExpiredError(f"Download failed: {exc}") from exc
+        resp = self.browser.download_attachment(attachment_id, timeout=timeout)
 
         if resp.status_code in (401, 440):
-            raise SessionExpiredError(
-                f"Session expired (HTTP {resp.status_code})."
-            )
+            raise SessionExpiredError(f"Session expired (HTTP {resp.status_code}).")
 
-        if "text/html" in resp.headers.get("Content-Type", ""):
-            raise SessionExpiredError(
-                "Session expired (HTML response on attachment download)."
-            )
+        if "text/html" in resp.headers.get("content-type", ""):
+            raise SessionExpiredError("Session expired (HTML response on attachment download).")
 
         # Parse filename from Content-Disposition header
         filename = "attachment"
-        cd = resp.headers.get("Content-Disposition", "")
+        cd = resp.headers.get("content-disposition", "")
         if cd:
             import re as _re
             from urllib.parse import unquote
@@ -356,7 +149,7 @@ class OWAClient:
                 if match:
                     filename = unquote(match.group(1).strip())
 
-        content_type = resp.headers.get("Content-Type", "application/octet-stream")
+        content_type = resp.headers.get("content-type", "application/octet-stream")
 
         return resp.content, filename, content_type
 
@@ -379,46 +172,43 @@ class OWAClient:
     # Folder helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def folder_id_dict(folder_id: str) -> dict:
+        """Build the typed folder-reference dict for a folder_id.
+
+        get_folder_id() returns the bare distinguished ID (e.g. "inbox")
+        for distinguished folders instead of a resolved opaque ID, so
+        callers must use this instead of hardcoding FolderId - a
+        distinguished name needs the DistinguishedFolderId wrapper.
+        """
+        if folder_id.lower() in _DISTINGUISHED_IDS:
+            return {"__type": "DistinguishedFolderId:#Exchange", "Id": folder_id}
+        return {"__type": "FolderId:#Exchange", "Id": folder_id}
+
     def get_folder_id(self, folder_name: str) -> str | None:
         """Resolve a folder name to its Exchange folder ID.
 
         Supports distinguished folder names (inbox, sentitems, drafts, etc.)
         in both English and Russian, plus custom folder names looked up
         via FindFolder on msgfolderroot.
+
+        Distinguished folders are normally returned as-is (e.g. "inbox")
+        without a GetFolder round-trip: on the classic canary-cookie OWA
+        backend, GetFolder returns a flattened {"Folders": [...]} shape with
+        no FolderId at all, but DistinguishedFolderId is already a valid
+        identifier everywhere a resolved FolderId would be used - see
+        folder_id_dict(). On the modern OAuth/Bearer backend ("new Outlook"),
+        GetFolder works correctly and FindConversation there requires a real
+        opaque FolderId rather than the bare distinguished name, so we
+        resolve it properly in that mode instead of short-circuiting.
         """
         folder_lower = folder_name.lower()
 
-        # Check distinguished folders first
         distinguished_id = DISTINGUISHED_FOLDERS.get(folder_lower)
         if distinguished_id:
-            payload = {
-                "__type": "GetFolderJsonRequest:#Exchange",
-                "Header": {
-                    "__type": "JsonRequestHeaders:#Exchange",
-                    "RequestServerVersion": "Exchange2013",
-                },
-                "Body": {
-                    "__type": "GetFolderRequest:#Exchange",
-                    "FolderShape": {
-                        "__type": "FolderResponseShape:#Exchange",
-                        "BaseShape": "IdOnly",
-                    },
-                    "FolderIds": [
-                        {
-                            "__type": "DistinguishedFolderId:#Exchange",
-                            "Id": distinguished_id,
-                        }
-                    ],
-                },
-            }
-
-            data = self.request("GetFolder", payload)
-            for msg in self.extract_items(data):
-                if "Folders" in msg:
-                    for f in msg["Folders"]:
-                        fid = f.get("FolderId", {}).get("Id")
-                        if fid:
-                            return fid
+            if self.browser.auth_mode != "bearer":
+                return distinguished_id
+            return self._resolve_distinguished_folder_id(distinguished_id) or distinguished_id
 
         # Fall back to searching custom folders by name
         payload = {
@@ -456,6 +246,37 @@ class OWAClient:
                     if f.get("DisplayName", "").lower() == folder_lower:
                         return f.get("FolderId", {}).get("Id")
 
+        return None
+
+    def _resolve_distinguished_folder_id(self, distinguished_id: str) -> str | None:
+        """Resolve a distinguished folder name to its real opaque FolderId via GetFolder.
+
+        Only meaningful on backends where GetFolder returns the classic
+        Items/FolderId envelope (the modern OAuth/Bearer backend) - see
+        get_folder_id().
+        """
+        payload = {
+            "__type": "GetFolderJsonRequest:#Exchange",
+            "Header": {
+                "__type": "JsonRequestHeaders:#Exchange",
+                "RequestServerVersion": "Exchange2013",
+            },
+            "Body": {
+                "__type": "GetFolderRequest:#Exchange",
+                "FolderShape": {
+                    "__type": "FolderResponseShape:#Exchange",
+                    "BaseShape": "IdOnly",
+                },
+                "FolderIds": [
+                    {"__type": "DistinguishedFolderId:#Exchange", "Id": distinguished_id}
+                ],
+            },
+        }
+        data = self.request("GetFolder", payload)
+        for msg in self.extract_items(data):
+            folders = msg.get("Folders", [])
+            if folders:
+                return folders[0].get("FolderId", {}).get("Id")
         return None
 
     # ------------------------------------------------------------------

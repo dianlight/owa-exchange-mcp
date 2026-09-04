@@ -10,6 +10,7 @@ import time
 import base64
 import getpass
 from pathlib import Path
+from urllib.parse import urlparse
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -32,10 +33,10 @@ def encrypt_credentials(username: str, password: str, master_password: str):
     salt = os.urandom(16)
     key = get_key(master_password, salt)
     f = Fernet(key)
-    
+
     data = f"{username}:{password}".encode()
     encrypted = f.encrypt(data)
-    
+
     SALT_FILE.write_bytes(salt)
     CREDS_FILE.write_bytes(encrypted)
     os.chmod(SALT_FILE, 0o600)
@@ -46,12 +47,12 @@ def decrypt_credentials(master_password: str) -> tuple:
     """Decrypt and return credentials"""
     if not CREDS_FILE.exists() or not SALT_FILE.exists():
         return None, None
-    
+
     salt = SALT_FILE.read_bytes()
     encrypted = CREDS_FILE.read_bytes()
     key = get_key(master_password, salt)
     f = Fernet(key)
-    
+
     try:
         data = f.decrypt(encrypted).decode()
         username, password = data.split(":", 1)
@@ -67,76 +68,127 @@ def setup_credentials():
     password = getpass.getpass("Enter your password: ")
     master = getpass.getpass("Create a master password to encrypt credentials: ")
     master2 = getpass.getpass("Confirm master password: ")
-    
+
     if master != master2:
         print("Passwords don't match!")
         return False
-    
+
     encrypt_credentials(username, password, master)
     return True
 
+def _default_profile_dir() -> Path:
+    return Path(
+        os.environ.get("EXCHANGE_BROWSER_PROFILE_DIR")
+        or (Path(__file__).parent / ".browser-profile")
+    )
+
+
 def login(username: str, password: str, master_password: str = None):
-    """Login to OWA with 2FA (mobile push)"""
+    """Login to OWA with 2FA (mobile push).
+
+    Runs against the same persistent Chromium profile the MCP server uses
+    (EXCHANGE_BROWSER_PROFILE_DIR, or .browser-profile/ by default), so a
+    manual `python3 login.py` pre-warms the exact session the server will
+    pick up on its next start.
+    """
     from playwright.sync_api import sync_playwright
 
     owa_url = os.environ.get("EXCHANGE_OWA_URL", "")
     if not owa_url:
         print("ERROR: EXCHANGE_OWA_URL environment variable is not set.")
         return False
-    owa_host = owa_url.replace("https://", "").replace("http://", "").rstrip("/")
+    owa_host = urlparse(owa_url).netloc
 
     print(f"Logging in as {username}...", flush=True)
 
+    profile_dir = _default_profile_dir()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
-        page = context.new_page()
+        context = p.chromium.launch_persistent_context(str(profile_dir), headless=True)
+        pages = context.pages
+        page = pages[0] if pages else context.new_page()
 
-        # Step 1: Navigate to OWA (redirects to SSO)
+        # Step 1: Navigate to OWA (redirects to Microsoft Entra ID sign-in)
         page.goto(f"{owa_url}/owa/", wait_until="networkidle")
-        
-        # Step 2: Fill credentials and submit
-        page.fill('input[name="username"]', username)
-        page.fill('input[name="password"]', password)
-        # Try clicking Continue button (may be in English or Russian)
+
+        # Step 2a: Email step (loginfmt), then advance to the password step
+        page.fill('input[name="loginfmt"]', username)
         try:
-            page.locator('button:has-text("Continue"), button:has-text("Продолжить")').first.click(timeout=5000)
+            page.click('#idSIButton9', timeout=5000)
         except:
-            page.press('input[name="password"]', 'Enter')
+            page.press('input[name="loginfmt"]', 'Enter')
         page.wait_for_load_state("networkidle")
-        
-        print("Credentials submitted, selecting 2FA method...", flush=True)
 
-        # Step 3: Click 2FA authenticator button (first available on the page)
+        # Step 2b: Password step (passwd field only becomes fillable here)
+        page.wait_for_selector('input[name="passwd"]', state="visible", timeout=15000)
+        page.fill('input[name="passwd"]', password)
         try:
-            auth_btn = page.locator('button').first
-            auth_btn.click(timeout=10000)
-            page.wait_for_load_state("networkidle")
-        except Exception as e:
-            print(f"Could not find 2FA button: {e}", flush=True)
+            page.click('#idSIButton9', timeout=5000)
+        except:
+            page.press('input[name="passwd"]', 'Enter')
+        page.wait_for_load_state("networkidle")
 
-        # Step 4: Wait for mobile approval (polls for OWA redirect)
-        print("Waiting for mobile approval... Check your 2FA app!", flush=True)
+        print("Credentials submitted, waiting for sign-in to complete...", flush=True)
+
+        # Step 3: Wait for mobile MFA approval if prompted, and for OWA redirect.
+        # Along the way, accept the "Stay signed in?" (KMSI) interstitial if it
+        # appears - it reuses the same #idSIButton9 id as the previous steps.
+        print("Waiting for sign-in to finish... Check your 2FA app if prompted!", flush=True)
         success = False
+        kmsi_handled = False
         last_url = ""
         for i in range(90):  # Wait up to 90 seconds
             time.sleep(1)
-            
+
             try:
                 url = page.url
-                
+
                 # Print URL when it changes
                 if url != last_url:
                     print(f"  URL changed: {url[:80]}...", flush=True)
                     last_url = url
-                
-                # Check if we're at OWA (not at SSO pages)
-                if owa_host in url and "ofam" not in url and "adfs" not in url:
-                    print("  OWA detected! Waiting for page to load...", flush=True)
-                    page.wait_for_load_state("load", timeout=15000)
+
+                # Check if we're at OWA (not at SSO pages). Compare the actual
+                # page host, not a substring match on the full URL: SSO login
+                # pages often embed the OWA host in a redirect_uri query param,
+                # which would falsely match before authentication completes.
+                if urlparse(url).netloc == owa_host and "ofam" not in url and "adfs" not in url:
+                    print("  OWA detected! Waiting for OWA session to initialize...", flush=True)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=15000)
+                    except Exception:
+                        pass
+                    # The document 'load' event only means the SPA shell
+                    # rendered - OWA's own session cookies (X-OWA-CANARY
+                    # included) are set by background requests fired after
+                    # that. Wait for the canary to actually show up, or
+                    # every saved session will be SSO-only and every OWA
+                    # API call will 401 despite a "successful" login.
+                    for _ in range(15):
+                        if any(c["name"] == "X-OWA-CANARY" for c in context.cookies()):
+                            break
+                        time.sleep(1)
+                    else:
+                        print("  Warning: X-OWA-CANARY cookie not seen after 15s - session may be incomplete.", flush=True)
+                        # DIAGNOSTIC: find out how (or whether) this OWA
+                        # deployment exposes the canary token, since it's
+                        # not showing up as a cookie. Safe to print - the
+                        # canary is a CSRF token meant to be client-readable,
+                        # not a secret like a session cookie.
+                        try:
+                            html = page.content()
+                            idx = html.lower().find("canary")
+                            if idx >= 0:
+                                snippet = html[max(0, idx - 80):idx + 150]
+                                print(f"  [diag] found 'canary' in page HTML near: ...{snippet}...", flush=True)
+                            else:
+                                print("  [diag] 'canary' not found anywhere in page HTML.", flush=True)
+                        except Exception as diag_e:
+                            print(f"  [diag] HTML scan failed: {diag_e}", flush=True)
                     success = True
                     break
-                
+
                 # Also check if page has OWA elements
                 try:
                     if page.locator('[aria-label*="Outlook"], [aria-label*="Почта"]').count() > 0:
@@ -145,10 +197,21 @@ def login(username: str, password: str, master_password: str = None):
                         break
                 except:
                     pass
-                
+
+                # Accept "Stay signed in?" once, if it shows up
+                if not kmsi_handled:
+                    try:
+                        if page.locator('input[name="passwd"]').count() == 0 and page.locator('#idSIButton9').is_visible(timeout=1000):
+                            print("  Accepting 'Stay signed in?' prompt...", flush=True)
+                            page.click('#idSIButton9', timeout=5000)
+                            kmsi_handled = True
+                            page.wait_for_load_state("networkidle", timeout=15000)
+                    except:
+                        pass
+
                 if i > 0 and i % 15 == 0:
                     print(f"  Still waiting... ({i}s)", flush=True)
-                    
+
             except Exception as e:
                 err_str = str(e).lower()
                 if "navigation" in err_str or "destroyed" in err_str or "target closed" in err_str:
@@ -156,54 +219,37 @@ def login(username: str, password: str, master_password: str = None):
                     try:
                         page.wait_for_load_state("load", timeout=15000)
                         url = page.url
-                        if owa_host in url and "ofam" not in url:
+                        if urlparse(url).netloc == owa_host and "ofam" not in url:
                             success = True
                             break
                     except:
                         pass
                 else:
                     print(f"  Error: {e}", flush=True)
-        
+
         if success:
             print("\n*** SUCCESS! Logged into OWA! ***", flush=True)
-
-            # Save cookies (encrypted if master password available)
-            cookies = context.cookies()
-            cookie_file = Path(__file__).parent / "session-cookies.txt"
-            cookies_str = "\n".join(
-                f"{c['name']}={c['value']}" for c in cookies
-            )
-            if master_password and SALT_FILE.exists():
-                salt = SALT_FILE.read_bytes()
-                key = get_key(master_password, salt)
-                f = Fernet(key)
-                cookie_file.write_bytes(f.encrypt(cookies_str.encode()))
-                os.chmod(cookie_file, 0o600)
-                print(f"Encrypted cookies saved to {cookie_file}", flush=True)
-            else:
-                with open(cookie_file, 'w') as f:
-                    f.write(cookies_str + "\n")
-                print(f"Cookies saved to {cookie_file}", flush=True)
+            print(f"Session saved in persistent browser profile: {profile_dir}", flush=True)
         else:
             print("Login failed - no approval received within 60 seconds", flush=True)
-        
-        browser.close()
+
+        context.close()
         return success
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--setup":
         setup_credentials()
         return
-    
+
     if not CREDS_FILE.exists():
         print("No credentials found. Run with --setup first.")
         sys.exit(1)
-    
-    master = getpass.getpass("Master password: ")
+
+    master = os.environ.get("EXCHANGE_MASTER_PASSWORD") or getpass.getpass("Master password: ")
     username, password = decrypt_credentials(master)
     if not username:
         sys.exit(1)
-    
+
     login(username, password, master_password=master)
 
 if __name__ == "__main__":

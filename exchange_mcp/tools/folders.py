@@ -11,12 +11,6 @@ from exchange_mcp.server import mcp, AppContext
 from exchange_mcp.owa_client import OWAClient
 
 
-_DISTINGUISHED_NAMES = {
-    "msgfolderroot", "inbox", "sentitems", "drafts", "deleteditems",
-    "junkemail", "outbox", "calendar", "contacts", "tasks", "notes",
-    "journal", "searchfolders",
-}
-
 _HEADER_TZ = {
     "__type": "JsonRequestHeaders:#Exchange",
     "RequestServerVersion": "Exchange2013",
@@ -36,19 +30,14 @@ def _get_client(ctx: Context) -> OWAClient:
     return app_ctx.client
 
 
-def _folder_id_dict(folder_id: str) -> dict:
-    """Build a typed FolderId or DistinguishedFolderId dict."""
-    if folder_id.lower() in _DISTINGUISHED_NAMES:
-        return {"__type": "DistinguishedFolderId:#Exchange", "Id": folder_id}
-    return {"__type": "FolderId:#Exchange", "Id": folder_id}
-
-
 @mcp.tool()
 def check_session(ctx: Context = None) -> str:
     """Check whether the current OWA session is authenticated.
 
-    Makes a lightweight GetFolder call on the inbox. Returns session
-    status, the mailbox display name, and cookie file path.
+    Makes a lightweight FindFolder call on the inbox (not GetFolder: this
+    OWA deployment's GetFolder action returns a flattened, non-EWS
+    response with no folder metadata at all). Returns session status,
+    the mailbox display name, and cookie file path.
 
     Returns:
         JSON object with authenticated (bool), mailbox name, and details.
@@ -56,25 +45,32 @@ def check_session(ctx: Context = None) -> str:
     client = _get_client(ctx)
 
     payload = {
-        "__type": "GetFolderJsonRequest:#Exchange",
+        "__type": "FindFolderJsonRequest:#Exchange",
         "Header": {
             "__type": "JsonRequestHeaders:#Exchange",
             "RequestServerVersion": "Exchange2013",
         },
         "Body": {
-            "__type": "GetFolderRequest:#Exchange",
+            "__type": "FindFolderRequest:#Exchange",
             "FolderShape": {
                 "__type": "FolderResponseShape:#Exchange",
                 "BaseShape": "Default",
             },
-            "FolderIds": [
+            "ParentFolderIds": [
                 {"__type": "DistinguishedFolderId:#Exchange", "Id": "inbox"}
             ],
+            "Traversal": "Shallow",
+            "Paging": {
+                "__type": "IndexedPageView:#Exchange",
+                "BasePoint": "Beginning",
+                "Offset": 0,
+                "MaxEntriesReturned": 1,
+            },
         },
     }
 
     try:
-        data = client.request("GetFolder", payload)
+        data = client.request("FindFolder", payload)
     except Exception as e:
         return json.dumps({
             "authenticated": False,
@@ -83,12 +79,12 @@ def check_session(ctx: Context = None) -> str:
         })
 
     for msg in client.extract_items(data):
-        if "Folders" in msg:
-            folder = msg["Folders"][0]
+        parent_folder = msg.get("RootFolder", {}).get("ParentFolder")
+        if parent_folder:
             return json.dumps({
                 "authenticated": True,
-                "mailbox": folder.get("DisplayName", ""),
-                "unread": folder.get("UnreadCount", 0),
+                "mailbox": parent_folder.get("DisplayName", ""),
+                "unread": parent_folder.get("UnreadCount", 0),
                 "cookie_file": str(client.cookie_file),
             })
 
@@ -124,7 +120,7 @@ def get_folders(
 
     # Determine parent folder id type
     # Distinguished folder names are short lowercase strings
-    parent_folder = _folder_id_dict(parent_folder_id)
+    parent_folder = OWAClient.folder_id_dict(parent_folder_id)
 
     payload = {
         "__type": "FindFolderJsonRequest:#Exchange",
@@ -195,7 +191,7 @@ def create_folder(
             "__type": "CreateFolderRequest:#Exchange",
             "ParentFolderId": {
                 "__type": "TargetFolderId:#Exchange",
-                "BaseFolderId": _folder_id_dict(parent_folder_id),
+                "BaseFolderId": OWAClient.folder_id_dict(parent_folder_id),
             },
             "Folders": [
                 {
@@ -409,7 +405,7 @@ def move_folder(
             ],
             "ToFolderId": {
                 "__type": "TargetFolderId:#Exchange",
-                "BaseFolderId": _folder_id_dict(target_parent_folder_id),
+                "BaseFolderId": OWAClient.folder_id_dict(target_parent_folder_id),
             },
         },
     }

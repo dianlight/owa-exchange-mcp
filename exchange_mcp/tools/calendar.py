@@ -430,125 +430,128 @@ def get_calendar_events(
     except ValueError as e:
         return json.dumps({"error": f"Invalid date format: {e}"})
 
-    # --- Expanded mode: uses GetUserAvailability for accurate recurring counts ---
-    if expand_recurring:
+    try:
+        # --- Expanded mode: uses GetUserAvailability for accurate recurring counts ---
+        if expand_recurring:
+            expanded = _get_expanded_events(
+                client, start_dt.date(), (end_dt + timedelta(days=1)).date()
+            )
+            events = []
+            for ev in expanded:
+                events.append({
+                    "subject": ev['subject'],
+                    "start": ev['start'],
+                    "end": ev['end'],
+                    "location": ev.get('location', ''),
+                    "busy_type": ev.get('busy_type', ''),
+                    "is_meeting": ev.get('is_meeting', False),
+                    "is_recurring": ev.get('is_recurring', False),
+                })
+            return json.dumps(events, ensure_ascii=False)
+
+        # --- Default mode ---
+        # Step 1: Get all events (including recurring) via GetUserAvailability
         expanded = _get_expanded_events(
             client, start_dt.date(), (end_dt + timedelta(days=1)).date()
         )
+
+        # Step 2: Get events with item_ids via FindItem + CalendarView.
+        # CalendarView restricts results to the date range and expands recurring
+        # events into individual occurrences (each with its own ItemId).
+        folder_id = client.get_folder_id("calendar")
+        finditem_by_key: dict[str, dict] = {}  # "subject|start" -> item
+        if folder_id:
+            cv_start = start_dt.strftime("%Y-%m-%dT00:00:00")
+            cv_end = (end_dt + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
+
+            payload = {
+                "__type": "FindItemJsonRequest:#Exchange",
+                "Header": {
+                    "__type": "JsonRequestHeaders:#Exchange",
+                    "RequestServerVersion": "Exchange2013",
+                },
+                "Body": {
+                    "__type": "FindItemRequest:#Exchange",
+                    "ItemShape": {
+                        "__type": "ItemResponseShape:#Exchange",
+                        "BaseShape": "AllProperties",
+                    },
+                    "ParentFolderIds": [
+                        OWAClient.folder_id_dict(folder_id)
+                    ],
+                    "Traversal": "Shallow",
+                    "CalendarView": {
+                        "__type": "CalendarView:#Exchange",
+                        "StartDate": cv_start,
+                        "EndDate": cv_end,
+                    },
+                },
+            }
+
+            data = client.request("FindItem", payload)
+
+            all_items = []
+            for msg in client.extract_items(data):
+                if "RootFolder" in msg:
+                    all_items = msg["RootFolder"].get("Items", [])
+                    break
+
+            # Index FindItem results by subject + normalized local start time.
+            # FindItem returns UTC timestamps (e.g. "2026-02-17T06:30:00Z"),
+            # while GetUserAvailability returns Moscow local time ("2026-02-17T09:30:00").
+            # Normalize FindItem timestamps to local time for matching.
+            for item in all_items:
+                subject = item.get("Subject", "")
+                start = item.get("Start", "")
+                local_start = _utc_to_local_str(start)
+                key = f"{subject}|{local_start}"
+                finditem_by_key[key] = item
+
+        # Step 3: Merge — use expanded list as the authoritative event list,
+        # enrich with FindItem data (item_id, details) when available
         events = []
         for ev in expanded:
-            events.append({
-                "subject": ev['subject'],
-                "start": ev['start'],
-                "end": ev['end'],
-                "location": ev.get('location', ''),
-                "busy_type": ev.get('busy_type', ''),
-                "is_meeting": ev.get('is_meeting', False),
-                "is_recurring": ev.get('is_recurring', False),
-            })
+            subject = ev.get("subject", "(No subject)")
+            start = ev.get("start", "")
+            end = ev.get("end", "")
+            is_recurring = ev.get("is_recurring", False)
+
+            # Match expanded event (local time) with FindItem result (normalized to local)
+            fi_item = finditem_by_key.get(f"{subject}|{start}")
+
+            item_id = fi_item.get("ItemId", {}).get("Id", "") if fi_item else ""
+
+            event = {
+                "subject": subject,
+                "start": fi_item.get("Start", start) if fi_item else start,
+                "end": fi_item.get("End", end) if fi_item else end,
+                "location": ev.get("location", ""),
+                "is_all_day": fi_item.get("IsAllDayEvent", False) if fi_item else False,
+                "is_cancelled": fi_item.get("IsCancelled", False) if fi_item else False,
+                "is_meeting": ev.get("is_meeting", False),
+                "is_recurring": is_recurring,
+                "organizer": "",
+                "my_response": fi_item.get("MyResponseType", "") if fi_item else "",
+                "item_id": item_id,
+                "body": "",
+                "attendees_required": [],
+                "attendees_optional": [],
+            }
+
+            # Get full details via GetItem if requested and item_id is available
+            if include_body and item_id:
+                details = _get_event_details(client, item_id)
+                event["organizer"] = details["organizer"]
+                event["location"] = details["location"] or event["location"]
+                event["body"] = details["body"]
+                event["attendees_required"] = details["attendees_required"]
+                event["attendees_optional"] = details["attendees_optional"]
+
+            events.append(event)
+
         return json.dumps(events, ensure_ascii=False)
-
-    # --- Default mode ---
-    # Step 1: Get all events (including recurring) via GetUserAvailability
-    expanded = _get_expanded_events(
-        client, start_dt.date(), (end_dt + timedelta(days=1)).date()
-    )
-
-    # Step 2: Get events with item_ids via FindItem + CalendarView.
-    # CalendarView restricts results to the date range and expands recurring
-    # events into individual occurrences (each with its own ItemId).
-    folder_id = client.get_folder_id("calendar")
-    finditem_by_key: dict[str, dict] = {}  # "subject|start" -> item
-    if folder_id:
-        cv_start = start_dt.strftime("%Y-%m-%dT00:00:00")
-        cv_end = (end_dt + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
-
-        payload = {
-            "__type": "FindItemJsonRequest:#Exchange",
-            "Header": {
-                "__type": "JsonRequestHeaders:#Exchange",
-                "RequestServerVersion": "Exchange2013",
-            },
-            "Body": {
-                "__type": "FindItemRequest:#Exchange",
-                "ItemShape": {
-                    "__type": "ItemResponseShape:#Exchange",
-                    "BaseShape": "AllProperties",
-                },
-                "ParentFolderIds": [
-                    {"__type": "FolderId:#Exchange", "Id": folder_id}
-                ],
-                "Traversal": "Shallow",
-                "CalendarView": {
-                    "__type": "CalendarView:#Exchange",
-                    "StartDate": cv_start,
-                    "EndDate": cv_end,
-                },
-            },
-        }
-
-        data = client.request("FindItem", payload)
-
-        all_items = []
-        for msg in client.extract_items(data):
-            if "RootFolder" in msg:
-                all_items = msg["RootFolder"].get("Items", [])
-                break
-
-        # Index FindItem results by subject + normalized local start time.
-        # FindItem returns UTC timestamps (e.g. "2026-02-17T06:30:00Z"),
-        # while GetUserAvailability returns Moscow local time ("2026-02-17T09:30:00").
-        # Normalize FindItem timestamps to local time for matching.
-        for item in all_items:
-            subject = item.get("Subject", "")
-            start = item.get("Start", "")
-            local_start = _utc_to_local_str(start)
-            key = f"{subject}|{local_start}"
-            finditem_by_key[key] = item
-
-    # Step 3: Merge — use expanded list as the authoritative event list,
-    # enrich with FindItem data (item_id, details) when available
-    events = []
-    for ev in expanded:
-        subject = ev.get("subject", "(No subject)")
-        start = ev.get("start", "")
-        end = ev.get("end", "")
-        is_recurring = ev.get("is_recurring", False)
-
-        # Match expanded event (local time) with FindItem result (normalized to local)
-        fi_item = finditem_by_key.get(f"{subject}|{start}")
-
-        item_id = fi_item.get("ItemId", {}).get("Id", "") if fi_item else ""
-
-        event = {
-            "subject": subject,
-            "start": fi_item.get("Start", start) if fi_item else start,
-            "end": fi_item.get("End", end) if fi_item else end,
-            "location": ev.get("location", ""),
-            "is_all_day": fi_item.get("IsAllDayEvent", False) if fi_item else False,
-            "is_cancelled": fi_item.get("IsCancelled", False) if fi_item else False,
-            "is_meeting": ev.get("is_meeting", False),
-            "is_recurring": is_recurring,
-            "organizer": "",
-            "my_response": fi_item.get("MyResponseType", "") if fi_item else "",
-            "item_id": item_id,
-            "body": "",
-            "attendees_required": [],
-            "attendees_optional": [],
-        }
-
-        # Get full details via GetItem if requested and item_id is available
-        if include_body and item_id:
-            details = _get_event_details(client, item_id)
-            event["organizer"] = details["organizer"]
-            event["location"] = details["location"] or event["location"]
-            event["body"] = details["body"]
-            event["attendees_required"] = details["attendees_required"]
-            event["attendees_optional"] = details["attendees_optional"]
-
-        events.append(event)
-
-    return json.dumps(events, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": f"Failed to get calendar events: {e}"})
 
 
 # ------------------------------------------------------------------
