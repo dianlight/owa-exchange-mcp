@@ -1,11 +1,8 @@
 {
   "mcpServers": {
     "exchange-mcp": {
-      "type": "stdio",
-      "command": "exchange-mcp-server",
-      "env": {
-        "EXCHANGE_OWA_URL": "https://owa.example.com"
-      }
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp"
     }
   }
 }

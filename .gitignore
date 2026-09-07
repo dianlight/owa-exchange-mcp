@@ -1,6 +1,9 @@
 # Local config
 .mcp.json
+.env.local
 instructions.md
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
 
 # Credentials and session data
 .credentials.enc

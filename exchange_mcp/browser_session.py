@@ -204,6 +204,7 @@ class BrowserSession:
         return await self._async_capture_bearer_context()
 
     async def _async_ensure_logged_in(self, username: str | None, password: str | None) -> dict:
+        await self._async_ensure_context()
         page = self._anchor_page
         try:
             await page.goto(f"{self.owa_url}/owa/", wait_until="networkidle", timeout=30000)
@@ -507,6 +508,7 @@ class BrowserSession:
             await page.close()
 
     async def _async_post_json(self, action: str, payload: dict, timeout: float) -> BrowserResponse:
+        await self._async_ensure_context()
         await self._async_ensure_auth()
         body = _json.dumps(payload)
 
@@ -526,6 +528,7 @@ class BrowserSession:
         return await self._async_execute(url, headers, body, f"action={action}", timeout)
 
     async def _async_post_header_payload(self, action: str, payload: dict, timeout: float) -> BrowserResponse:
+        await self._async_ensure_context()
         await self._async_ensure_auth()
         url_post_data = quote(_json.dumps(payload, separators=(",", ":")))
 
@@ -561,6 +564,7 @@ class BrowserSession:
     # ------------------------------------------------------------------
 
     async def _async_download_attachment(self, attachment_id: str, timeout: float) -> BrowserResponse:
+        await self._async_ensure_context()
         canary = await self._async_current_canary()
         url = (
             f"{self.owa_url}/owa/service.svc/s/GetFileAttachment"

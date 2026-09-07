@@ -24,14 +24,22 @@ pip install -e .
 
 ## Install
 
-Add to your MCP client config. Replace `https://owa.example.com` with your OWA URL.
+Two ways to run the server, depending on whether you want it spawned per session or always-on:
 
-**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+### Option A: stdio (spawned per client session)
+
+The client starts and stops the process itself. Simple, but every new session
+pays a cold Chromium start (and an interactive 2FA wait, if configured).
+Replace `https://owa.example.com` with your OWA URL.
+
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`),
+**Cursor** (`.cursor/mcp.json`), or **Claude Code** (`.mcp.json`):
 
 ```json
 {
   "mcpServers": {
     "exchange": {
+      "type": "stdio",
       "command": "uvx",
       "args": ["exchange-mcp-server"],
       "env": {
@@ -42,37 +50,32 @@ Add to your MCP client config. Replace `https://owa.example.com` with your OWA U
 }
 ```
 
-**Cursor** (`.cursor/mcp.json`):
+### Option B: streamable-http (persistent, recommended for Claude Cowork)
+
+Run the server once as its own long-lived process, then point clients at its
+URL instead of spawning it. The browser/login session stays warm across
+sessions and can be shared by multiple client windows:
+
+```bash
+exchange-mcp-server --transport http --port 8765
+```
+
+Start it manually whenever you need it — there is no autostart mechanism;
+the process must already be listening before a client tries to connect.
 
 ```json
 {
   "mcpServers": {
     "exchange": {
-      "command": "uvx",
-      "args": ["exchange-mcp-server"],
-      "env": {
-        "EXCHANGE_OWA_URL": "https://owa.example.com"
-      }
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp"
     }
   }
 }
 ```
 
-**Claude Code** (`.mcp.json`):
-
-```json
-{
-  "mcpServers": {
-    "exchange": {
-      "command": "uvx",
-      "args": ["exchange-mcp-server"],
-      "env": {
-        "EXCHANGE_OWA_URL": "https://owa.example.com"
-      }
-    }
-  }
-}
-```
+`.mcp.json.example` in this repo ships with the Option B config — copy it to
+`.mcp.json` and adjust the port if you changed it.
 
 ## Configuration
 
@@ -82,6 +85,14 @@ Add to your MCP client config. Replace `https://owa.example.com` with your OWA U
 | `EXCHANGE_MASTER_PASSWORD` | No | If set, the server logs in automatically at startup using stored encrypted credentials (waits through 2FA before serving) |
 | `EXCHANGE_BROWSER_PROFILE_DIR` | No | Path to the persistent browser profile directory (default: `.browser-profile/` next to the package) |
 | `EXCHANGE_HEADLESS` | No | Set to `false`/`0` to run the browser with a visible window (same effect as `--show-browser`) |
+| `EXCHANGE_MCP_TRANSPORT` | No | `stdio` (default) or `http`. Same effect as `--transport`. |
+| `EXCHANGE_MCP_HOST` | No | Bind host for `--transport http` (default `127.0.0.1` — keep it on loopback, see [Security](#security)) |
+| `EXCHANGE_MCP_PORT` | No | Bind port for `--transport http` (default `8765`) |
+
+Any of these can also live in a gitignored `.env.local` file next to
+`pyproject.toml` (copy `.env.local.example`) — the server loads it at startup
+without overriding variables already set in the environment. Useful when
+starting the server from a context with no shell to `export` into.
 
 ## Architecture
 
@@ -94,6 +105,12 @@ launches once at server startup, backed by an on-disk profile so the session
 opens its own tab against that same session, does its work, and closes the
 tab. If the browser crashes or the OWA session expires, it recovers
 automatically on the next call.
+
+The server itself runs over either transport (`--transport stdio`, the
+default, or `--transport http`). The lifespan that creates the browser
+session runs exactly once per process either way; over `http` that process
+outlives any single client session, so the warm browser/login is shared
+across every client connection instead of being rebuilt per session.
 
 Pass `--show-browser` (or set `EXCHANGE_HEADLESS=false`) to run with a
 visible window instead of headless, useful for watching the login flow or
@@ -228,3 +245,15 @@ Every Exchange / OWA deployment has its own authentication setup — some requir
 - The browser profile directory holds the live session the same way a
   logged-in browser normally would; treat it like a browser profile
   (don't share it, exclude it from backups you'd share)
+- **If running with `--transport http`**: bind stays on `127.0.0.1` by
+  default — never set `EXCHANGE_MCP_HOST`/`--host` to `0.0.0.0` or a LAN
+  address, that would expose full mailbox access to your network with no
+  authentication of its own. Keep FastMCP's built-in `transport_security`
+  (Host header validation) enabled; it's what stops an unrelated web page
+  in your regular browser from reaching `localhost:8765` via DNS rebinding.
+  Any local process that can reach the port has the same mailbox access a
+  spawned stdio process had before — this is a longer-lived process, not a
+  wider trust boundary, but it's worth being deliberate about.
+- `.env.local` holds `EXCHANGE_MASTER_PASSWORD` in plaintext on disk — same
+  trade-off as passing it via a client's `env` block today. It's gitignored;
+  don't check it in or share it.

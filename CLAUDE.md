@@ -14,6 +14,10 @@ The server requires one environment variable, plus optional ones for the browser
 - `EXCHANGE_MASTER_PASSWORD` — (optional) If set, the server logs in automatically at startup using stored encrypted credentials, blocking through 2FA before it starts serving tools.
 - `EXCHANGE_BROWSER_PROFILE_DIR` — (optional) Path to the persistent Chromium profile directory. Defaults to `.browser-profile/` next to the package.
 - `EXCHANGE_HEADLESS` — (optional) Set to `false`/`0` to run the browser with a visible window. Same effect as the `--show-browser` CLI flag (which takes precedence).
+- `EXCHANGE_MCP_TRANSPORT` — (optional) `stdio` (default) or `http`. Same effect as `--transport`.
+- `EXCHANGE_MCP_HOST` / `EXCHANGE_MCP_PORT` — (optional) Bind address for `--transport http`. Default `127.0.0.1:8765` — never bind non-loopback, the MCP endpoint has no auth of its own.
+
+Any variable above can also be placed in a gitignored `.env.local` next to `pyproject.toml` (see `.env.local.example`); `server.py` loads it at startup without overriding variables already present in the environment. Useful when starting the server from a context with no shell to `export` into.
 
 ## Structure
 
@@ -22,7 +26,7 @@ The server requires one environment variable, plus optional ones for the browser
   - `server.py` — FastMCP server with lifespan context; launches the browser and (if `EXCHANGE_MASTER_PASSWORD` is set) blocks on login before serving
   - `browser_session.py` — `BrowserSession`: one persistent Chromium context for the process's lifetime, reused by every OWA call
   - `owa_client.py` — OWA API client; delegates transport to `BrowserSession`, keeps the request/response/folder-resolution logic
-  - `auth.py` — Login glue between the MCP tool and `BrowserSession`, plus credential encryption (reuses crypto from `login.py`)
+  - `auth.py` — Login glue between the MCP tool and `BrowserSession`, plus credential encryption (reuses crypto from `login.py`). It's the *only* place inside the package that imports `login.py` — do the same anywhere else that needs those helpers (see note below), don't import `login` directly.
   - `tools/` — Tool modules: email, calendar, people, folders, availability, analytics, auth
 
 ## Running
@@ -33,11 +37,15 @@ export EXCHANGE_OWA_URL=https://owa.example.com
 python3 login.py --setup       # One-time credential setup
 python3 login.py               # Login (pre-warms the persistent browser profile)
 pip install -e .               # Install MCP server
-exchange-mcp-server            # Run MCP server (stdio transport)
+exchange-mcp-server            # Run MCP server (stdio transport, spawned per client session)
 exchange-mcp-server --show-browser  # Same, with a visible browser window
+
+# Persistent local server instead of per-session stdio spawn (start manually,
+# no autostart mechanism — must already be running before a client connects):
+exchange-mcp-server --transport http --port 8765
 ```
 
-Dependencies: `mcp`, `cryptography`, `playwright` (run `playwright install chromium` once).
+Dependencies: `mcp`, `cryptography`, `playwright` (run `playwright install chromium` once). `mcp`'s `streamable-http` transport (`uvicorn`/`starlette`) is already a transitive dependency — no extra install needed for `--transport http`.
 
 ## Architecture
 
@@ -57,6 +65,10 @@ Dependencies: `mcp`, `cryptography`, `playwright` (run `playwright install chrom
 **Recovery**: if the browser process/context crashes, `BrowserSession` relaunches on the same profile directory and retries the call once. If the OWA session expires, `OWAClient` retries once after a re-login attempt.
 
 **Encryption**: PBKDF2-HMAC-SHA256 (480,000 iterations) + AES-256-Fernet for stored credentials (`.credentials.enc`/`.salt`). Sessions no longer go through this — they live in the browser profile directory instead of an encrypted cookie file.
+
+**Importing `login.py` from inside the package**: `login.py` lives at the repo root and isn't a packaged module (no `py-modules` entry in `pyproject.toml`), so `from login import ...` only resolves when the running process's own `sys.path` happens to include the repo root — true for `python login.py` or `python -m exchange_mcp.server` run from repo root, **false** for the installed `exchange-mcp-server` console-script entry point (its wrapper puts `Scripts/`/`bin/` on `sys.path[0]`, not the caller's cwd). `exchange_mcp/auth.py` works around this by inserting the repo root into `sys.path` before importing `login`; always import those helpers via `from exchange_mcp.auth import ...`, never `from login import ...` directly, or the import silently fails at runtime under the real entry point (caught by a broad `except` in `server.py`'s startup path, so it won't crash — it'll just skip auto-login and log `No module named 'login'`).
+
+**Transport (`stdio` vs `http`)**: `main()` picks the transport via `--transport`/`EXCHANGE_MCP_TRANSPORT`. The lifespan that creates the `BrowserSession` runs exactly once per process either way — under `stdio` that process is spawned and killed per client session, so the warm browser/login is rebuilt every time; under `--transport http` the process is long-lived and the same `BrowserSession`/login is shared across every client connection that hits it, but it must be started manually — there is no autostart mechanism. Never bind `--host`/`EXCHANGE_MCP_HOST` off `127.0.0.1` — the MCP endpoint has no auth of its own, and FastMCP's `transport_security` (Host header validation) must stay enabled to block DNS-rebinding from other pages in the user's browser.
 
 ## Maintaining PROJECT_STATUS.md
 
