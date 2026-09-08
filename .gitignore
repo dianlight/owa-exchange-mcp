@@ -21,3 +21,4 @@ dist/
 
 # Smoke test suite runtime state (server pid/log, result log)
 tests/smoke/.state/
+.browser-profile.bak-20260908-115935/
