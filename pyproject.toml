@@ -16,8 +16,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/nhype/owa-exchange-mcp"
-Repository = "https://github.com/nhype/owa-exchange-mcp"
+Homepage = "https://github.com/dianlight/owa-exchange-mcp"
+Repository = "https://github.com/dianlight/owa-exchange-mcp"
 
 [project.scripts]
 exchange-mcp-server = "exchange_mcp.server:main"

@@ -1,10 +1,10 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.nhype/owa-exchange-mcp",
+  "name": "io.github.dianlight/owa-exchange-mcp",
   "title": "OWA Exchange MCP Server",
   "description": "MCP server for Microsoft Exchange / OWA — email, calendar, directory, availability",
   "repository": {
-    "url": "https://github.com/nhype/owa-exchange-mcp",
+    "url": "https://github.com/dianlight/owa-exchange-mcp",
     "source": "github"
   },
   "version": "2.0.0-beta.0",

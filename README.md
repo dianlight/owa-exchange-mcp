@@ -1,4 +1,4 @@
-<!-- mcp-name: io.github.nhype/owa-exchange-mcp -->
+<!-- mcp-name: io.github.dianlight/owa-exchange-mcp -->
 
 # OWA Exchange MCP Server
 
