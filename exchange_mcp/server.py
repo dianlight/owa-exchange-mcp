@@ -13,7 +13,7 @@ import sys
 import warnings
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from pydantic_settings.exceptions import IncompleteFieldDefinitionWarning
@@ -32,9 +32,26 @@ from exchange_mcp.owa_client import OWAClient
 
 @dataclass
 class AppContext:
-    """Shared application state available to all tools via lifespan context."""
+    """Shared application state available to all tools via lifespan context.
+
+    `pending_login` is backed by the module-level `_shared_pending_login`
+    (see _get_shared_client) rather than a per-instance field: AppContext
+    itself is created fresh per client session (one per app_lifespan() call),
+    but the login tool's two-call 2FA flow needs the *second* call — which
+    may arrive on a different MCP client session than the first — to see the
+    background task the first call started. A per-instance field would only
+    ever be visible to calls on that same session.
+    """
     client: OWAClient
-    pending_login: asyncio.Task | None = field(default=None, repr=False)
+
+    @property
+    def pending_login(self) -> "asyncio.Task | None":
+        return _shared_pending_login
+
+    @pending_login.setter
+    def pending_login(self, value: "asyncio.Task | None") -> None:
+        global _shared_pending_login
+        _shared_pending_login = value
 
 
 def _resolve_headless() -> bool:
@@ -115,6 +132,7 @@ _shared_state_lock = asyncio.Lock()
 _shared_browser: BrowserSession | None = None
 _shared_client: OWAClient | None = None
 _shared_startup_task: asyncio.Task | None = None
+_shared_pending_login: asyncio.Task | None = None
 
 
 async def _get_shared_client() -> OWAClient:

@@ -128,7 +128,37 @@ below for details: a `FaultMessage`-fallback bug in [availability.py](exchange_m
 `_get_availability_events()` that masked the `GetUserAvailability` failure as a false-clean "0
 meetings" result in both `get_meeting_stats` and `get_meeting_contacts`.
 
-Only `login` (`auth.py`) remains untested.
+**Update 2026-09-08 (continued) — `login` tested; one more architecture bug found and fixed.**
+Verified via the full forced-relogin flow: moved `.browser-profile` aside (kept as a
+timestamped backup, not deleted), restarted the server without `EXCHANGE_MASTER_PASSWORD`
+so it came up with no session, confirmed via `check_session` that the session was genuinely
+invalid, called `login(master_password=...)` to trigger a real decrypt + browser 2FA login,
+approved the mobile push, then called `login()` again to harvest the result — `check_session`
+came back authenticated afterward, confirming the real 2FA path works end-to-end.
+
+While doing this, found that the *second* `login()` call reported `"Session is already
+active"` (the "no pending task" branch) instead of `"Logged in and session verified."` (the
+"harvested a background 2FA result" branch) — surfacing a real bug: [server.py](exchange_mcp/server.py)'s
+`AppContext.pending_login` was a per-instance dataclass field, but `AppContext` itself is
+created fresh on every `app_lifespan()` call (i.e. per client session), while the
+`OWAClient`/browser it wraps is the shared process-wide singleton (see the lifespan fix
+above). So the login tool's two-call 2FA pattern only worked if both calls happened to land
+on the *same* MCP client session — a second call from a different session (as happened here,
+since the verification script opened a fresh connection each run) never saw the first call's
+background task, and would have silently started a duplicate `perform_login()` if the first
+one hadn't already finished by the time it ran. It "worked" in this verification only because
+the real login had already completed by the time the second call landed; a slower 2FA
+approval would have raced a second login attempt against the first on the same browser.
+Fixed by moving `pending_login` out of the per-instance field and into the same
+module-level shared-state group as `_shared_client`/`_shared_browser`, exposed through a
+property on `AppContext` so `auth.py` needed no changes. [test_login.py](tests/smoke/tests/test_login.py)
+covers the repeatable "already active" idempotent path (regression-verified against the fix
+after restarting the server); the actual cross-session background-task-harvest branch was
+verified by code inspection (single `AppContext(...)` construction site, `py_compile` clean)
+rather than a second live 2FA cycle, since forcing another mobile-push approval just to
+re-exercise a small, mechanically-obvious fix wasn't worth asking for.
+
+All 30 tools have now been exercised at least once against a real OWA mailbox.
 
 `
 ✶ Insight ─────────────────────────────────────
@@ -229,7 +259,7 @@ Migration/Automated-test/Manual-QA status below — every tool still goes throug
 
 | Tool | Description | Migration | Automated test | Manual QA / Status |
 |---|---|---|---|---|
-| `login` | Credential setup + two-call, non-blocking 2FA login against the shared browser session | Migrated | None | Pending — closest to being exercised: `_diag_session_valid.py` drives the same `BrowserSession.ensure_logged_in()` this tool calls, but as a standalone script outside the MCP server process |
+| `login` | Credential setup + two-call, non-blocking 2FA login against the shared browser session | Migrated | `tests/smoke/tests/test_login.py` (idempotent "already active" path only — see note below) | OK (2026-09-08) |
 
 ## 4. Gaps worth closing
 
