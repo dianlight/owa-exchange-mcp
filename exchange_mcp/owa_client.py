@@ -109,11 +109,23 @@ class OWAClient:
             )
 
         try:
-            return resp.json()
+            data = resp.json()
         except (ValueError, TypeError) as exc:
             raise SessionExpiredError(
                 f"Unexpected response (HTTP {resp.status_code}). Session may have expired."
             ) from exc
+
+        # Some malformed requests fault at the OWA method-dispatch layer
+        # instead of the usual per-item ResponseMessages/ResponseClass shape
+        # -- e.g. {"Body": {"ErrorCode": 400, "FaultMessage": "..."}} with no
+        # "ResponseMessages" key at all. extract_items() finds nothing to
+        # iterate in that shape, so callers checking only ResponseClass=="Error"
+        # would otherwise treat this as a silent success.
+        body = data.get("Body") if isinstance(data, dict) else None
+        if isinstance(body, dict) and "ErrorCode" in body and "ResponseMessages" not in body:
+            raise RuntimeError(body.get("FaultMessage") or f"OWA request failed (ErrorCode {body['ErrorCode']}).")
+
+        return data
 
     # ------------------------------------------------------------------
     # File download (attachments)

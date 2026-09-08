@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from mcp.server.fastmcp import Context
 
 from exchange_mcp.server import mcp, AppContext
-from exchange_mcp.owa_client import OWAClient
+from exchange_mcp.owa_client import OWAClient, SessionExpiredError
 from exchange_mcp.utils import html_to_text, parse_iso_datetime, extract_links_from_html
 
 
@@ -76,12 +76,14 @@ def _get_event_details(client: OWAClient, item_id: str) -> dict:
         "body": "",
         "attendees_required": [],
         "attendees_optional": [],
+        "categories": [],
     }
 
     for msg in client.extract_items(data):
         if "Items" not in msg:
             continue
         for item in msg["Items"]:
+            result["categories"] = item.get("Categories", [])
             # Location
             result["location"] = item.get("Location", "")
             if not result["location"]:
@@ -303,6 +305,63 @@ def _build_html_body(description: str | None) -> str:
         )
     body += "</body></html>"
     return body
+
+
+@mcp.tool()
+def _debug_get_user_availability_raw(
+    start_date: str,
+    end_date: str,
+    ctx: Context = None,
+) -> str:
+    """TEMPORARY DEBUG TOOL. Returns the raw GetUserAvailability response."""
+    client = _get_client(ctx)
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    payload = {
+        '__type': 'GetUserAvailabilityJsonRequest:#Exchange',
+        'Header': {
+            '__type': 'JsonRequestHeaders:#Exchange',
+            'RequestServerVersion': 'Exchange2013',
+            'TimeZoneContext': {
+                '__type': 'TimeZoneContext:#Exchange',
+                'TimeZoneDefinition': {
+                    '__type': 'TimeZoneDefinitionType:#Exchange',
+                    'Id': 'Russian Standard Time',
+                },
+            },
+        },
+        'Body': {
+            '__type': 'GetUserAvailabilityRequest:#Exchange',
+            'MailboxDataArray': [{
+                '__type': 'MailboxData:#Exchange',
+                'Email': {'__type': 'EmailAddress:#Exchange', 'Address': client.user_email},
+                'AttendeeType': 'Required',
+            }],
+            'FreeBusyViewOptions': {
+                '__type': 'FreeBusyViewOptions:#Exchange',
+                'TimeWindow': {
+                    '__type': 'Duration:#Exchange',
+                    'StartTime': f'{start_dt.date()}T00:00:00',
+                    'EndTime': f'{end_dt.date()}T00:00:00',
+                },
+                'MergedFreeBusyIntervalInMinutes': 30,
+                'RequestedView': 'DetailedMerged',
+            },
+        },
+    }
+    try:
+        data = client.request('GetUserAvailability', payload)
+        return json.dumps({
+            "user_email": client.user_email,
+            "payload": payload,
+            "response": data,
+        }, ensure_ascii=False, default=str)
+    except Exception as e:
+        return json.dumps({
+            "user_email": client.user_email,
+            "payload": payload,
+            "exception": str(e),
+        }, ensure_ascii=False, default=str)
 
 
 # ------------------------------------------------------------------
@@ -1319,3 +1378,258 @@ def get_event_links(
 
     except Exception as e:
         return json.dumps({"error": f"Failed to extract event links: {e}"})
+
+
+# ------------------------------------------------------------------
+# Category tools
+# ------------------------------------------------------------------
+
+
+def _get_change_key(client: OWAClient, item_id: str) -> str | None:
+    """Fetch the ChangeKey for an item via GetItem (IdOnly).
+
+    OWA requires the ChangeKey on write operations like SetItemField.
+    """
+    payload = {
+        "__type": "GetItemJsonRequest:#Exchange",
+        "Header": {
+            "__type": "JsonRequestHeaders:#Exchange",
+            "RequestServerVersion": "Exchange2013",
+        },
+        "Body": {
+            "__type": "GetItemRequest:#Exchange",
+            "ItemShape": {
+                "__type": "ItemResponseShape:#Exchange",
+                "BaseShape": "IdOnly",
+            },
+            "ItemIds": [{"__type": "ItemId:#Exchange", "Id": item_id}],
+        },
+    }
+    data = client.request("GetItem", payload)
+    for msg in client.extract_items(data):
+        if "Items" in msg:
+            for item in msg["Items"]:
+                return item.get("ItemId", {}).get("ChangeKey")
+    return None
+
+
+def _set_event_categories(client: OWAClient, item_ids: list[str], categories: list[str]) -> None:
+    """Overwrite the Categories field on each event via UpdateItem/SetItemField.
+
+    KNOWN BACKEND LIMITATION (see PROJECT_STATUS.md): on this OWA build,
+    UpdateItem on a CalendarItem always fails with
+    ErrorSendMeetingInvitationsOrCancellationsRequired, even though the
+    request below sends SendMeetingInvitationsOrCancellations at the exact
+    Body-level position documented for the SOAP attribute, together with the
+    SendMeetingInvitationsOrCancellationsSpecified companion flag Microsoft's
+    own EWS Managed API code sample sets alongside it
+    (https://learn.microsoft.com/dotnet/api/exchangewebservices.updateitemtype.sendmeetinginvitationsorcancellations).
+    The SetItemField shape itself (Path/Item, not FieldURI/CalendarItem) is
+    confirmed correct -- it mirrors email.py's _set_email_categories, which
+    works, and getting it right is what took this from a generic
+    OwaMethodArgumentException ("Invalid argument used to call method
+    UpdateItem") to this specific, later-stage validation error. Ruled out
+    across both this shape fix and every variation tried previously: the
+    attribute's value (SendToNone/SendOnlyToChanged), the Specified flag,
+    and meeting vs. plain zero-attendee appointment -- all fail identically.
+    The bespoke "UpdateCalendarEvent" action (mirroring CreateCalendarEvent's
+    naming, which keeps the standard CreateItemRequest body under a
+    different action name) was also retried with this corrected shape: it
+    skips the attribute check but unconditionally rejects the standard EWS
+    ItemId as malformed, so it's not a viable substitute either. Left as the
+    standard/documented shape below -- it now fails loudly with OWA's real
+    error instead of a false "success" (see the fault-envelope check added
+    to OWAClient._to_json) -- pending either a fixed backend or a captured
+    example of OWA's own web client performing this action.
+    """
+    items = []
+    for iid in item_ids:
+        change_key = _get_change_key(client, iid)
+        item_id_dict = {"__type": "ItemId:#Exchange", "Id": iid}
+        if change_key:
+            item_id_dict["ChangeKey"] = change_key
+        items.append(
+            {
+                "__type": "ItemChange:#Exchange",
+                "ItemId": item_id_dict,
+                "Updates": [
+                    {
+                        "__type": "SetItemField:#Exchange",
+                        "Path": {"__type": "PropertyUri:#Exchange", "FieldURI": "Categories"},
+                        "Item": {"__type": "CalendarItem:#Exchange", "Categories": categories},
+                    }
+                ],
+            }
+        )
+
+    payload = {
+        "__type": "UpdateItemJsonRequest:#Exchange",
+        "Header": {
+            "__type": "JsonRequestHeaders:#Exchange",
+            "RequestServerVersion": "V2017_08_18",
+        },
+        "Body": {
+            "__type": "UpdateItemRequest:#Exchange",
+            "ItemChanges": items,
+            "ConflictResolution": "AutoResolve",
+            "SendMeetingInvitationsOrCancellations": "SendToNone",
+            "SendMeetingInvitationsOrCancellationsSpecified": True,
+        },
+    }
+
+    data = client.request("UpdateItem", payload)
+    for msg in client.extract_items(data):
+        if msg.get("ResponseClass") == "Error":
+            raise RuntimeError(msg.get("MessageText", "UpdateItem failed."))
+
+
+@mcp.tool()
+def assign_event_categories(
+    item_ids: list[str],
+    categories: list[str],
+    ctx: Context = None,
+) -> str:
+    """Add one or more categories to calendar events, keeping any categories already present.
+
+    Categories are just strings on the item (standard EWS behavior) - any
+    name works, including ones not present in the mailbox's master category
+    list (see the category_* tools). Assigning a brand-new name does not
+    register it in the master list or give it a color.
+
+    Args:
+        item_ids: List of Exchange ItemIds to tag (from get_calendar_events).
+        categories: Category names to add.
+    """
+    try:
+        client = _get_client(ctx)
+        for iid in item_ids:
+            existing = _get_event_details(client, iid).get("categories", [])
+            merged = list(dict.fromkeys(existing + categories))
+            _set_event_categories(client, [iid], merged)
+        return json.dumps({
+            "success": True,
+            "message": f"Added categories to {len(item_ids)} event(s).",
+        })
+    except SessionExpiredError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        return json.dumps({"error": f"Failed to assign categories: {e}"})
+
+
+@mcp.tool()
+def remove_event_categories(
+    item_ids: list[str],
+    categories: list[str],
+    ctx: Context = None,
+) -> str:
+    """Remove one or more categories from calendar events, keeping any others present.
+
+    Args:
+        item_ids: List of Exchange ItemIds to untag (from get_calendar_events).
+        categories: Category names to remove (case-insensitive match).
+    """
+    try:
+        client = _get_client(ctx)
+        lowered = {c.lower() for c in categories}
+        for iid in item_ids:
+            existing = _get_event_details(client, iid).get("categories", [])
+            remaining = [c for c in existing if c.lower() not in lowered]
+            _set_event_categories(client, [iid], remaining)
+        return json.dumps({
+            "success": True,
+            "message": f"Removed categories from {len(item_ids)} event(s).",
+        })
+    except SessionExpiredError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        return json.dumps({"error": f"Failed to remove categories: {e}"})
+
+
+@mcp.tool()
+def find_events_by_category(
+    category: str,
+    start_date: str,
+    end_date: str,
+    limit: int = 10,
+    ctx: Context = None,
+) -> str:
+    """Find calendar events tagged with a given category within a date range.
+
+    Args:
+        category: Category name to search for (case-insensitive match).
+        start_date: Start date in YYYY-MM-DD format.
+        end_date: End date in YYYY-MM-DD format.
+        limit: Maximum number of matching events to return (default 10, max 50).
+    """
+    try:
+        client = _get_client(ctx)
+        max_limit = 50
+        if limit > max_limit:
+            limit = max_limit
+
+        try:
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        except ValueError as e:
+            return json.dumps({"error": f"Invalid date format: {e}"})
+
+        folder_id = client.get_folder_id("calendar")
+        if not folder_id:
+            return json.dumps({"error": "Calendar folder not found."})
+
+        cv_start = start_dt.strftime("%Y-%m-%dT00:00:00")
+        cv_end = (end_dt + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
+
+        payload = {
+            "__type": "FindItemJsonRequest:#Exchange",
+            "Header": {
+                "__type": "JsonRequestHeaders:#Exchange",
+                "RequestServerVersion": "Exchange2013",
+            },
+            "Body": {
+                "__type": "FindItemRequest:#Exchange",
+                "ItemShape": {
+                    "__type": "ItemResponseShape:#Exchange",
+                    "BaseShape": "AllProperties",
+                },
+                "ParentFolderIds": [OWAClient.folder_id_dict(folder_id)],
+                "Traversal": "Shallow",
+                "CalendarView": {
+                    "__type": "CalendarView:#Exchange",
+                    "StartDate": cv_start,
+                    "EndDate": cv_end,
+                },
+            },
+        }
+
+        data = client.request("FindItem", payload)
+
+        all_items = []
+        for msg in client.extract_items(data):
+            if "RootFolder" in msg:
+                all_items = msg["RootFolder"].get("Items", [])
+                break
+
+        category_lower = category.lower()
+        matches = [
+            item for item in all_items
+            if any(cat.lower() == category_lower for cat in (item.get("Categories") or []))
+        ]
+
+        events = []
+        for item in matches[:limit]:
+            events.append({
+                "item_id": item.get("ItemId", {}).get("Id", ""),
+                "subject": item.get("Subject", ""),
+                "start": item.get("Start", ""),
+                "end": item.get("End", ""),
+                "location": item.get("Location", ""),
+                "categories": item.get("Categories", []),
+            })
+
+        return json.dumps({"events": events, "count": len(events)})
+
+    except SessionExpiredError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        return json.dumps({"error": f"Failed to find events by category: {e}"})

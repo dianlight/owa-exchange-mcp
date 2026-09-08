@@ -196,6 +196,7 @@ import exchange_mcp.tools.folders    # noqa: E402, F401
 import exchange_mcp.tools.availability  # noqa: E402, F401
 import exchange_mcp.tools.analytics     # noqa: E402, F401
 import exchange_mcp.tools.auth          # noqa: E402, F401
+import exchange_mcp.tools.categories     # noqa: E402, F401
 
 
 def main():

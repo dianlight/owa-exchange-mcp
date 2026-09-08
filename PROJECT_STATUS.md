@@ -158,7 +158,32 @@ verified by code inspection (single `AppContext(...)` construction site, `py_com
 rather than a second live 2FA cycle, since forcing another mobile-push approval just to
 re-exercise a small, mechanically-obvious fix wasn't worth asking for.
 
-All 30 tools have now been exercised at least once against a real OWA mailbox.
+**Update 2026-09-08 (continued) — new Category tools added (email + calendar + master
+list).** Added a new `categories.py` module (4 tools: `list_categories`/`create_category`/
+`rename_category`/`delete_category`) plus 3 category tools each on `email.py` and
+`calendar.py` (`assign_*_categories`/`remove_*_categories`/`find_*_by_category`), using
+OWA's native "Category" terminology. `categories.py`'s master-list CRUD goes through a
+bespoke, non-EWS `UpdateMasterCategoryList` action (see its own module docstring — the
+classic EWS `GetUserConfiguration`/`UpdateUserConfiguration` pattern 500s with a
+`NullReferenceException` on this tenant for the `"CategoryList"` config name). The
+email-side per-item tools use the standard EWS `UpdateItem`/`SetItemField` action and work
+correctly.
+
+The calendar-side per-item write tools do not: `assign_event_categories`/
+`remove_event_categories` cannot persist a `Categories` change on this OWA build — see
+their `KO` rows below. Getting here surfaced and fixed a real false-positive-success bug
+along the way: OWA's `UpdateItem` action can return a top-level fault envelope
+(`{"Body": {"ErrorCode": ..., "FaultMessage": ...}}`) with no `ResponseMessages` key at
+all, which `OWAClient.extract_items()` silently treats as "no items, so no error" — every
+existing `UpdateItem`-based tool that only checked per-item `ResponseClass == "Error"` was
+exposed to this exact class of silent failure. Fixed centrally in
+[owa_client.py](exchange_mcp/owa_client.py)'s `_to_json()`, which now raises immediately on
+that fault-envelope shape, so any current or future caller gets a real error instead of a
+false "success" — this is a general hardening, not specific to categories.
+`find_events_by_category` (a pure `FindItem`+`CalendarView` read, unaffected by the write
+bug) works correctly.
+
+All 40 tools have now been exercised at least once against a real OWA mailbox.
 
 `
 ✶ Insight ─────────────────────────────────────
@@ -194,9 +219,9 @@ Migration/Automated-test/Manual-QA status below — every tool still goes throug
   use `OK` / `KO` once you have an actual result, and add a one-line note (error text,
   date) for any `KO`.
 
-## 3. Tool inventory (30 tools across 7 modules)
+## 3. Tool inventory (40 tools across 8 modules)
 
-### Email — [exchange_mcp/tools/email.py](exchange_mcp/tools/email.py) (10)
+### Email — [exchange_mcp/tools/email.py](exchange_mcp/tools/email.py) (13)
 
 | Tool | Description | Migration | Automated test | Manual QA / Status |
 |---|---|---|---|---|
@@ -210,8 +235,11 @@ Migration/Automated-test/Manual-QA status below — every tool still goes throug
 | `delete_email` | Delete (soft or permanent) one or more emails | Migrated | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) |
 | `download_attachments` | Download all file attachments from an email to disk | Migrated | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) |
 | `get_email_links` | Extract hyperlinks from an email's HTML body | Migrated | `tests/smoke/tests/test_get_email_detail.py` | OK (2026-09-07) |
+| `assign_email_categories` | Add one or more categories to emails, keeping any already present | Migrated | `tests/smoke/tests/test_email_category_tagging.py` | OK (2026-09-08) |
+| `remove_email_categories` | Remove one or more categories from emails, keeping any others present | Migrated | `tests/smoke/tests/test_email_category_tagging.py` | OK (2026-09-08) |
+| `find_emails_by_category` | Find email conversations tagged with a given category | Migrated | `tests/smoke/tests/test_email_category_tagging.py` | OK (2026-09-08) |
 
-### Calendar — [exchange_mcp/tools/calendar.py](exchange_mcp/tools/calendar.py) (7)
+### Calendar — [exchange_mcp/tools/calendar.py](exchange_mcp/tools/calendar.py) (10)
 
 | Tool | Description | Migration | Automated test | Manual QA / Status |
 |---|---|---|---|---|
@@ -222,6 +250,18 @@ Migration/Automated-test/Manual-QA status below — every tool still goes throug
 | `respond_to_meeting` | Accept / decline / tentatively accept a meeting invite | Migrated | None — self-invite produces no meeting-request email to respond to (confirmed 2026-09-08; Exchange doesn't ask an organizer to accept their own invite), so this can't be covered by a self-contained automated test | OK (2026-09-08, manual) — verified against a real incoming Google Calendar invite from a different account (Tentative response sent successfully) |
 | `download_event_attachments` | Download file attachments from a calendar event | Migrated | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) |
 | `get_event_links` | Extract hyperlinks from an event's HTML description | Migrated | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) |
+| `assign_event_categories` | Add one or more categories to events, keeping any already present | Migrated | `tests/smoke/tests/test_calendar_category_tagging.py` | KO (2026-09-08) — `UpdateItem` on a `CalendarItem` always fails with `ErrorSendMeetingInvitationsOrCancellationsRequired` on this OWA build, even with the attribute sent at the exact documented position plus the `Specified` companion flag Microsoft's own EWS Managed API code sample sets alongside it. Ruled out: the attribute's value, the `Specified` flag, meeting vs. plain zero-attendee appointment, and a bespoke `UpdateCalendarEvent` action (which instead rejects the standard `ItemId` as malformed). Not fixable client-side without a captured example of OWA's own web client performing this action — see `_set_event_categories`'s docstring in [calendar.py](exchange_mcp/tools/calendar.py) for the full trail. |
+| `remove_event_categories` | Remove one or more categories from events, keeping any others present | Migrated | `tests/smoke/tests/test_calendar_category_tagging.py` | KO (2026-09-08) — same root cause as `assign_event_categories` above (shares `_set_event_categories`). |
+| `find_events_by_category` | Find events tagged with a given category | Migrated | `tests/smoke/tests/test_calendar_category_tagging.py` | OK (2026-09-08) — pure `FindItem`+`CalendarView` read, unaffected by the write-path bug above. |
+
+### Categories — [exchange_mcp/tools/categories.py](exchange_mcp/tools/categories.py) (4)
+
+| Tool | Description | Migration | Automated test | Manual QA / Status |
+|---|---|---|---|---|
+| `list_categories` | List every category in the mailbox's master category list | Migrated | `tests/smoke/tests/test_category_lifecycle.py` | OK (2026-09-08) |
+| `create_category` | Create a new category in the master category list | Migrated | `tests/smoke/tests/test_category_lifecycle.py` | OK (2026-09-08) |
+| `rename_category` | Rename an existing category in the master category list | Migrated | `tests/smoke/tests/test_category_lifecycle.py` | OK (2026-09-08) |
+| `delete_category` | Delete a category from the master category list | Migrated | `tests/smoke/tests/test_category_lifecycle.py` | OK (2026-09-08) |
 
 ### Directory — [exchange_mcp/tools/people.py](exchange_mcp/tools/people.py) (1)
 

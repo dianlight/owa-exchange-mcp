@@ -111,6 +111,7 @@ def _get_item_details(client: OWAClient, item_id: str) -> dict:
         "has_links": False,
         "importance": "Normal",
         "attachments": [],
+        "categories": [],
     }
 
     for msg in client.extract_items(data):
@@ -118,6 +119,7 @@ def _get_item_details(client: OWAClient, item_id: str) -> dict:
             continue
         for item in msg["Items"]:
             result["subject"] = item.get("Subject", "(No subject)")
+            result["categories"] = item.get("Categories", [])
 
             # Sender
             from_data = item.get("From", {}).get("Mailbox", {})
@@ -969,3 +971,184 @@ def get_email_links(
         return json.dumps({"error": str(e)})
     except Exception as e:
         return json.dumps({"error": f"Failed to extract links: {e}"})
+
+
+def _set_email_categories(client: OWAClient, item_ids: list[str], categories: list[str]) -> None:
+    """Overwrite the Categories field on each item via UpdateItem/SetItemField."""
+    changes = []
+    for iid in item_ids:
+        change_key = _get_change_key(client, iid)
+        item_id_dict = {"__type": "ItemId:#Exchange", "Id": iid}
+        if change_key:
+            item_id_dict["ChangeKey"] = change_key
+        changes.append(
+            {
+                "__type": "ItemChange:#Exchange",
+                "ItemId": item_id_dict,
+                "Updates": [
+                    {
+                        "__type": "SetItemField:#Exchange",
+                        "Path": {
+                            "__type": "PropertyUri:#Exchange",
+                            "FieldURI": "Categories",
+                        },
+                        "Item": {
+                            "__type": "Message:#Exchange",
+                            "Categories": categories,
+                        },
+                    }
+                ],
+            }
+        )
+
+    payload = {
+        "__type": "UpdateItemJsonRequest:#Exchange",
+        "Header": {
+            "__type": "JsonRequestHeaders:#Exchange",
+            "RequestServerVersion": "V2017_08_18",
+        },
+        "Body": {
+            "__type": "UpdateItemRequest:#Exchange",
+            "ItemChanges": changes,
+            "ConflictResolution": "AutoResolve",
+            "MessageDisposition": "SaveOnly",
+        },
+    }
+
+    data = client.request("UpdateItem", payload)
+    for msg in client.extract_items(data):
+        if msg.get("ResponseClass") == "Error":
+            raise RuntimeError(msg.get("MessageText", "UpdateItem failed."))
+
+
+@mcp.tool()
+def assign_email_categories(
+    item_ids: list[str],
+    categories: list[str],
+    ctx: Context = None,
+) -> str:
+    """Add one or more categories to emails, keeping any categories already present.
+
+    Categories are just strings on the item (standard EWS behavior) - any
+    name works, including ones not present in the mailbox's master category
+    list (see the category_* tools). Assigning a brand-new name does not
+    register it in the master list or give it a color.
+
+    Args:
+        item_ids: List of Exchange ItemIds to tag.
+        categories: Category names to add.
+    """
+    try:
+        client = _get_client(ctx)
+        for iid in item_ids:
+            existing = _get_item_details(client, iid).get("categories", [])
+            merged = list(dict.fromkeys(existing + categories))
+            _set_email_categories(client, [iid], merged)
+        return json.dumps({
+            "success": True,
+            "message": f"Added categories to {len(item_ids)} email(s).",
+        })
+    except SessionExpiredError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        return json.dumps({"error": f"Failed to assign categories: {e}"})
+
+
+@mcp.tool()
+def remove_email_categories(
+    item_ids: list[str],
+    categories: list[str],
+    ctx: Context = None,
+) -> str:
+    """Remove one or more categories from emails, keeping any others present.
+
+    Args:
+        item_ids: List of Exchange ItemIds to untag.
+        categories: Category names to remove (case-insensitive match).
+    """
+    try:
+        client = _get_client(ctx)
+        lowered = {c.lower() for c in categories}
+        for iid in item_ids:
+            existing = _get_item_details(client, iid).get("categories", [])
+            remaining = [c for c in existing if c.lower() not in lowered]
+            _set_email_categories(client, [iid], remaining)
+        return json.dumps({
+            "success": True,
+            "message": f"Removed categories from {len(item_ids)} email(s).",
+        })
+    except SessionExpiredError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        return json.dumps({"error": f"Failed to remove categories: {e}"})
+
+
+@mcp.tool()
+def find_emails_by_category(
+    category: str,
+    folder: str = "Inbox",
+    limit: int = 10,
+    ctx: Context = None,
+) -> str:
+    """Find email conversations tagged with a given category.
+
+    Args:
+        category: Category name to search for (case-insensitive match).
+        folder: Folder name to search within (Inbox, Sent, Drafts, Deleted, or custom).
+        limit: Maximum number of matching conversations to return (default 10, max 50).
+    """
+    try:
+        client = _get_client(ctx)
+        max_limit = 50
+        if limit > max_limit:
+            limit = max_limit
+
+        folder_id = client.get_folder_id(folder)
+        if not folder_id:
+            return json.dumps({"error": f"Folder '{folder}' not found."})
+
+        find_body = {
+            "__type": "FindConversationRequest:#Exchange",
+            "ParentFolderId": {
+                "__type": "TargetFolderId:#Exchange",
+                "BaseFolderId": OWAClient.folder_id_dict(folder_id),
+            },
+            "ConversationShape": {
+                "__type": "ConversationResponseShape:#Exchange",
+                "BaseShape": "IdOnly",
+            },
+            "ShapeName": "ReactConversationListView",
+            "ViewFilter": "All",
+            "Paging": {
+                "__type": "IndexedPageView:#Exchange",
+                "BasePoint": "Beginning",
+                "Offset": 0,
+                "MaxEntriesReturned": 200,
+            },
+        }
+
+        payload = {
+            "__type": "FindConversationJsonRequest:#Exchange",
+            "Header": {
+                "__type": "JsonRequestHeaders:#Exchange",
+                "RequestServerVersion": "Exchange2013",
+            },
+            "Body": find_body,
+        }
+
+        data = client.request("FindConversation", payload)
+        conversations = (data.get("Body") or {}).get("Conversations") or []
+
+        category_lower = category.lower()
+        matches = [
+            c for c in conversations
+            if any(cat.lower() == category_lower for cat in (c.get("Categories") or []))
+        ]
+
+        emails = [_extract_conversation_summary(c) for c in matches[:limit]]
+        return json.dumps({"emails": emails, "count": len(emails)})
+
+    except SessionExpiredError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        return json.dumps({"error": f"Failed to find emails by category: {e}"})

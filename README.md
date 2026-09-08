@@ -2,7 +2,7 @@
 
 # OWA Exchange MCP Server
 
-MCP (Model Context Protocol) server for any Microsoft Exchange / OWA (Outlook Web Access) deployment. Gives LLM agents access to email, calendar, directory search, folders, availability, and meeting analytics via 30 tools.
+MCP (Model Context Protocol) server for any Microsoft Exchange / OWA (Outlook Web Access) deployment. Gives LLM agents access to email, calendar, directory search, folders, categories, availability, and meeting analytics via 40 tools.
 
 Works with any on-premise or hosted Exchange server that exposes OWA.
 
@@ -153,9 +153,9 @@ profile for the MCP server to pick up. Credentials are encrypted at rest
 with AES-256 (PBKDF2 key derivation, 480k iterations); the browser profile
 itself holds the live session (cookies) the way a real browser would.
 
-## Tools (30)
+## Tools (40)
 
-### Email (10)
+### Email (13)
 | Tool | Description |
 |---|---|
 | `get_emails` | List emails from a folder with filtering |
@@ -168,8 +168,11 @@ itself holds the live session (cookies) the way a real browser would.
 | `mark_email_read` | Mark email as read/unread |
 | `download_attachments` | Download file attachments from an email |
 | `get_email_links` | Extract hyperlinks from an email body |
+| `assign_email_categories` | Tag emails with one or more categories |
+| `remove_email_categories` | Remove categories from emails |
+| `find_emails_by_category` | Find emails tagged with a given category |
 
-### Calendar (7)
+### Calendar (10)
 | Tool | Description |
 |---|---|
 | `get_calendar_events` | Get events in a date range (supports recurring expansion) |
@@ -179,6 +182,17 @@ itself holds the live session (cookies) the way a real browser would.
 | `respond_to_meeting` | Accept, decline, or tentatively accept |
 | `download_event_attachments` | Download file attachments from a calendar event |
 | `get_event_links` | Extract hyperlinks from an event description |
+| `assign_event_categories` | Tag calendar events with one or more categories |
+| `remove_event_categories` | Remove categories from calendar events |
+| `find_events_by_category` | Find calendar events tagged with a given category |
+
+### Categories (4)
+| Tool | Description |
+|---|---|
+| `list_categories` | List the master category list (name + color) |
+| `create_category` | Create a new category on the master list |
+| `rename_category` | Rename an existing category |
+| `delete_category` | Delete a category from the master list |
 
 ### Directory (1)
 | Tool | Description |
@@ -225,6 +239,7 @@ exchange_mcp/
   tools/
     email.py              # Email tools
     calendar.py           # Calendar tools
+    categories.py         # Master category list CRUD
     people.py             # Directory search
     folders.py            # Folder management & session check
     availability.py       # Free time / meeting time
