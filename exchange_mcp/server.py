@@ -7,6 +7,7 @@ Uses FastMCP with a lifespan context manager to share a single OWAClient
 
 import argparse
 import asyncio
+import atexit
 import os
 import sys
 import warnings
@@ -110,23 +111,57 @@ async def _startup(browser: BrowserSession, client: OWAClient) -> None:
               "The `login` tool remains available.", file=sys.stderr, flush=True)
 
 
+_shared_state_lock = asyncio.Lock()
+_shared_browser: BrowserSession | None = None
+_shared_client: OWAClient | None = None
+_shared_startup_task: asyncio.Task | None = None
+
+
+async def _get_shared_client() -> OWAClient:
+    """Create the BrowserSession/OWAClient once, on first use, and reuse it for
+    the life of the process.
+
+    Under --transport http, the mcp SDK's StreamableHTTPSessionManager runs a
+    fresh low-level Server.run() - and therefore a fresh app_lifespan() call -
+    per client session, not once for the whole process. Without this module-level
+    singleton, app_lifespan would launch a new browser and log in again on every
+    single client connection, then tear it down when that connection closed,
+    instead of staying warm and shared as intended.
+    """
+    global _shared_browser, _shared_client, _shared_startup_task
+
+    async with _shared_state_lock:
+        if _shared_client is not None:
+            return _shared_client
+
+        owa_url = os.environ.get("EXCHANGE_OWA_URL", "")
+        if not owa_url:
+            raise ValueError("OWA URL not configured. Set the EXCHANGE_OWA_URL environment variable.")
+
+        profile_dir = os.environ.get("EXCHANGE_BROWSER_PROFILE_DIR") or None
+        browser = BrowserSession(owa_url, headless=_resolve_headless(), profile_dir=profile_dir)
+        client = OWAClient(browser)
+        _shared_startup_task = asyncio.create_task(_startup(browser, client))
+        _shared_browser = browser
+        _shared_client = client
+        return client
+
+
+@atexit.register
+def _stop_shared_browser() -> None:
+    if _shared_browser is not None:
+        _shared_browser.stop()
+
+
 @asynccontextmanager
 async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
-    """Set up the shared OWAClient and kick off browser startup in the background."""
-    owa_url = os.environ.get("EXCHANGE_OWA_URL", "")
-    if not owa_url:
-        raise ValueError("OWA URL not configured. Set the EXCHANGE_OWA_URL environment variable.")
+    """Yield the process-wide shared OWAClient (see _get_shared_client).
 
-    profile_dir = os.environ.get("EXCHANGE_BROWSER_PROFILE_DIR") or None
-    browser = BrowserSession(owa_url, headless=_resolve_headless(), profile_dir=profile_dir)
-    client = OWAClient(browser)
-    startup_task = asyncio.create_task(_startup(browser, client))
-
-    try:
-        yield AppContext(client=client)
-    finally:
-        startup_task.cancel()
-        browser.stop()
+    Deliberately does not stop the browser when an individual client session
+    ends - only process exit (_stop_shared_browser, above) does that.
+    """
+    client = await _get_shared_client()
+    yield AppContext(client=client)
 
 
 # Create the MCP server instance

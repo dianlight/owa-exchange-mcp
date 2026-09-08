@@ -34,8 +34,8 @@ Any variable above can also be placed in a gitignored `.env.local` next to `pypr
 ```bash
 export EXCHANGE_OWA_URL=https://owa.example.com
 
-python3 login.py --setup       # One-time credential setup
-python3 login.py               # Login (pre-warms the persistent browser profile)
+python login.py --setup       # One-time credential setup
+python login.py               # Login (pre-warms the persistent browser profile)
 pip install -e .               # Install MCP server
 exchange-mcp-server            # Run MCP server (stdio transport, spawned per client session)
 exchange-mcp-server --show-browser  # Same, with a visible browser window
@@ -43,6 +43,9 @@ exchange-mcp-server --show-browser  # Same, with a visible browser window
 # Persistent local server instead of per-session stdio spawn (start manually,
 # no autostart mechanism — must already be running before a client connects):
 exchange-mcp-server --transport http --port 8765
+
+# Persistent local servet to use during smoke test
+exchange-mcp-server --transport http --port 8765 --show-browser
 ```
 
 Dependencies: `mcp`, `cryptography`, `playwright` (run `playwright install chromium` once). `mcp`'s `streamable-http` transport (`uvicorn`/`starlette`) is already a transitive dependency — no extra install needed for `--transport http`.

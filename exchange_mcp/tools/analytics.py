@@ -44,13 +44,16 @@ def _get_availability_events(
     end: date,
     batch_size: int = 5,
     chunk_days: int = 14,
-) -> dict[str, list[dict]]:
+) -> tuple[dict[str, list[dict]], list[str]]:
     """Query GetUserAvailability for multiple people across a date range.
 
-    Returns dict mapping email -> list of calendar event dicts with
-    keys: subject, start_date, busy_type.
+    Returns (results, errors): results maps email -> list of calendar event
+    dicts with keys: subject, start_date, busy_type. errors collects one
+    message per failed chunk/batch, so a GetUserAvailability failure shows
+    up as a reportable warning instead of silently looking like "no meetings".
     """
     results: dict[str, list[dict]] = {email: [] for email in emails}
+    errors: list[str] = []
 
     # Batch people
     email_batches = [emails[i:i+batch_size] for i in range(0, len(emails), batch_size)]
@@ -101,6 +104,13 @@ def _get_availability_events(
             try:
                 data = client.request('GetUserAvailability', payload)
                 body = data.get('Body', {})
+                if 'ErrorCode' in body:
+                    errors.append(
+                        f"GetUserAvailability failed for {batch}: "
+                        f"{body.get('ExceptionName', body.get('ResponseCode', 'Unknown error'))}"
+                    )
+                    current = chunk_end
+                    continue
                 for i, fb_resp in enumerate(body.get('FreeBusyResponseArray', [])):
                     if i >= len(batch):
                         break
@@ -124,12 +134,12 @@ def _get_availability_events(
                                 'start_date': s[:10],
                                 'busy_type': bt,
                             })
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(f"GetUserAvailability failed for {batch}: {exc}")
 
             current = chunk_end
 
-    return results
+    return results, errors
 
 
 # ------------------------------------------------------------------
@@ -184,7 +194,7 @@ def get_meeting_stats(
             return json.dumps({"error": "Could not resolve any names to email addresses."})
 
         # Query availability
-        avail = _get_availability_events(client, emails, sd, ed)
+        avail, avail_errors = _get_availability_events(client, emails, sd, ed)
 
         # Count working days
         workdays = 0
@@ -226,10 +236,13 @@ def get_meeting_stats(
         # Sort by total descending
         stats.sort(key=lambda x: x["total_meetings"], reverse=True)
 
-        return json.dumps({
+        result = {
             "period": {"start": start_date, "end": end_date, "workdays": workdays},
             "stats": stats,
-        }, ensure_ascii=False)
+        }
+        if avail_errors:
+            result["warnings"] = avail_errors
+        return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": f"Failed to get meeting stats: {e}"})
 
@@ -280,7 +293,7 @@ def get_meeting_contacts(
             return json.dumps({"error": "Could not find calendar folder."})
 
         # Get expanded event subjects with occurrence counts
-        avail_result = _get_availability_events(client, [client.user_email], sd, ed)
+        avail_result, avail_errors = _get_availability_events(client, [client.user_email], sd, ed)
         expanded_events = avail_result.get(client.user_email, [])
 
         subject_counts = Counter(ev['subject'] for ev in expanded_events)
@@ -417,11 +430,14 @@ def get_meeting_contacts(
                 "meetings": count,
             })
 
-        return json.dumps({
+        result = {
             "period": {"start": start_date, "end": end_date},
             "total_meetings": total_expanded,
             "unique_contacts": len(contacts),
             "contacts": result_contacts,
-        }, ensure_ascii=False)
+        }
+        if avail_errors:
+            result["warnings"] = avail_errors
+        return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": f"Failed to get meeting contacts: {e}"})

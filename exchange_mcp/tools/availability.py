@@ -475,7 +475,7 @@ def find_meeting_time(
 
     body = data.get('Body', {})
     if 'ErrorCode' in body:
-        return json.dumps({"error": body.get('FaultMessage', 'Unknown error')})
+        return json.dumps({"error": body.get('FaultMessage') or f"GetUserAvailability failed: {body.get('ExceptionName', 'Unknown error')}"})
 
     # Parse availability responses
     all_busy = []

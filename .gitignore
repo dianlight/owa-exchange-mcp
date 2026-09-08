@@ -18,3 +18,6 @@ __pycache__/
 *.egg-info/
 dist/
 .playwright-mcp/
+
+# Smoke test suite runtime state (server pid/log, result log)
+tests/smoke/.state/

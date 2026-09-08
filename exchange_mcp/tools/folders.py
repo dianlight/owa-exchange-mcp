@@ -39,6 +39,13 @@ def check_session(ctx: Context = None) -> str:
     response with no folder metadata at all). Returns session status,
     the mailbox display name, and cookie file path.
 
+    On the classic canary-cookie backend, RootFolder includes a
+    ParentFolder describing the inbox itself (name, unread count) alongside
+    Folders (its children) - mailbox/unread come from there. On the modern
+    OAuth/Bearer backend ("new Outlook"), RootFolder has no ParentFolder at
+    all, only Folders, so authentication there is inferred from ResponseClass
+    and mailbox/unread are simply omitted.
+
     Returns:
         JSON object with authenticated (bool), mailbox name, and details.
     """
@@ -79,14 +86,14 @@ def check_session(ctx: Context = None) -> str:
         })
 
     for msg in client.extract_items(data):
+        if msg.get("ResponseClass") != "Success":
+            continue
+        result = {"authenticated": True, "cookie_file": str(client.cookie_file)}
         parent_folder = msg.get("RootFolder", {}).get("ParentFolder")
         if parent_folder:
-            return json.dumps({
-                "authenticated": True,
-                "mailbox": parent_folder.get("DisplayName", ""),
-                "unread": parent_folder.get("UnreadCount", 0),
-                "cookie_file": str(client.cookie_file),
-            })
+            result["mailbox"] = parent_folder.get("DisplayName", "")
+            result["unread"] = parent_folder.get("UnreadCount", 0)
+        return json.dumps(result)
 
     return json.dumps({
         "authenticated": False,

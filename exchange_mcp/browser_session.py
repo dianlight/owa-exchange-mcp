@@ -454,25 +454,43 @@ class BrowserSession:
         if body is not None:
             fetch_opts["body"] = body
 
-        result = await asyncio.wait_for(
-            page.evaluate(
-                """
-                async ([url, opts]) => {
-                    try {
-                        const r = await fetch(url, opts);
-                        const text = await r.text();
-                        const headers = {};
-                        r.headers.forEach((v, k) => { headers[k] = v; });
-                        return {status: r.status, headers, body: text, error: null};
-                    } catch (e) {
-                        return {status: 0, headers: {}, body: '', error: String(e)};
-                    }
+        script = """
+            async ([url, opts]) => {
+                try {
+                    const r = await fetch(url, opts);
+                    const text = await r.text();
+                    const headers = {};
+                    r.headers.forEach((v, k) => { headers[k] = v; });
+                    return {status: r.status, headers, body: text, error: null};
+                } catch (e) {
+                    return {status: 0, headers: {}, body: '', error: String(e)};
                 }
-                """,
-                [url, fetch_opts],
-            ),
-            timeout=timeout,
-        )
+            }
+            """
+
+        # The modern Outlook SPA can navigate itself internally (route
+        # changes with no visible URL/reload) at any point, not just right
+        # after the reload() in _async_capture_bearer_context. If that
+        # happens while page.evaluate() is mid-flight, Chromium tears down
+        # the page's JS execution context out from under it - this is
+        # unrelated to a real browser/context crash (see _CRASH_HINTS
+        # above), so it doesn't need a full relaunch, just a brief wait for
+        # the SPA to resettle and one retry of the same fetch.
+        for attempt in range(2):
+            try:
+                result = await asyncio.wait_for(
+                    page.evaluate(script, [url, fetch_opts]), timeout=timeout
+                )
+                break
+            except Exception as exc:
+                if attempt == 0 and "execution context" in str(exc).lower():
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=10000)
+                    except Exception:
+                        pass
+                    continue
+                raise
+
         if result.get("error"):
             raise RuntimeError(f"fetch() from anchor page failed: {result['error']}")
 
