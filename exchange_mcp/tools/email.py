@@ -360,7 +360,7 @@ def _search_folder_aqs(client: OWAClient, parent_folder_id: dict, query: str, li
                 "__type": "ItemResponseShape:#Exchange",
                 "BaseShape": "Default",
                 "AdditionalProperties": [
-                    {"__type": "PropertyUri:#Exchange", "FieldURI": "ParentFolderId"},
+                    {"__type": "PropertyUri:#Exchange", "FieldURI": "item:ParentFolderId"},
                 ],
             },
             "ParentFolderIds": [parent_folder_id],
@@ -421,7 +421,7 @@ def _local_search_fallback(
                     "__type": "ItemResponseShape:#Exchange",
                     "BaseShape": "Default",
                     "AdditionalProperties": [
-                        {"__type": "PropertyUri:#Exchange", "FieldURI": "ParentFolderId"},
+                        {"__type": "PropertyUri:#Exchange", "FieldURI": "item:ParentFolderId"},
                     ],
                 },
                 "ParentFolderIds": parent_folder_ids,
