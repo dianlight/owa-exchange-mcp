@@ -26,7 +26,7 @@ untracked files):
 
 **Net effect for the tool table below:** because every tool module talks to Exchange
 exclusively through `OWAClient.request()` / `OWAClient.request_header_payload()`, and
-those two methods are now fully backed by `BrowserSession`, **all 30 tools are
+those two methods are now fully backed by `BrowserSession`, **all tools are
 architecturally migrated** — there is no tool left calling the old HTTP path directly.
 
 **Update 2026-09-07 — smoke-test suite in progress.** A `tests/smoke/` package now
@@ -169,14 +169,15 @@ classic EWS `GetUserConfiguration`/`UpdateUserConfiguration` pattern 500s with a
 email-side per-item tools use the standard EWS `UpdateItem`/`SetItemField` action and work
 correctly.
 
-The calendar-side per-item write tools do not: `assign_event_categories`/
-`remove_event_categories` cannot persist a `Categories` change on this OWA build — see
-their `KO` rows below. Getting here surfaced and fixed a real false-positive-success bug
-along the way: OWA's `UpdateItem` action can return a top-level fault envelope
-(`{"Body": {"ErrorCode": ..., "FaultMessage": ...}}`) with no `ResponseMessages` key at
-all, which `OWAClient.extract_items()` silently treats as "no items, so no error" — every
-existing `UpdateItem`-based tool that only checked per-item `ResponseClass == "Error"` was
-exposed to this exact class of silent failure. Fixed centrally in
+At the time, the calendar-side per-item write tools did not: `assign_event_categories`/
+`remove_event_categories` could not persist a `Categories` change on this OWA build via the
+standard EWS `UpdateItem`/`SetItemField` action — see the follow-up update below for the fix.
+Getting here surfaced and fixed a real false-positive-success bug along the way: OWA's
+`UpdateItem` action can return a top-level fault envelope (`{"Body": {"ErrorCode": ...,
+"FaultMessage": ...}}`) with no `ResponseMessages` key at all, which
+`OWAClient.extract_items()` silently treats as "no items, so no error" — every existing
+`UpdateItem`-based tool that only checked per-item `ResponseClass == "Error"` was exposed to
+this exact class of silent failure. Fixed centrally in
 [owa_client.py](exchange_mcp/owa_client.py)'s `_to_json()`, which now raises immediately on
 that fault-envelope shape, so any current or future caller gets a real error instead of a
 false "success" — this is a general hardening, not specific to categories.
@@ -184,6 +185,67 @@ false "success" — this is a general hardening, not specific to categories.
 bug) works correctly.
 
 All 40 tools have now been exercised at least once against a real OWA mailbox.
+
+**Update 2026-09-08 (continued) — fixed the category write-path on calendar items.**
+`assign_event_categories`/`remove_event_categories` were failing because standard EWS
+`UpdateItem`/`SetItemField` unconditionally rejects `CalendarItem` updates on this OWA build
+with `ErrorSendMeetingInvitationsOrCancellationsRequired`, no matter what
+`SendMeetingInvitationsOrCancellations`/`...Specified` combination is sent. Resolved by
+driving the real OWA web UI with Playwright against the persistent Chromium profile and
+capturing the actual request its own client sends when toggling a category on an
+already-saved event (headers redacted before anything was printed or written to disk, per
+the project's standing rule against persisting live bearer tokens). OWA's web client doesn't
+use `UpdateItem` for this at all — it POSTs a bespoke `UpdateCalendarEvent` action via the
+`X-OWA-UrlPostData` header (empty POST body, same transport `categories.py`'s
+`UpdateMasterCategoryList` already uses), with a singular `ItemChange`, a top-level `EventId`
+mirroring `ItemChange.ItemId`, no `ChangeKey`/`ConflictResolution`, and
+`ShouldSendUpdateToAttendees`/`EventScope`/`TargetAudience` in place of
+`SendMeetingInvitationsOrCancellations`. `_set_event_categories` in
+[calendar.py](exchange_mcp/tools/calendar.py) now builds and sends that exact shape via
+`OWAClient.request_header_payload()`; re-run against a real mailbox via
+`test_calendar_category_tagging.py`, which now passes end to end.
+
+**Update 2026-09-08 (continued) — `get_calendar_events` returned empty results.**
+Reported as a live bug: real calendar items confirmed to exist via direct `GetItem`
+lookups were not showing up in `get_calendar_events` for date ranges that definitely
+contained them, reproduced on both a freshly created zero-attendee appointment and
+wide multi-month ranges. Root-caused to two independent, unrelated bugs, not a
+session/canary degradation:
+
+1. `get_calendar_events`'s default and `expand_recurring=True` modes both treated
+   `GetUserAvailability` as the authoritative event source (`FindItem` results were
+   only used to enrich matches already found there). `GetUserAvailability` returns a
+   permanent `{"ErrorCode": 500, "ExceptionName": "NotImplementedException"}` fault on
+   this OWA build regardless of `RequestedView` — confirmed across all five documented
+   values. Since that call always failed (silently, into a swallowing `except
+   Exception: pass`), the "authoritative" list was always empty, so the merge step
+   never had anything to enrich. Fixed by dropping `GetUserAvailability` entirely and
+   making `FindItem`+`CalendarView` the sole source, mirroring the pattern
+   `find_events_by_category` already used successfully. The `expand_recurring`
+   parameter was removed rather than fixed: it depended entirely on
+   `GetUserAvailability`'s expansion, and this backend's `CalendarView` does not expand
+   recurring series into per-occurrence items either (a series master item's own
+   `CalendarItemType` is `RecurringMaster`, appearing once, not once per occurrence —
+   verified directly by fetching a real 3-month range and finding zero
+   `Occurrence`/`Exception`-typed items alongside 147 `RecurringMaster` ones). This is a
+   narrower documented limitation, not a regression: no code path on this deployment
+   can currently expand recurring series into occurrences.
+2. Independently, and more severely: `FindItem`'s `CalendarView.StartDate`/`EndDate`
+   has **no filtering effect at all** on this OWA build — verified by querying the
+   same folder with a 1-day window, a window in the year 1901, and a window in the
+   year 2099, all three returning the identical ~4800-item count (the entire calendar
+   folder, unfiltered). This affected both `get_calendar_events` and
+   `find_events_by_category` (the latter was previously marked `OK` because its
+   category-match assertions happened to still pass — the date-range parameters were
+   silently no-ops the whole time). Fixed by filtering `FindItem`'s results
+   client-side against each item's own `Start`/`End` in both tools
+   (`_filter_items_by_date_range` in [calendar.py](exchange_mcp/tools/calendar.py)).
+
+Also strengthened [test_get_calendar_events.py](tests/smoke/tests/test_get_calendar_events.py):
+the old version only asserted the tool returned *a list*, which an always-empty result
+satisfied just as well as a correct one — exactly how this bug went undetected. It now
+creates a disposable appointment inside the query window and asserts it comes back by
+`item_id`, then cleans up.
 
 `
 ✶ Insight ─────────────────────────────────────
@@ -201,13 +263,17 @@ itself during a transport swap.
 [server.py](exchange_mcp/server.py) gained a `--transport {stdio,http}` flag for running
 it as a persistent long-lived process instead of a per-session stdio spawn. There is no
 autostart mechanism — it must be started manually. This doesn't change any tool's
-Migration/Automated-test/Manual-QA status below — every tool still goes through the same
+Automated-test/Manual-QA status below — every tool still goes through the same
 `OWAClient`/`BrowserSession` regardless of which transport carries the MCP session.
 
 ## 2. How to read the table
 
-- **Migration** — `Migrated` means the tool's code path goes exclusively through the
-  browser-backed `OWAClient`. Nothing in this codebase is `Unmigrated` today.
+- **ID** — a permanent 3-digit identifier: digit 1 is the module number (fixed per
+  module, see the module list below), digits 2-3 are the tool's sequence number within
+  that module. Once assigned, a tool's ID never changes or gets reused, even if the
+  table is reordered or tools are added/removed elsewhere — see CLAUDE.md's "Maintaining
+  PROJECT_STATUS.md" section for the assignment rule. Module numbers: 1 Email, 2
+  Calendar, 3 Categories, 4 Directory, 5 Folders, 6 Availability, 7 Analytics, 8 Auth.
 - **Automated test** — this repo has **no test suite** (no `tests/` folder, no CI
   config found). So this column is `None` for every row — it is a statement about the
   repo, not about any individual tool.
@@ -223,83 +289,83 @@ Migration/Automated-test/Manual-QA status below — every tool still goes throug
 
 ### Email — [exchange_mcp/tools/email.py](exchange_mcp/tools/email.py) (13)
 
-| Tool | Description | Migration | Automated test | Manual QA / Status |
+| ID | Tool | Description | Automated test | Manual QA / Status |
 |---|---|---|---|---|
-| `get_emails` | List emails from a folder, grouped by conversation/thread, with unread/pagination filters | Migrated | `tests/smoke/tests/test_get_emails.py` | OK (2026-09-07) |
-| `get_email` | Get a single email's full body, recipients, and attachments | Migrated | `tests/smoke/tests/test_get_email_detail.py` | OK (2026-09-07) |
-| `send_email` | Send a new email (to/cc/bcc, HTML or plain text) | Migrated | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) |
-| `reply_email` | Reply (or reply-all) to an email | Migrated | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) |
-| `forward_email` | Forward an email to new recipients | Migrated | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) |
-| `mark_email_read` | Mark one or more emails read/unread | Migrated | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) |
-| `move_email` | Move one or more emails to another folder | Migrated | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) |
-| `delete_email` | Delete (soft or permanent) one or more emails | Migrated | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) |
-| `download_attachments` | Download all file attachments from an email to disk | Migrated | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) |
-| `get_email_links` | Extract hyperlinks from an email's HTML body | Migrated | `tests/smoke/tests/test_get_email_detail.py` | OK (2026-09-07) |
-| `assign_email_categories` | Add one or more categories to emails, keeping any already present | Migrated | `tests/smoke/tests/test_email_category_tagging.py` | OK (2026-09-08) |
-| `remove_email_categories` | Remove one or more categories from emails, keeping any others present | Migrated | `tests/smoke/tests/test_email_category_tagging.py` | OK (2026-09-08) |
-| `find_emails_by_category` | Find email conversations tagged with a given category | Migrated | `tests/smoke/tests/test_email_category_tagging.py` | OK (2026-09-08) |
+| 101 | `get_emails` | List emails from a folder, grouped by conversation/thread, with unread/pagination filters | `tests/smoke/tests/test_get_emails.py` | OK (2026-09-07) |
+| 102 | `get_email` | Get a single email's full body, recipients, and attachments | `tests/smoke/tests/test_get_email_detail.py` | OK (2026-09-07) |
+| 103 | `send_email` | Send a new email (to/cc/bcc, HTML or plain text) | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) |
+| 104 | `reply_email` | Reply (or reply-all) to an email | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) |
+| 105 | `forward_email` | Forward an email to new recipients | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) |
+| 106 | `mark_email_read` | Mark one or more emails read/unread | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) |
+| 107 | `move_email` | Move one or more emails to another folder | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) |
+| 108 | `delete_email` | Delete (soft or permanent) one or more emails | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) |
+| 109 | `download_attachments` | Download all file attachments from an email to disk | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) |
+| 110 | `get_email_links` | Extract hyperlinks from an email's HTML body | `tests/smoke/tests/test_get_email_detail.py` | OK (2026-09-07) |
+| 111 | `assign_email_categories` | Add one or more categories to emails, keeping any already present | `tests/smoke/tests/test_email_category_tagging.py` | OK (2026-09-08) |
+| 112 | `remove_email_categories` | Remove one or more categories from emails, keeping any others present | `tests/smoke/tests/test_email_category_tagging.py` | OK (2026-09-08) |
+| 113 | `find_emails_by_category` | Find email conversations tagged with a given category | `tests/smoke/tests/test_email_category_tagging.py` | OK (2026-09-08) |
 
 ### Calendar — [exchange_mcp/tools/calendar.py](exchange_mcp/tools/calendar.py) (10)
 
-| Tool | Description | Migration | Automated test | Manual QA / Status |
+| ID | Tool | Description | Automated test | Manual QA / Status |
 |---|---|---|---|---|
-| `get_calendar_events` | List events in a date range; optional recurring-occurrence expansion | Migrated | `tests/smoke/tests/test_get_calendar_events.py` | OK (2026-09-08) |
-| `create_meeting` | Create a meeting with attendees, location, reminder, sensitivity | Migrated | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) |
-| `update_meeting` | Update a meeting (implemented as cancel + recreate — OWA JSON API has no reliable `UpdateItem` for calendar items) | Migrated | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) |
-| `cancel_meeting` | Cancel a meeting and notify attendees (soft-delete only — moves to Deleted Items, no permanent-delete option) | Migrated | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) |
-| `respond_to_meeting` | Accept / decline / tentatively accept a meeting invite | Migrated | None — self-invite produces no meeting-request email to respond to (confirmed 2026-09-08; Exchange doesn't ask an organizer to accept their own invite), so this can't be covered by a self-contained automated test | OK (2026-09-08, manual) — verified against a real incoming Google Calendar invite from a different account (Tentative response sent successfully) |
-| `download_event_attachments` | Download file attachments from a calendar event | Migrated | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) |
-| `get_event_links` | Extract hyperlinks from an event's HTML description | Migrated | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) |
-| `assign_event_categories` | Add one or more categories to events, keeping any already present | Migrated | `tests/smoke/tests/test_calendar_category_tagging.py` | KO (2026-09-08) — `UpdateItem` on a `CalendarItem` always fails with `ErrorSendMeetingInvitationsOrCancellationsRequired` on this OWA build, even with the attribute sent at the exact documented position plus the `Specified` companion flag Microsoft's own EWS Managed API code sample sets alongside it. Ruled out: the attribute's value, the `Specified` flag, meeting vs. plain zero-attendee appointment, and a bespoke `UpdateCalendarEvent` action (which instead rejects the standard `ItemId` as malformed). Not fixable client-side without a captured example of OWA's own web client performing this action — see `_set_event_categories`'s docstring in [calendar.py](exchange_mcp/tools/calendar.py) for the full trail. |
-| `remove_event_categories` | Remove one or more categories from events, keeping any others present | Migrated | `tests/smoke/tests/test_calendar_category_tagging.py` | KO (2026-09-08) — same root cause as `assign_event_categories` above (shares `_set_event_categories`). |
-| `find_events_by_category` | Find events tagged with a given category | Migrated | `tests/smoke/tests/test_calendar_category_tagging.py` | OK (2026-09-08) — pure `FindItem`+`CalendarView` read, unaffected by the write-path bug above. |
+| 201 | `get_calendar_events` | List events in a date range (a recurring series appears once, as its master item, not expanded per occurrence) | `tests/smoke/tests/test_get_calendar_events.py` | OK (2026-09-08, re-verified) — see "Update 2026-09-08 (continued) — get_calendar_events returned empty results" below |
+| 202 | `create_meeting` | Create a meeting with attendees, location, reminder, sensitivity | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) |
+| 203 | `update_meeting` | Update a meeting (implemented as cancel + recreate — OWA JSON API has no reliable `UpdateItem` for calendar items) | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) |
+| 204 | `cancel_meeting` | Cancel a meeting and notify attendees (soft-delete only — moves to Deleted Items, no permanent-delete option) | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) |
+| 205 | `respond_to_meeting` | Accept / decline / tentatively accept a meeting invite | None — self-invite produces no meeting-request email to respond to (confirmed 2026-09-08; Exchange doesn't ask an organizer to accept their own invite), so this can't be covered by a self-contained automated test | OK (2026-09-08, manual) — verified against a real incoming Google Calendar invite from a different account (Tentative response sent successfully) |
+| 206 | `download_event_attachments` | Download file attachments from a calendar event | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) |
+| 207 | `get_event_links` | Extract hyperlinks from an event's HTML description | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) |
+| 208 | `assign_event_categories` | Add one or more categories to events, keeping any already present | `tests/smoke/tests/test_calendar_category_tagging.py` | OK (2026-09-08) — fixed by switching `_set_event_categories` to the bespoke `UpdateCalendarEvent` action captured from OWA's own web client; see "Update 2026-09-08 (continued) — fixed the category write-path" below. |
+| 209 | `remove_event_categories` | Remove one or more categories from events, keeping any others present | `tests/smoke/tests/test_calendar_category_tagging.py` | OK (2026-09-08) — same fix as `assign_event_categories` above (shares `_set_event_categories`). |
+| 210 | `find_events_by_category` | Find events tagged with a given category within a date range | `tests/smoke/tests/test_calendar_category_tagging.py` | OK (2026-09-08, re-verified) — pure `FindItem`+`CalendarView` read, unaffected by the write-path bug above; its date-range filtering had the same silent no-op bug as `get_calendar_events` (see below) and is now fixed by the same client-side filter. |
 
 ### Categories — [exchange_mcp/tools/categories.py](exchange_mcp/tools/categories.py) (4)
 
-| Tool | Description | Migration | Automated test | Manual QA / Status |
+| ID | Tool | Description | Automated test | Manual QA / Status |
 |---|---|---|---|---|
-| `list_categories` | List every category in the mailbox's master category list | Migrated | `tests/smoke/tests/test_category_lifecycle.py` | OK (2026-09-08) |
-| `create_category` | Create a new category in the master category list | Migrated | `tests/smoke/tests/test_category_lifecycle.py` | OK (2026-09-08) |
-| `rename_category` | Rename an existing category in the master category list | Migrated | `tests/smoke/tests/test_category_lifecycle.py` | OK (2026-09-08) |
-| `delete_category` | Delete a category from the master category list | Migrated | `tests/smoke/tests/test_category_lifecycle.py` | OK (2026-09-08) |
+| 301 | `list_categories` | List every category in the mailbox's master category list | `tests/smoke/tests/test_category_lifecycle.py` | OK (2026-09-08) |
+| 302 | `create_category` | Create a new category in the master category list | `tests/smoke/tests/test_category_lifecycle.py` | OK (2026-09-08) |
+| 303 | `rename_category` | Rename an existing category in the master category list | `tests/smoke/tests/test_category_lifecycle.py` | OK (2026-09-08) |
+| 304 | `delete_category` | Delete a category from the master category list | `tests/smoke/tests/test_category_lifecycle.py` | OK (2026-09-08) |
 
 ### Directory — [exchange_mcp/tools/people.py](exchange_mcp/tools/people.py) (1)
 
-| Tool | Description | Migration | Automated test | Manual QA / Status |
+| ID | Tool | Description | Automated test | Manual QA / Status |
 |---|---|---|---|---|
-| `find_person` | Search Active Directory (`ResolveNames`) for people by name/email/keyword | Migrated | `tests/smoke/tests/test_find_person.py` | KO (2026-09-08) — `ResolveNames` throws a server-side `System.NullReferenceException` on this tenant (confirmed via `x-owa-error`/`x-owaerrormessageid` response headers); not fixable client-side. Also breaks `get_meeting_stats` (below), which resolves names the same way. |
+| 401 | `find_person` | Search Active Directory (`ResolveNames`) for people by name/email/keyword | `tests/smoke/tests/test_find_person.py` | KO (2026-09-08) — `ResolveNames` throws a server-side `System.NullReferenceException` on this tenant (confirmed via `x-owa-error`/`x-owaerrormessageid` response headers); not fixable client-side. Also breaks `get_meeting_stats` (below), which resolves names the same way. |
 
 ### Folders — [exchange_mcp/tools/folders.py](exchange_mcp/tools/folders.py) (7)
 
-| Tool | Description | Migration | Automated test | Manual QA / Status |
+| ID | Tool | Description | Automated test | Manual QA / Status |
 |---|---|---|---|---|
-| `check_session` | Lightweight auth check (`FindFolder` on inbox) — reports mailbox name + unread count when the backend's response includes them (omitted on the modern OAuth/Bearer backend, which never returns `ParentFolder`) | Migrated | `tests/smoke/tests/test_check_session.py` | OK (2026-09-07) |
-| `get_folders` | List mail folders (shallow or recursive) with counts | Migrated | `tests/smoke/tests/test_get_folders.py` | OK (2026-09-08) |
-| `create_folder` | Create a new mail folder | Migrated | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) |
-| `rename_folder` | Rename an existing folder | Migrated | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) |
-| `empty_folder` | Empty all items from a folder | Migrated | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) |
-| `delete_folder` | Delete a mail folder | Migrated | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) |
-| `move_folder` | Move a folder under a different parent | Migrated | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) |
+| 501 | `check_session` | Lightweight auth check (`FindFolder` on inbox) — reports mailbox name + unread count when the backend's response includes them (omitted on the modern OAuth/Bearer backend, which never returns `ParentFolder`) | `tests/smoke/tests/test_check_session.py` | OK (2026-09-07) |
+| 502 | `get_folders` | List mail folders (shallow or recursive) with counts | `tests/smoke/tests/test_get_folders.py` | OK (2026-09-08) |
+| 503 | `create_folder` | Create a new mail folder | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) |
+| 504 | `rename_folder` | Rename an existing folder | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) |
+| 505 | `empty_folder` | Empty all items from a folder | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) |
+| 506 | `delete_folder` | Delete a mail folder | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) |
+| 507 | `move_folder` | Move a folder under a different parent | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) |
 
 ### Availability — [exchange_mcp/tools/availability.py](exchange_mcp/tools/availability.py) (2)
 
-| Tool | Description | Migration | Automated test | Manual QA / Status |
+| ID | Tool | Description | Automated test | Manual QA / Status |
 |---|---|---|---|---|
-| `find_free_time` | Find free slots in your own calendar within working hours | Migrated | `tests/smoke/tests/test_find_free_time.py` | OK (2026-09-08) |
-| `find_meeting_time` | Find common free slots across multiple attendees (`GetUserAvailability`) | Migrated | `tests/smoke/tests/test_find_meeting_time.py` | KO (2026-09-08) — `GetUserAvailability` returns a structured error body (`ErrorCode: 500, ExceptionName: NotImplementedException`) on this tenant; the action isn't implemented on this OWA backend at all. Also breaks `get_meeting_stats`/`get_meeting_contacts` (below), which share this call. Fixed a real bug found while diagnosing this: the error path read `body.get('FaultMessage', 'Unknown error')`, which doesn't fall back when the key is present-but-`null` (as here) — now falls back to `ExceptionName` so the real error surfaces instead of `{"error": null}`. |
+| 601 | `find_free_time` | Find free slots in your own calendar within working hours | `tests/smoke/tests/test_find_free_time.py` | OK (2026-09-08) |
+| 602 | `find_meeting_time` | Find common free slots across multiple attendees (`GetUserAvailability`) | `tests/smoke/tests/test_find_meeting_time.py` | KO (2026-09-08) — `GetUserAvailability` returns a structured error body (`ErrorCode: 500, ExceptionName: NotImplementedException`) on this tenant; the action isn't implemented on this OWA backend at all. Also breaks `get_meeting_stats`/`get_meeting_contacts` (below), which share this call. Fixed a real bug found while diagnosing this: the error path read `body.get('FaultMessage', 'Unknown error')`, which doesn't fall back when the key is present-but-`null` (as here) — now falls back to `ExceptionName` so the real error surfaces instead of `{"error": null}`. |
 
 ### Analytics — [exchange_mcp/tools/analytics.py](exchange_mcp/tools/analytics.py) (2)
 
-| Tool | Description | Migration | Automated test | Manual QA / Status |
+| ID | Tool | Description | Automated test | Manual QA / Status |
 |---|---|---|---|---|
-| `get_meeting_stats` | Meeting-count statistics for one or more people over a date range | Migrated | `tests/smoke/tests/test_get_meeting_stats.py` | KO (2026-09-08) — fails at the `ResolveNames` step (same `NullReferenceException` as `find_person`) before it ever reaches `GetUserAvailability`. |
-| `get_meeting_contacts` | Weighted "who you meet with most" connection matrix from your own calendar | Migrated | `tests/smoke/tests/test_get_meeting_contacts.py` | OK (2026-09-08), with caveats — doesn't call `ResolveNames`, so it doesn't hit that bug, but its sole data source (`GetUserAvailability`) is the same unimplemented action as `find_meeting_time`, so it always returns 0 meetings/0 contacts on this backend. Fixed a real bug found here: `_get_availability_events()` silently swallowed that failure (`except Exception: pass`) and never checked for an `ErrorCode` in a successfully-parsed error body either, so both this tool and `get_meeting_stats` were reporting a false-clean empty result instead of a diagnosable one. Now returns `(results, errors)` and both tools add a `"warnings"` field when `errors` is non-empty — verified live: a 30-day query now returns `"warnings": ["GetUserAvailability failed for [...]: NotImplementedException", ...]` instead of silently looking like "no meetings". [test_get_meeting_contacts.py](tests/smoke/tests/test_get_meeting_contacts.py)/[test_get_meeting_stats.py](tests/smoke/tests/test_get_meeting_stats.py) now include `warnings` in their recorded note when present, so a passing smoke-test run no longer hides this behind a bare `OK` — the underlying data is still empty on this backend (that part is unfixable here), but it's no longer silent about why. |
+| 701 | `get_meeting_stats` | Meeting-count statistics for one or more people over a date range | `tests/smoke/tests/test_get_meeting_stats.py` | KO (2026-09-08) — fails at the `ResolveNames` step (same `NullReferenceException` as `find_person`) before it ever reaches `GetUserAvailability`. |
+| 702 | `get_meeting_contacts` | Weighted "who you meet with most" connection matrix from your own calendar | `tests/smoke/tests/test_get_meeting_contacts.py` | OK (2026-09-08), with caveats — doesn't call `ResolveNames`, so it doesn't hit that bug, but its sole data source (`GetUserAvailability`) is the same unimplemented action as `find_meeting_time`, so it always returns 0 meetings/0 contacts on this backend. Fixed a real bug found here: `_get_availability_events()` silently swallowed that failure (`except Exception: pass`) and never checked for an `ErrorCode` in a successfully-parsed error body either, so both this tool and `get_meeting_stats` were reporting a false-clean empty result instead of a diagnosable one. Now returns `(results, errors)` and both tools add a `"warnings"` field when `errors` is non-empty — verified live: a 30-day query now returns `"warnings": ["GetUserAvailability failed for [...]: NotImplementedException", ...]` instead of silently looking like "no meetings". [test_get_meeting_contacts.py](tests/smoke/tests/test_get_meeting_contacts.py)/[test_get_meeting_stats.py](tests/smoke/tests/test_get_meeting_stats.py) now include `warnings` in their recorded note when present, so a passing smoke-test run no longer hides this behind a bare `OK` — the underlying data is still empty on this backend (that part is unfixable here), but it's no longer silent about why. |
 
 ### Auth — [exchange_mcp/tools/auth.py](exchange_mcp/tools/auth.py) (1)
 
-| Tool | Description | Migration | Automated test | Manual QA / Status |
+| ID | Tool | Description | Automated test | Manual QA / Status |
 |---|---|---|---|---|
-| `login` | Credential setup + two-call, non-blocking 2FA login against the shared browser session | Migrated | `tests/smoke/tests/test_login.py` (idempotent "already active" path only — see note below) | OK (2026-09-08) |
+| 801 | `login` | Credential setup + two-call, non-blocking 2FA login against the shared browser session | `tests/smoke/tests/test_login.py` (idempotent "already active" path only — see note below) | OK (2026-09-08) |
 
 ## 4. Gaps worth closing
 
@@ -310,7 +376,7 @@ Migration/Automated-test/Manual-QA status below — every tool still goes throug
   picking the right `__type` for a distinguished vs. opaque folder ID — both would be
   cheap to unit test without a live mailbox and remain a gap.
 - **No live/manual QA log.** There's no record (changelog, issue tracker, etc.) of which
-  of the 30 tools have actually been run against a real OWA mailbox since the
+  of the 40 tools have actually been run against a real OWA mailbox since the
   browser-session rewrite. This document's "Manual QA / Status" column is a template for
   that log — fill it in as you verify each tool.
 - **`BrowserSession`'s crash recovery doesn't cover a stuck profile lock.** Its documented

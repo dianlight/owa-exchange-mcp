@@ -27,27 +27,6 @@ def _get_client(ctx: Context) -> OWAClient:
 # ------------------------------------------------------------------
 
 
-def _utc_to_local_str(dt_str: str) -> str:
-    """Convert a UTC ISO timestamp to local Moscow time string.
-
-    FindItem returns UTC (e.g. '2026-02-17T06:30:00Z'), while
-    GetUserAvailability returns local Moscow time ('2026-02-17T09:30:00').
-    This normalizes to the local format for key matching.
-    Moscow is permanently UTC+3 (no DST since 2014).
-    """
-    if not dt_str:
-        return dt_str
-    if dt_str.endswith("Z"):
-        try:
-            utc_dt = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%SZ")
-            local_dt = utc_dt + timedelta(hours=3)
-            return local_dt.strftime("%Y-%m-%dT%H:%M:%S")
-        except ValueError:
-            return dt_str.rstrip("Z")
-    # No timezone suffix — already local time
-    return dt_str
-
-
 def _get_event_details(client: OWAClient, item_id: str) -> dict:
     """Get full event details (body, organizer, attendees) via GetItem."""
     payload = {
@@ -307,154 +286,32 @@ def _build_html_body(description: str | None) -> str:
     return body
 
 
-@mcp.tool()
-def _debug_get_user_availability_raw(
-    start_date: str,
-    end_date: str,
-    ctx: Context = None,
-) -> str:
-    """TEMPORARY DEBUG TOOL. Returns the raw GetUserAvailability response."""
-    client = _get_client(ctx)
-    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-    payload = {
-        '__type': 'GetUserAvailabilityJsonRequest:#Exchange',
-        'Header': {
-            '__type': 'JsonRequestHeaders:#Exchange',
-            'RequestServerVersion': 'Exchange2013',
-            'TimeZoneContext': {
-                '__type': 'TimeZoneContext:#Exchange',
-                'TimeZoneDefinition': {
-                    '__type': 'TimeZoneDefinitionType:#Exchange',
-                    'Id': 'Russian Standard Time',
-                },
-            },
-        },
-        'Body': {
-            '__type': 'GetUserAvailabilityRequest:#Exchange',
-            'MailboxDataArray': [{
-                '__type': 'MailboxData:#Exchange',
-                'Email': {'__type': 'EmailAddress:#Exchange', 'Address': client.user_email},
-                'AttendeeType': 'Required',
-            }],
-            'FreeBusyViewOptions': {
-                '__type': 'FreeBusyViewOptions:#Exchange',
-                'TimeWindow': {
-                    '__type': 'Duration:#Exchange',
-                    'StartTime': f'{start_dt.date()}T00:00:00',
-                    'EndTime': f'{end_dt.date()}T00:00:00',
-                },
-                'MergedFreeBusyIntervalInMinutes': 30,
-                'RequestedView': 'DetailedMerged',
-            },
-        },
-    }
-    try:
-        data = client.request('GetUserAvailability', payload)
-        return json.dumps({
-            "user_email": client.user_email,
-            "payload": payload,
-            "response": data,
-        }, ensure_ascii=False, default=str)
-    except Exception as e:
-        return json.dumps({
-            "user_email": client.user_email,
-            "payload": payload,
-            "exception": str(e),
-        }, ensure_ascii=False, default=str)
-
-
 # ------------------------------------------------------------------
 # Tool 1: get_calendar_events
 # ------------------------------------------------------------------
 
 
-def _get_expanded_events(
-    client: OWAClient, start_date, end_date, chunk_days: int = 14
+def _filter_items_by_date_range(
+    items: list[dict], start_dt: datetime, end_dt_exclusive: datetime
 ) -> list[dict]:
-    """Get expanded calendar events via GetUserAvailability.
+    """Keep only items overlapping [start_dt, end_dt_exclusive).
 
-    Unlike FindItem (which returns only master items for recurring series),
-    this returns every individual occurrence within the date range.
-
-    Requires client.user_email to be set (done by the login tool).
+    FindItem's CalendarView StartDate/EndDate has no filtering effect on this
+    OWA backend -- it always returns every item in the folder regardless of
+    the requested window (confirmed empirically: a 1-day window and a 200-year
+    window returned the identical item count). This filters client-side using
+    each item's own Start/End instead.
     """
-    if not client.user_email:
-        return []
-
-    expanded = []
-    current = start_date
-
-    while current < end_date:
-        chunk_end = min(current + timedelta(days=chunk_days), end_date)
-
-        payload = {
-            '__type': 'GetUserAvailabilityJsonRequest:#Exchange',
-            'Header': {
-                '__type': 'JsonRequestHeaders:#Exchange',
-                'RequestServerVersion': 'Exchange2013',
-                'TimeZoneContext': {
-                    '__type': 'TimeZoneContext:#Exchange',
-                    'TimeZoneDefinition': {
-                        '__type': 'TimeZoneDefinitionType:#Exchange',
-                        'Id': 'Russian Standard Time',
-                    },
-                },
-            },
-            'Body': {
-                '__type': 'GetUserAvailabilityRequest:#Exchange',
-                'MailboxDataArray': [{
-                    '__type': 'MailboxData:#Exchange',
-                    'Email': {'__type': 'EmailAddress:#Exchange', 'Address': client.user_email},
-                    'AttendeeType': 'Required',
-                }],
-                'FreeBusyViewOptions': {
-                    '__type': 'FreeBusyViewOptions:#Exchange',
-                    'TimeWindow': {
-                        '__type': 'Duration:#Exchange',
-                        'StartTime': f'{current}T00:00:00',
-                        'EndTime': f'{chunk_end}T00:00:00',
-                    },
-                    'MergedFreeBusyIntervalInMinutes': 30,
-                    'RequestedView': 'DetailedMerged',
-                },
-            },
-        }
-
+    kept = []
+    for item in items:
         try:
-            data = client.request('GetUserAvailability', payload)
-            body = data.get('Body', {})
-            for fb_resp in body.get('FreeBusyResponseArray', []):
-                fb_view = fb_resp.get('FreeBusyView', {})
-                cal_events = fb_view.get('CalendarEventArray', {})
-                items = (
-                    cal_events.get('Items', [])
-                    if isinstance(cal_events, dict)
-                    else (cal_events if isinstance(cal_events, list) else [])
-                )
-                for event in items:
-                    bt = event.get('BusyType', '')
-                    details = event.get('CalendarEventDetails', {})
-                    subject = details.get('Subject', '') if details else ''
-                    location = details.get('Location', '') if details else ''
-                    is_meeting = details.get('IsMeeting', False) if details else False
-                    is_recurring = details.get('IsRecurring', False) if details else False
-
-                    expanded.append({
-                        'subject': subject or '(No subject)',
-                        'start': event.get('StartTime', ''),
-                        'end': event.get('EndTime', ''),
-                        'busy_type': bt,
-                        'location': location,
-                        'is_meeting': is_meeting,
-                        'is_recurring': is_recurring,
-                    })
-        except Exception:
-            pass
-
-        current = chunk_end
-
-    return sorted(expanded, key=lambda x: x.get('start', ''))
+            item_start = parse_iso_datetime(item.get("Start", ""))
+            item_end = parse_iso_datetime(item.get("End", "") or item.get("Start", ""))
+        except (ValueError, TypeError):
+            continue
+        if item_start < end_dt_exclusive and item_end > start_dt:
+            kept.append(item)
+    return kept
 
 
 @mcp.tool()
@@ -462,7 +319,6 @@ def get_calendar_events(
     start_date: str,
     end_date: str,
     include_body: bool = True,
-    expand_recurring: bool = False,
     ctx: Context = None,
 ) -> str:
     """Get calendar events within a date range.
@@ -472,14 +328,14 @@ def get_calendar_events(
         end_date: End date in YYYY-MM-DD format.
         include_body: If True, fetch full event details (organizer, attendees, body)
                       via GetItem for each event. Slower but more complete.
-                      Ignored when expand_recurring=True.
-        expand_recurring: If True, show every individual occurrence of recurring
-                          meetings (via GetUserAvailability). This gives an accurate
-                          count of all events but returns fewer fields per event
-                          (no item_id, attendees, or body). Default False.
 
     Returns:
         JSON array of event objects with subject, start, end, location, attendees, etc.
+        A recurring series appears once, as its master item (calendar_item_type
+        "RecurringMaster"), not expanded into one entry per occurrence -- this
+        OWA deployment's CalendarView does not perform occurrence expansion, and
+        GetUserAvailability (which would normally provide that expansion) returns
+        a permanent NotImplementedException on this backend.
     """
     client = _get_client(ctx)
 
@@ -490,114 +346,68 @@ def get_calendar_events(
         return json.dumps({"error": f"Invalid date format: {e}"})
 
     try:
-        # --- Expanded mode: uses GetUserAvailability for accurate recurring counts ---
-        if expand_recurring:
-            expanded = _get_expanded_events(
-                client, start_dt.date(), (end_dt + timedelta(days=1)).date()
-            )
-            events = []
-            for ev in expanded:
-                events.append({
-                    "subject": ev['subject'],
-                    "start": ev['start'],
-                    "end": ev['end'],
-                    "location": ev.get('location', ''),
-                    "busy_type": ev.get('busy_type', ''),
-                    "is_meeting": ev.get('is_meeting', False),
-                    "is_recurring": ev.get('is_recurring', False),
-                })
-            return json.dumps(events, ensure_ascii=False)
-
-        # --- Default mode ---
-        # Step 1: Get all events (including recurring) via GetUserAvailability
-        expanded = _get_expanded_events(
-            client, start_dt.date(), (end_dt + timedelta(days=1)).date()
-        )
-
-        # Step 2: Get events with item_ids via FindItem + CalendarView.
-        # CalendarView restricts results to the date range and expands recurring
-        # events into individual occurrences (each with its own ItemId).
         folder_id = client.get_folder_id("calendar")
-        finditem_by_key: dict[str, dict] = {}  # "subject|start" -> item
-        if folder_id:
-            cv_start = start_dt.strftime("%Y-%m-%dT00:00:00")
-            cv_end = (end_dt + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
+        if not folder_id:
+            return json.dumps({"error": "Calendar folder not found."})
 
-            payload = {
-                "__type": "FindItemJsonRequest:#Exchange",
-                "Header": {
-                    "__type": "JsonRequestHeaders:#Exchange",
-                    "RequestServerVersion": "Exchange2013",
+        cv_start = start_dt.strftime("%Y-%m-%dT00:00:00")
+        cv_end = (end_dt + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
+
+        payload = {
+            "__type": "FindItemJsonRequest:#Exchange",
+            "Header": {
+                "__type": "JsonRequestHeaders:#Exchange",
+                "RequestServerVersion": "Exchange2013",
+            },
+            "Body": {
+                "__type": "FindItemRequest:#Exchange",
+                "ItemShape": {
+                    "__type": "ItemResponseShape:#Exchange",
+                    "BaseShape": "AllProperties",
                 },
-                "Body": {
-                    "__type": "FindItemRequest:#Exchange",
-                    "ItemShape": {
-                        "__type": "ItemResponseShape:#Exchange",
-                        "BaseShape": "AllProperties",
-                    },
-                    "ParentFolderIds": [
-                        OWAClient.folder_id_dict(folder_id)
-                    ],
-                    "Traversal": "Shallow",
-                    "CalendarView": {
-                        "__type": "CalendarView:#Exchange",
-                        "StartDate": cv_start,
-                        "EndDate": cv_end,
-                    },
+                "ParentFolderIds": [OWAClient.folder_id_dict(folder_id)],
+                "Traversal": "Shallow",
+                "CalendarView": {
+                    "__type": "CalendarView:#Exchange",
+                    "StartDate": cv_start,
+                    "EndDate": cv_end,
                 },
-            }
+            },
+        }
 
-            data = client.request("FindItem", payload)
+        data = client.request("FindItem", payload)
 
-            all_items = []
-            for msg in client.extract_items(data):
-                if "RootFolder" in msg:
-                    all_items = msg["RootFolder"].get("Items", [])
-                    break
+        all_items = []
+        for msg in client.extract_items(data):
+            if "RootFolder" in msg:
+                all_items = msg["RootFolder"].get("Items", [])
+                break
 
-            # Index FindItem results by subject + normalized local start time.
-            # FindItem returns UTC timestamps (e.g. "2026-02-17T06:30:00Z"),
-            # while GetUserAvailability returns Moscow local time ("2026-02-17T09:30:00").
-            # Normalize FindItem timestamps to local time for matching.
-            for item in all_items:
-                subject = item.get("Subject", "")
-                start = item.get("Start", "")
-                local_start = _utc_to_local_str(start)
-                key = f"{subject}|{local_start}"
-                finditem_by_key[key] = item
+        end_dt_exclusive = end_dt + timedelta(days=1)
+        matching_items = _filter_items_by_date_range(all_items, start_dt, end_dt_exclusive)
 
-        # Step 3: Merge — use expanded list as the authoritative event list,
-        # enrich with FindItem data (item_id, details) when available
         events = []
-        for ev in expanded:
-            subject = ev.get("subject", "(No subject)")
-            start = ev.get("start", "")
-            end = ev.get("end", "")
-            is_recurring = ev.get("is_recurring", False)
-
-            # Match expanded event (local time) with FindItem result (normalized to local)
-            fi_item = finditem_by_key.get(f"{subject}|{start}")
-
-            item_id = fi_item.get("ItemId", {}).get("Id", "") if fi_item else ""
+        for item in matching_items:
+            item_id = item.get("ItemId", {}).get("Id", "")
 
             event = {
-                "subject": subject,
-                "start": fi_item.get("Start", start) if fi_item else start,
-                "end": fi_item.get("End", end) if fi_item else end,
-                "location": ev.get("location", ""),
-                "is_all_day": fi_item.get("IsAllDayEvent", False) if fi_item else False,
-                "is_cancelled": fi_item.get("IsCancelled", False) if fi_item else False,
-                "is_meeting": ev.get("is_meeting", False),
-                "is_recurring": is_recurring,
+                "subject": item.get("Subject", "") or "(No subject)",
+                "start": item.get("Start", ""),
+                "end": item.get("End", ""),
+                "location": item.get("Location", ""),
+                "is_all_day": item.get("IsAllDayEvent", False),
+                "is_cancelled": item.get("IsCancelled", False),
+                "is_meeting": item.get("IsMeeting", False),
+                "is_recurring": item.get("CalendarItemType", "") == "RecurringMaster",
+                "calendar_item_type": item.get("CalendarItemType", ""),
                 "organizer": "",
-                "my_response": fi_item.get("MyResponseType", "") if fi_item else "",
+                "my_response": item.get("MyResponseType", ""),
                 "item_id": item_id,
                 "body": "",
                 "attendees_required": [],
                 "attendees_optional": [],
             }
 
-            # Get full details via GetItem if requested and item_id is available
             if include_body and item_id:
                 details = _get_event_details(client, item_id)
                 event["organizer"] = details["organizer"]
@@ -608,6 +418,7 @@ def get_calendar_events(
 
             events.append(event)
 
+        events.sort(key=lambda e: e["start"])
         return json.dumps(events, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": f"Failed to get calendar events: {e}"})
@@ -1385,102 +1196,59 @@ def get_event_links(
 # ------------------------------------------------------------------
 
 
-def _get_change_key(client: OWAClient, item_id: str) -> str | None:
-    """Fetch the ChangeKey for an item via GetItem (IdOnly).
-
-    OWA requires the ChangeKey on write operations like SetItemField.
-    """
-    payload = {
-        "__type": "GetItemJsonRequest:#Exchange",
-        "Header": {
-            "__type": "JsonRequestHeaders:#Exchange",
-            "RequestServerVersion": "Exchange2013",
-        },
-        "Body": {
-            "__type": "GetItemRequest:#Exchange",
-            "ItemShape": {
-                "__type": "ItemResponseShape:#Exchange",
-                "BaseShape": "IdOnly",
-            },
-            "ItemIds": [{"__type": "ItemId:#Exchange", "Id": item_id}],
-        },
-    }
-    data = client.request("GetItem", payload)
-    for msg in client.extract_items(data):
-        if "Items" in msg:
-            for item in msg["Items"]:
-                return item.get("ItemId", {}).get("ChangeKey")
-    return None
-
-
 def _set_event_categories(client: OWAClient, item_ids: list[str], categories: list[str]) -> None:
-    """Overwrite the Categories field on each event via UpdateItem/SetItemField.
+    """Overwrite the Categories field on each event via the bespoke UpdateCalendarEvent action.
 
-    KNOWN BACKEND LIMITATION (see PROJECT_STATUS.md): on this OWA build,
-    UpdateItem on a CalendarItem always fails with
-    ErrorSendMeetingInvitationsOrCancellationsRequired, even though the
-    request below sends SendMeetingInvitationsOrCancellations at the exact
-    Body-level position documented for the SOAP attribute, together with the
-    SendMeetingInvitationsOrCancellationsSpecified companion flag Microsoft's
-    own EWS Managed API code sample sets alongside it
-    (https://learn.microsoft.com/dotnet/api/exchangewebservices.updateitemtype.sendmeetinginvitationsorcancellations).
-    The SetItemField shape itself (Path/Item, not FieldURI/CalendarItem) is
-    confirmed correct -- it mirrors email.py's _set_email_categories, which
-    works, and getting it right is what took this from a generic
-    OwaMethodArgumentException ("Invalid argument used to call method
-    UpdateItem") to this specific, later-stage validation error. Ruled out
-    across both this shape fix and every variation tried previously: the
-    attribute's value (SendToNone/SendOnlyToChanged), the Specified flag,
-    and meeting vs. plain zero-attendee appointment -- all fail identically.
-    The bespoke "UpdateCalendarEvent" action (mirroring CreateCalendarEvent's
-    naming, which keeps the standard CreateItemRequest body under a
-    different action name) was also retried with this corrected shape: it
-    skips the attribute check but unconditionally rejects the standard EWS
-    ItemId as malformed, so it's not a viable substitute either. Left as the
-    standard/documented shape below -- it now fails loudly with OWA's real
-    error instead of a false "success" (see the fault-envelope check added
-    to OWAClient._to_json) -- pending either a fixed backend or a captured
-    example of OWA's own web client performing this action.
+    Standard EWS UpdateItem/SetItemField always fails on this OWA build with
+    ErrorSendMeetingInvitationsOrCancellationsRequired, no matter what
+    meeting-notification attribute/value is sent alongside it. OWA's own web
+    client doesn't use UpdateItem for this at all -- captured from the real
+    browser network traffic, it POSTs a non-standard UpdateCalendarEvent
+    action (payload in the X-OWA-UrlPostData header, not the POST body) with
+    a singular ItemChange, a top-level EventId mirroring ItemChange.ItemId,
+    no ChangeKey/ConflictResolution, and ShouldSendUpdateToAttendees/
+    EventScope/TargetAudience in place of SendMeetingInvitationsOrCancellations.
     """
-    items = []
     for iid in item_ids:
-        change_key = _get_change_key(client, iid)
         item_id_dict = {"__type": "ItemId:#Exchange", "Id": iid}
-        if change_key:
-            item_id_dict["ChangeKey"] = change_key
-        items.append(
-            {
-                "__type": "ItemChange:#Exchange",
-                "ItemId": item_id_dict,
-                "Updates": [
-                    {
-                        "__type": "SetItemField:#Exchange",
-                        "Path": {"__type": "PropertyUri:#Exchange", "FieldURI": "Categories"},
-                        "Item": {"__type": "CalendarItem:#Exchange", "Categories": categories},
-                    }
-                ],
-            }
-        )
+        payload = {
+            "__type": "UpdateCalendarEventJsonRequest:#Exchange",
+            "Header": {
+                "__type": "JsonRequestHeaders:#Exchange",
+                "RequestServerVersion": "V2018_01_08",
+                "TimeZoneContext": {
+                    "__type": "TimeZoneContext:#Exchange",
+                    "TimeZoneDefinition": {
+                        "__type": "TimeZoneDefinitionType:#Exchange",
+                        "Id": "Russian Standard Time",
+                    },
+                },
+            },
+            "Body": {
+                "__type": "UpdateCalendarEventRequest:#Exchange",
+                "EventId": item_id_dict,
+                "ItemChange": {
+                    "__type": "ItemChange:#Exchange",
+                    "Updates": [
+                        {
+                            "__type": "SetItemField:#Exchange",
+                            "Path": {"__type": "PropertyUri:#Exchange", "FieldURI": "Categories"},
+                            "Item": {"__type": "CalendarItem:#Exchange", "Categories": categories},
+                        }
+                    ],
+                    "ItemId": item_id_dict,
+                },
+                "EventScope": 0,
+                "ShouldSendUpdateToAttendees": False,
+                "TargetAudience": 0,
+                "ClientSupportsIrm": True,
+            },
+        }
 
-    payload = {
-        "__type": "UpdateItemJsonRequest:#Exchange",
-        "Header": {
-            "__type": "JsonRequestHeaders:#Exchange",
-            "RequestServerVersion": "V2017_08_18",
-        },
-        "Body": {
-            "__type": "UpdateItemRequest:#Exchange",
-            "ItemChanges": items,
-            "ConflictResolution": "AutoResolve",
-            "SendMeetingInvitationsOrCancellations": "SendToNone",
-            "SendMeetingInvitationsOrCancellationsSpecified": True,
-        },
-    }
-
-    data = client.request("UpdateItem", payload)
-    for msg in client.extract_items(data):
-        if msg.get("ResponseClass") == "Error":
-            raise RuntimeError(msg.get("MessageText", "UpdateItem failed."))
+        data = client.request_header_payload("UpdateCalendarEvent", payload)
+        for msg in client.extract_items(data):
+            if msg.get("ResponseClass") == "Error":
+                raise RuntimeError(msg.get("MessageText", "UpdateCalendarEvent failed."))
 
 
 @mcp.tool()
@@ -1610,9 +1378,12 @@ def find_events_by_category(
                 all_items = msg["RootFolder"].get("Items", [])
                 break
 
+        end_dt_exclusive = end_dt + timedelta(days=1)
+        in_range_items = _filter_items_by_date_range(all_items, start_dt, end_dt_exclusive)
+
         category_lower = category.lower()
         matches = [
-            item for item in all_items
+            item for item in in_range_items
             if any(cat.lower() == category_lower for cat in (item.get("Categories") or []))
         ]
 

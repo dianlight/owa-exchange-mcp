@@ -175,7 +175,7 @@ itself holds the live session (cookies) the way a real browser would.
 ### Calendar (10)
 | Tool | Description |
 |---|---|
-| `get_calendar_events` | Get events in a date range (supports recurring expansion) |
+| `get_calendar_events` | Get events in a date range |
 | `create_meeting` | Create a meeting with attendees |
 | `update_meeting` | Update an existing meeting |
 | `cancel_meeting` | Cancel a meeting and notify attendees |

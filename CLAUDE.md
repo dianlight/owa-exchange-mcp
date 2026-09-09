@@ -22,12 +22,12 @@ Any variable above can also be placed in a gitignored `.env.local` next to `pypr
 ## Structure
 
 - `login.py` — Browser-based login via 2FA, against the same persistent Chromium profile the server uses
-- `exchange_mcp/` — MCP server package (30 tools)
+- `exchange_mcp/` — MCP server package (40 tools)
   - `server.py` — FastMCP server with lifespan context; launches the browser and (if `EXCHANGE_MASTER_PASSWORD` is set) blocks on login before serving
   - `browser_session.py` — `BrowserSession`: one persistent Chromium context for the process's lifetime, reused by every OWA call
   - `owa_client.py` — OWA API client; delegates transport to `BrowserSession`, keeps the request/response/folder-resolution logic
   - `auth.py` — Login glue between the MCP tool and `BrowserSession`, plus credential encryption (reuses crypto from `login.py`). It's the *only* place inside the package that imports `login.py` — do the same anywhere else that needs those helpers (see note below), don't import `login` directly.
-  - `tools/` — Tool modules: email, calendar, people, folders, availability, analytics, auth
+  - `tools/` — Tool modules: email, calendar, categories, people, folders, availability, analytics, auth
 
 ## Running
 
@@ -75,9 +75,10 @@ Dependencies: `mcp`, `cryptography`, `playwright` (run `playwright install chrom
 
 ## Maintaining PROJECT_STATUS.md
 
-[PROJECT_STATUS.md](PROJECT_STATUS.md) tracks, per MCP tool: migration status, automated-test coverage, and manual QA result (`Pending`/`OK`/`KO`). Keep it in sync as part of the same change, not as a follow-up:
+[PROJECT_STATUS.md](PROJECT_STATUS.md) tracks, per MCP tool: a permanent ID, automated-test coverage, and manual QA result (`Pending`/`OK`/`KO`). Keep it in sync as part of the same change, not as a follow-up:
 
-- Adding, removing, or renaming a tool → add/remove/update its row (and the module's tool count in its section header and in the "30 tools" totals here and in README.md).
+- **ID column and numbering rule**: every tool row's first column is a permanent 3-digit ID — digit 1 is the tool's module number, digits 2-3 are the tool's sequence number within that module (`e.g. 208` = module 2 (Calendar), 8th tool assigned in that module). Module numbers are fixed: 1 Email, 2 Calendar, 3 Categories, 4 Directory (`people.py`), 5 Folders, 6 Availability, 7 Analytics, 8 Auth — a brand-new module gets the next unused digit, never a reused or renumbered one. **An ID never changes once assigned**, even if the table is reordered or the tool is later removed — do not renumber existing rows to close a gap, and do not reuse a retired tool's ID for a different tool. Adding a tool to an existing module → give it the next unused 2-digit sequence number in that module (append at the end of that module's existing max, regardless of where the row is placed in the table). Removing a tool → delete its row; leave the gap in the sequence rather than shifting later IDs down.
+- Adding, removing, or renaming a tool → add/remove/update its row (and the module's tool count in its section header and in the "40 tools" totals here and in README.md).
 - Changing a tool's behavior (new params, different OWA action, altered response shape) → update its Description cell if it's no longer accurate, and reset its Manual QA status to `Pending` unless it's been re-verified.
 - Running or receiving the result of a manual test against a live OWA mailbox → update that tool's Manual QA / Status cell to `OK` or `KO` (with a one-line note for `KO`), don't leave it stale at `Pending`.
 - Landing an automated test for a tool or helper → update the Automated test column for the affected row(s) and the note in §4 if it was called out there as a gap.
