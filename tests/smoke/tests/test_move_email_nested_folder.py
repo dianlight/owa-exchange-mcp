@@ -1,8 +1,8 @@
 """Regression test for a real bug report: move_email (and get_emails) couldn't
 resolve destination folders nested more than one level deep, either by full
-path (e.g. "Progetti/ACE-NewGeco") or by bare name (e.g. "ACE-NewGeco") --
+path (e.g. "Projects/ClientFolder") or by bare name (e.g. "ClientFolder") --
 "Folder not found" on every attempt. Also seen with a folder nested one
-level under Inbox ("Quarantena").
+level under Inbox ("Triage").
 
 Root cause: OWAClient.get_folder_id() only ran a Shallow FindFolder rooted
 at msgfolderroot with a literal string match, so it never saw folders that
@@ -13,11 +13,11 @@ _find_child_folder_id), starting from a distinguished folder (e.g. "Inbox")
 when the first segment names one, otherwise from msgfolderroot.
 
 This test reproduces both shapes from the report against disposable,
-uniquely-tagged folders instead of the real "Progetti"/"Quarantena" trees:
+uniquely-tagged folders instead of the real folders from the report:
 
-1. A folder nested under another custom folder (mirrors "Progetti/ACE-NewGeco"):
+1. A folder nested under another custom folder (mirrors "Projects/ClientFolder"):
    [tag]-parent/[tag]-child, both created fresh under msgfolderroot/parent.
-2. A folder nested under a distinguished folder (mirrors "Inbox/Quarantena"):
+2. A folder nested under a distinguished folder (mirrors "Inbox/Triage"):
    Inbox/[tag]-inboxchild.
 
 For each, a disposable tagged email is moved into the nested folder via its
@@ -100,7 +100,7 @@ async def main() -> bool:
         parent_id = parent_info["id"]
         record("create_folder (parent)", parent_args, "OK", f"id={parent_id}")
 
-        # 1b. [tag]-child nested under [tag]-parent -- mirrors Progetti/ACE-NewGeco
+        # 1b. [tag]-child nested under [tag]-parent -- mirrors Projects/ClientFolder
         child_args = {"name": CHILD_NAME, "parent_folder_id": parent_id}
         child_info = await _call_create_folder(s, child_args)
         err = is_error_payload(child_info)
@@ -110,7 +110,7 @@ async def main() -> bool:
             return False
         record("create_folder (child)", child_args, "OK", f"id={child_info['id']}")
 
-        # 1c. [tag]-inboxchild directly under Inbox -- mirrors Inbox/Quarantena
+        # 1c. [tag]-inboxchild directly under Inbox -- mirrors Inbox/Triage
         inbox_child_args = {"name": INBOX_CHILD_NAME, "parent_folder_id": "inbox"}
         inbox_child_info = await _call_create_folder(s, inbox_child_args)
         err = is_error_payload(inbox_child_info)

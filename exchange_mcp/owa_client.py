@@ -211,7 +211,7 @@ class OWAClient:
         Supports distinguished folder names (inbox, sentitems, drafts, etc.)
         in both English and Russian, plus custom folder names looked up
         via FindFolder on msgfolderroot, plus "/"-delimited paths
-        (e.g. "Progetti/ACE-NewGeco" or "Inbox/Quarantena") for folders
+        (e.g. "Projects/ClientFolder" or "Inbox/Triage") for folders
         nested more than one level deep - see _resolve_folder_path().
 
         Distinguished folders are normally returned as-is (e.g. "inbox")
@@ -244,15 +244,15 @@ class OWAClient:
 
         get_folder_id()'s plain-name lookup only searches direct children
         of msgfolderroot (Shallow traversal), so a folder nested under
-        another custom folder (e.g. "ACE-NewGeco" under "Progetti") or
-        under a distinguished folder (e.g. "Quarantena" under "Inbox") is
+        another custom folder (e.g. "ClientFolder" under "Projects") or
+        under a distinguished folder (e.g. "Triage" under "Inbox") is
         invisible to it - confirmed live: neither the bare name nor a
-        literal "Progetti/ACE-NewGeco" string (which can never equal a
+        literal "Projects/ClientFolder" string (which can never equal a
         single-segment DisplayName) matched. Walking the path segment by
         segment, resolving each as a child of the previous, handles any
         depth and disambiguates same-named folders living at different
-        levels (this mailbox has both a top-level "ACE - NewGeco" and a
-        nested "ACE-NewGeco" under "Progetti").
+        levels (this mailbox has both a top-level "Client - Folder" and a
+        nested "ClientFolder" under "Projects").
         """
         segments = [s for s in folder_path.split("/") if s]
         if not segments:
