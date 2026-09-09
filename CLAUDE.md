@@ -16,13 +16,14 @@ The server requires one environment variable, plus optional ones for the browser
 - `EXCHANGE_HEADLESS` — (optional) Set to `false`/`0` to run the browser with a visible window. Same effect as the `--show-browser` CLI flag (which takes precedence).
 - `EXCHANGE_MCP_TRANSPORT` — (optional) `stdio` (default) or `http`. Same effect as `--transport`.
 - `EXCHANGE_MCP_HOST` / `EXCHANGE_MCP_PORT` — (optional) Bind address for `--transport http`. Default `127.0.0.1:8765` — never bind non-loopback, the MCP endpoint has no auth of its own.
+- `EXCHANGE_MCP_STABLE` — (optional) Set to `true`/`1`/`yes` to exclude known-buggy tools (`KNOWN_BUGGY_TOOLS` in `server.py`, kept in sync with the KO rows / Stability column in PROJECT_STATUS.md) from the MCP tool listing at startup, instead of exposing them to fail at call time. Same effect as the `--stable` CLI flag.
 
 Any variable above can also be placed in a gitignored `.env.local` next to `pyproject.toml` (see `.env.local.example`); `server.py` loads it at startup without overriding variables already present in the environment. Useful when starting the server from a context with no shell to `export` into.
 
 ## Structure
 
 - `login.py` — Browser-based login via 2FA, against the same persistent Chromium profile the server uses
-- `exchange_mcp/` — MCP server package (40 tools)
+- `exchange_mcp/` — MCP server package (41 tools)
   - `server.py` — FastMCP server with lifespan context; launches the browser and (if `EXCHANGE_MASTER_PASSWORD` is set) blocks on login before serving
   - `browser_session.py` — `BrowserSession`: one persistent Chromium context for the process's lifetime, reused by every OWA call
   - `owa_client.py` — OWA API client; delegates transport to `BrowserSession`, keeps the request/response/folder-resolution logic
@@ -39,6 +40,7 @@ python login.py               # Login (pre-warms the persistent browser profile)
 pip install -e .               # Install MCP server
 exchange-mcp-server            # Run MCP server (stdio transport, spawned per client session)
 exchange-mcp-server --show-browser  # Same, with a visible browser window
+exchange-mcp-server --stable        # Same, excluding known-buggy tools from the MCP tool listing
 
 # Persistent local server instead of per-session stdio spawn (start manually,
 # no autostart mechanism — must already be running before a client connects):
@@ -78,7 +80,8 @@ Dependencies: `mcp`, `cryptography`, `playwright` (run `playwright install chrom
 [PROJECT_STATUS.md](PROJECT_STATUS.md) tracks, per MCP tool: a permanent ID, automated-test coverage, and manual QA result (`Pending`/`OK`/`KO`). Keep it in sync as part of the same change, not as a follow-up:
 
 - **ID column and numbering rule**: every tool row's first column is a permanent 3-digit ID — digit 1 is the tool's module number, digits 2-3 are the tool's sequence number within that module (`e.g. 208` = module 2 (Calendar), 8th tool assigned in that module). Module numbers are fixed: 1 Email, 2 Calendar, 3 Categories, 4 Directory (`people.py`), 5 Folders, 6 Availability, 7 Analytics, 8 Auth — a brand-new module gets the next unused digit, never a reused or renumbered one. **An ID never changes once assigned**, even if the table is reordered or the tool is later removed — do not renumber existing rows to close a gap, and do not reuse a retired tool's ID for a different tool. Adding a tool to an existing module → give it the next unused 2-digit sequence number in that module (append at the end of that module's existing max, regardless of where the row is placed in the table). Removing a tool → delete its row; leave the gap in the sequence rather than shifting later IDs down.
-- Adding, removing, or renaming a tool → add/remove/update its row (and the module's tool count in its section header and in the "40 tools" totals here and in README.md).
+- Adding, removing, or renaming a tool → add/remove/update its row (and the module's tool count in its section header and in the "41 tools" totals here and in README.md).
 - Changing a tool's behavior (new params, different OWA action, altered response shape) → update its Description cell if it's no longer accurate, and reset its Manual QA status to `Pending` unless it's been re-verified.
 - Running or receiving the result of a manual test against a live OWA mailbox → update that tool's Manual QA / Status cell to `OK` or `KO` (with a one-line note for `KO`), don't leave it stale at `Pending`.
+- A tool becoming, or ceasing to be, a confirmed unfixable server-side failure (not merely `Pending`, and not a degraded-but-working case like `get_meeting_contacts`'s empty-result-plus-`warnings` behavior) → keep its Stability column cell (`Stable`/`Dev`) and `KNOWN_BUGGY_TOOLS` in `exchange_mcp/server.py` in sync with each other. `KNOWN_BUGGY_TOOLS` is what `--stable`/`EXCHANGE_MCP_STABLE` excludes from the MCP tool listing at startup.
 - Landing an automated test for a tool or helper → update the Automated test column for the affected row(s) and the note in §4 if it was called out there as a gap.

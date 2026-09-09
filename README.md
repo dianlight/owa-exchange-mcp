@@ -2,7 +2,7 @@
 
 # OWA Exchange MCP Server
 
-MCP (Model Context Protocol) server for any Microsoft Exchange / OWA (Outlook Web Access) deployment. Gives LLM agents access to email, calendar, directory search, folders, categories, availability, and meeting analytics via 40 tools.
+MCP (Model Context Protocol) server for any Microsoft Exchange / OWA (Outlook Web Access) deployment. Gives LLM agents access to email, calendar, directory search, folders, categories, availability, and meeting analytics via 41 tools.
 
 Works with any on-premise or hosted Exchange server that exposes OWA.
 
@@ -88,6 +88,7 @@ the process must already be listening before a client tries to connect.
 | `EXCHANGE_MCP_TRANSPORT` | No | `stdio` (default) or `http`. Same effect as `--transport`. |
 | `EXCHANGE_MCP_HOST` | No | Bind host for `--transport http` (default `127.0.0.1` — keep it on loopback, see [Security](#security)) |
 | `EXCHANGE_MCP_PORT` | No | Bind port for `--transport http` (default `8765`) |
+| `EXCHANGE_MCP_STABLE` | No | Set to `true`/`1`/`yes` to exclude known-buggy tools from the MCP tool listing (same effect as `--stable`) |
 
 Any of these can also live in a gitignored `.env.local` file next to
 `pyproject.toml` (copy `.env.local.example`) — the server loads it at startup
@@ -153,13 +154,14 @@ profile for the MCP server to pick up. Credentials are encrypted at rest
 with AES-256 (PBKDF2 key derivation, 480k iterations); the browser profile
 itself holds the live session (cookies) the way a real browser would.
 
-## Tools (40)
+## Tools (41)
 
-### Email (13)
+### Email (14)
 | Tool | Description |
 |---|---|
 | `get_emails` | List emails from a folder with filtering |
 | `get_email` | Get full email content by ID |
+| `search_emails` | Full-text search emails using AQS query syntax |
 | `send_email` | Send a new email |
 | `reply_email` | Reply to an email |
 | `forward_email` | Forward an email |

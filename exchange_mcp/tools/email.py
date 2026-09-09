@@ -5,6 +5,8 @@ emails via the OWA Exchange API.
 """
 
 import json
+import re
+import shlex
 
 from mcp.server.fastmcp import Context
 
@@ -241,6 +243,227 @@ def _build_recipient_list(emails: str) -> list[dict]:
     return recipients
 
 
+_AQS_LITE_KEYWORDS = {"subject", "from", "category", "isread", "hasattachment"}
+
+
+def _parse_aqs_lite(query: str) -> tuple[list[str], dict[str, list[str]]]:
+    """Split an AQS query into free-text terms and a subset of recognized
+    keyword:value filters, for the client-side fallback in search_emails.
+    """
+    try:
+        tokens = shlex.split(query)
+    except ValueError:
+        tokens = query.split()
+
+    terms: list[str] = []
+    filters: dict[str, list[str]] = {}
+    for token in tokens:
+        match = re.match(r"^(\w+):(.+)$", token)
+        if match and match.group(1).lower() in _AQS_LITE_KEYWORDS:
+            filters.setdefault(match.group(1).lower(), []).append(match.group(2))
+        else:
+            terms.append(token)
+    return terms, filters
+
+
+def _local_search_matches(item: dict, terms: list[str], filters: dict[str, list[str]]) -> bool:
+    """Best-effort match against fields already present in a FindItem/Default
+    result, mirroring the keywords _parse_aqs_lite recognizes.
+    """
+    subject = (item.get("Subject") or "").lower()
+    preview = (item.get("Preview") or "").lower()
+    from_data = item.get("From", {}).get("Mailbox") or item.get("Sender", {}).get("Mailbox") or {}
+    from_name = (from_data.get("Name") or "").lower()
+    from_email = (from_data.get("EmailAddress") or "").lower()
+    categories = [c.lower() for c in item.get("Categories", [])]
+
+    for val in filters.get("subject", []):
+        if val.lower() not in subject:
+            return False
+    for val in filters.get("from", []):
+        v = val.lower()
+        if v not in from_name and v not in from_email:
+            return False
+    for val in filters.get("category", []):
+        if val.lower() not in categories:
+            return False
+    for val in filters.get("isread", []):
+        if item.get("IsRead", False) != (val.lower() in ("true", "1", "yes")):
+            return False
+    for val in filters.get("hasattachment", []):
+        if item.get("HasAttachments", False) != (val.lower() in ("true", "1", "yes")):
+            return False
+
+    haystack = f"{subject} {preview} {from_name} {from_email}"
+    return all(term.lower() in haystack for term in terms)
+
+
+def _list_all_folder_ids(client: OWAClient, max_folders: int = 50) -> list[str]:
+    """Enumerate mail folder IDs under msgfolderroot via FindFolder/Deep.
+
+    search_emails(search_all_folders=True) needs this instead of FindItem's
+    own Traversal:"Deep": on at least one tenant, FindItem rejects Deep
+    outright ("Invalid argument used to call method FindItem") regardless of
+    folder or QueryString, while FindFolder/Deep - a different operation -
+    works fine (see get_folders' recursive=True).
+    """
+    payload = {
+        "__type": "FindFolderJsonRequest:#Exchange",
+        "Header": {
+            "__type": "JsonRequestHeaders:#Exchange",
+            "RequestServerVersion": "Exchange2013",
+        },
+        "Body": {
+            "__type": "FindFolderRequest:#Exchange",
+            "FolderShape": {
+                "__type": "FolderResponseShape:#Exchange",
+                "BaseShape": "IdOnly",
+            },
+            "ParentFolderIds": [OWAClient.folder_id_dict("msgfolderroot")],
+            "Traversal": "Deep",
+            "Paging": {
+                "__type": "IndexedPageView:#Exchange",
+                "BasePoint": "Beginning",
+                "Offset": 0,
+                "MaxEntriesReturned": max_folders,
+            },
+        },
+    }
+    data = client.request("FindFolder", payload)
+
+    ids = ["msgfolderroot"]
+    for msg in client.extract_items(data):
+        if "RootFolder" in msg and "Folders" in msg["RootFolder"]:
+            for f in msg["RootFolder"]["Folders"]:
+                fid = f.get("FolderId", {}).get("Id")
+                if fid:
+                    ids.append(fid)
+    return ids[:max_folders]
+
+
+def _search_folder_aqs(client: OWAClient, parent_folder_id: dict, query: str, limit: int) -> list[dict]:
+    """One server-side AQS QueryString search against a single folder (Shallow).
+
+    Returns [] on empty results or on any failure - including transport-level
+    exceptions, which Traversal:"Deep" triggers outright on some tenants - so
+    the caller can fall back to _local_search_fallback either way.
+    """
+    payload = {
+        "__type": "FindItemJsonRequest:#Exchange",
+        "Header": {
+            "__type": "JsonRequestHeaders:#Exchange",
+            "RequestServerVersion": "Exchange2013",
+        },
+        "Body": {
+            "__type": "FindItemRequest:#Exchange",
+            "ItemShape": {
+                "__type": "ItemResponseShape:#Exchange",
+                "BaseShape": "Default",
+                "AdditionalProperties": [
+                    {"__type": "PropertyUri:#Exchange", "FieldURI": "ParentFolderId"},
+                ],
+            },
+            "ParentFolderIds": [parent_folder_id],
+            "Traversal": "Shallow",
+            "QueryString": {"__type": "QueryStringType:#Exchange", "Value": query},
+            "Paging": {
+                "__type": "IndexedPageView:#Exchange",
+                "BasePoint": "Beginning",
+                "Offset": 0,
+                "MaxEntriesReturned": limit,
+            },
+        },
+    }
+    try:
+        data = client.request("FindItem", payload)
+    except SessionExpiredError:
+        raise
+    except Exception:
+        return []
+
+    for msg in client.extract_items(data):
+        if msg.get("ResponseClass") == "Error":
+            return []
+        if "RootFolder" in msg:
+            return msg["RootFolder"].get("Items", [])
+    return []
+
+
+def _local_search_fallback(
+    client: OWAClient,
+    parent_folder_ids: list[dict],
+    traversal: str,
+    query: str,
+    limit: int,
+    max_scan: int = 1000,
+) -> list[dict]:
+    """Page through items structurally (no QueryString) and filter client-side.
+
+    Used when the server accepts QueryString but silently returns zero
+    results for it - observed on at least one tenant's OWA backend, where
+    FindItem's content-index search never actually runs.
+    """
+    terms, filters = _parse_aqs_lite(query)
+    matches: list[dict] = []
+    offset = 0
+    page_size = 200
+
+    while offset < max_scan and len(matches) < limit:
+        payload = {
+            "__type": "FindItemJsonRequest:#Exchange",
+            "Header": {
+                "__type": "JsonRequestHeaders:#Exchange",
+                "RequestServerVersion": "Exchange2013",
+            },
+            "Body": {
+                "__type": "FindItemRequest:#Exchange",
+                "ItemShape": {
+                    "__type": "ItemResponseShape:#Exchange",
+                    "BaseShape": "Default",
+                    "AdditionalProperties": [
+                        {"__type": "PropertyUri:#Exchange", "FieldURI": "ParentFolderId"},
+                    ],
+                },
+                "ParentFolderIds": parent_folder_ids,
+                "Traversal": traversal,
+                "Paging": {
+                    "__type": "IndexedPageView:#Exchange",
+                    "BasePoint": "Beginning",
+                    "Offset": offset,
+                    "MaxEntriesReturned": page_size,
+                },
+            },
+        }
+
+        data = client.request("FindItem", payload)
+
+        page_items: list[dict] = []
+        includes_last = True
+        for msg in client.extract_items(data):
+            if msg.get("ResponseClass") == "Error":
+                raise RuntimeError(msg.get("MessageText", "Search failed."))
+            if "RootFolder" in msg:
+                root = msg["RootFolder"]
+                page_items = root.get("Items", [])
+                includes_last = root.get("IncludesLastItemInRange", True)
+                break
+
+        if not page_items:
+            break
+
+        for item in page_items:
+            if _local_search_matches(item, terms, filters):
+                matches.append(item)
+                if len(matches) >= limit:
+                    break
+
+        if includes_last:
+            break
+        offset += page_size
+
+    return matches
+
+
 # ------------------------------------------------------------------
 # Tools
 # ------------------------------------------------------------------
@@ -374,6 +597,118 @@ def get_emails(
         return json.dumps({"error": str(e)})
     except Exception as e:
         return json.dumps({"error": f"Failed to get emails: {e}"})
+
+
+@mcp.tool()
+def search_emails(
+    query: str,
+    folder: str = "Inbox",
+    limit: int = 25,
+    search_all_folders: bool = False,
+    ctx: Context = None,
+) -> str:
+    """Full-text search for emails using Exchange's indexed AQS query syntax.
+
+    Unlike get_emails (which lists/filters by folder, read state, etc.), this
+    searches message content: a bare phrase matches subject/body/participants
+    on the server's content index. Refine with AQS keyword:value pairs -
+    subject:, body:, from:, to:, cc:, bcc:, participants:, category:,
+    hasattachment:true/false, isread:true/false, importance:high, sent:/
+    received: (dates, e.g. received:>2026-01-01), size:>5000. Quote a phrase
+    for an exact match (subject:"project plan"); bare words are prefix/
+    substring matches. Results are individual messages, not threads - pass
+    an item_id to get_email for the full body.
+
+    Some OWA backends accept the search but their content index never
+    actually runs it (zero results with no error), and some combinations
+    (e.g. search_all_folders) can fail outright on the same backends. Either
+    way, this tool transparently falls back to a client-side scan of the
+    target folder(s), matching a reduced subset of the same syntax (bare
+    terms, subject:, from:, category:, isread:, hasattachment:) against each
+    message's subject/preview/sender/categories - slower, and no real body
+    search, but still returns something useful.
+
+    Args:
+        query: AQS query string, e.g. "budget report", 'from:alice subject:"Q3 plan"'.
+        folder: Folder to search (Inbox, Sent, Drafts, Deleted, Junk, or custom
+            name). Ignored if search_all_folders is True.
+        limit: Maximum number of matching messages to return (default 25, max 100).
+        search_all_folders: If True, search every mail folder in the mailbox
+            instead of just `folder`.
+    """
+    try:
+        client = _get_client(ctx)
+
+        max_limit = 100
+        if limit > max_limit:
+            limit = max_limit
+
+        if search_all_folders:
+            folder_ids = _list_all_folder_ids(client)
+            # Many folders each potentially needing a full local scan is
+            # expensive - cap each folder's fallback scan depth accordingly.
+            fallback_max_scan = 200
+        else:
+            folder_id = client.get_folder_id(folder)
+            if not folder_id:
+                return json.dumps({"error": f"Folder '{folder}' not found."})
+            folder_ids = [folder_id]
+            fallback_max_scan = 1000
+
+        found_items: list[dict] = []
+        used_fallback = False
+
+        for fid in folder_ids:
+            remaining = limit - len(found_items)
+            if remaining <= 0:
+                break
+            parent_folder_id = OWAClient.folder_id_dict(fid)
+
+            items = _search_folder_aqs(client, parent_folder_id, query, remaining)
+            if not items:
+                items = _local_search_fallback(
+                    client, [parent_folder_id], "Shallow", query, remaining,
+                    max_scan=fallback_max_scan,
+                )
+                if items:
+                    used_fallback = True
+            found_items.extend(items)
+
+        results = []
+        for item in found_items[:limit]:
+            from_data = item.get("From", {}).get("Mailbox", {})
+            if not from_data:
+                from_data = item.get("Sender", {}).get("Mailbox", {})
+
+            results.append(
+                {
+                    "item_id": item.get("ItemId", {}).get("Id", ""),
+                    "folder_id": item.get("ParentFolderId", {}).get("Id", ""),
+                    "subject": item.get("Subject") or "(No subject)",
+                    "from": from_data.get("EmailAddress", ""),
+                    "from_name": from_data.get("Name", ""),
+                    "date": item.get(
+                        "DateTimeSent",
+                        item.get("DateTimeReceived", item.get("DateTimeCreated", "")),
+                    ),
+                    "is_read": item.get("IsRead", False),
+                    "has_attachments": item.get("HasAttachments", False),
+                    "importance": item.get("Importance", "Normal"),
+                    "preview": item.get("Preview", ""),
+                    "categories": item.get("Categories", []),
+                }
+            )
+
+        return json.dumps({
+            "emails": results,
+            "count": len(results),
+            "used_local_fallback": used_fallback,
+        })
+
+    except SessionExpiredError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        return json.dumps({"error": f"Failed to search emails: {e}"})
 
 
 @mcp.tool()

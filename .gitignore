@@ -9,7 +9,7 @@ instructions.md
 .credentials.enc
 .salt
 session-cookies.txt
-.browser-profile/
+.browser-profile*/
 .mcpregistry_*
 
 # Python
@@ -21,4 +21,3 @@ dist/
 
 # Smoke test suite runtime state (server pid/log, result log)
 tests/smoke/.state/
-.browser-profile.bak-20260908-115935/

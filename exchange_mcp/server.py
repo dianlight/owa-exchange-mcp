@@ -198,6 +198,28 @@ import exchange_mcp.tools.analytics     # noqa: E402, F401
 import exchange_mcp.tools.auth          # noqa: E402, F401
 import exchange_mcp.tools.categories     # noqa: E402, F401
 
+# Tools with a known, unfixable server-side bug (see PROJECT_STATUS.md KO rows)
+# rather than merely untested or degraded-but-working ones (e.g. get_meeting_contacts,
+# which returns an empty result plus a `warnings` field instead of failing). Excluded
+# from the MCP tool listing under --stable so a client can't call them and hit a fault.
+KNOWN_BUGGY_TOOLS: dict[str, str] = {
+    "find_person": "ResolveNames throws a server-side System.NullReferenceException on this tenant (PROJECT_STATUS.md #401).",
+    "find_meeting_time": "Server-side fault in the availability service (PROJECT_STATUS.md #602).",
+    "get_meeting_stats": "Depends on ResolveNames, same NullReferenceException as find_person (PROJECT_STATUS.md #701).",
+}
+
+
+def _apply_stable_mode() -> None:
+    """Remove known-buggy tools from the MCP tool listing so --stable clients can't call them."""
+    for name, reason in KNOWN_BUGGY_TOOLS.items():
+        try:
+            mcp.remove_tool(name)
+            print(f"[exchange-mcp] --stable: excluded buggy tool '{name}' ({reason})",
+                  file=sys.stderr, flush=True)
+        except Exception as exc:
+            print(f"[exchange-mcp] --stable: could not exclude '{name}': {exc}",
+                  file=sys.stderr, flush=True)
+
 
 def main():
     """Entry point: run the MCP server over stdio (default) or streamable-http."""
@@ -228,7 +250,17 @@ def main():
         default=int(os.environ.get("EXCHANGE_MCP_PORT", "8765")),
         help="Bind port for --transport http.",
     )
+    parser.add_argument(
+        "--stable",
+        action="store_true",
+        default=os.environ.get("EXCHANGE_MCP_STABLE", "").strip().lower() in ("true", "1", "yes"),
+        help="Exclude tools with a known, unfixable server-side bug (see PROJECT_STATUS.md) "
+             "from the MCP tool listing, instead of exposing them to fail at call time.",
+    )
     args = parser.parse_args()
+
+    if args.stable:
+        _apply_stable_mode()
 
     if args.transport == "http":
         mcp.settings.host = args.host

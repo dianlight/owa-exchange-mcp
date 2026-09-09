@@ -111,8 +111,16 @@ class OWAClient:
         try:
             data = resp.json()
         except (ValueError, TypeError) as exc:
-            raise SessionExpiredError(
-                f"Unexpected response (HTTP {resp.status_code}). Session may have expired."
+            # A non-JSON, non-HTML body on a non-401/440 status is a server-side
+            # fault (e.g. OWA's x-owa-error header carrying a .NET exception name),
+            # not a session issue -- don't misreport it as one, since request()'s
+            # retry-after-relogin path only helps genuine session expiry and would
+            # otherwise just force a pointless extra login check before re-raising.
+            owa_error = resp.headers.get("x-owa-error", "")
+            detail = f" ({owa_error})" if owa_error else ""
+            body_snippet = resp.text[:300] if resp.text else ""
+            raise RuntimeError(
+                f"OWA request failed (HTTP {resp.status_code}){detail}. Snippet: {body_snippet}"
             ) from exc
 
         # Some malformed requests fault at the OWA method-dispatch layer
@@ -202,7 +210,9 @@ class OWAClient:
 
         Supports distinguished folder names (inbox, sentitems, drafts, etc.)
         in both English and Russian, plus custom folder names looked up
-        via FindFolder on msgfolderroot.
+        via FindFolder on msgfolderroot, plus "/"-delimited paths
+        (e.g. "Progetti/ACE-NewGeco" or "Inbox/Quarantena") for folders
+        nested more than one level deep - see _resolve_folder_path().
 
         Distinguished folders are normally returned as-is (e.g. "inbox")
         without a GetFolder round-trip: on the classic canary-cookie OWA
@@ -214,6 +224,9 @@ class OWAClient:
         opaque FolderId rather than the bare distinguished name, so we
         resolve it properly in that mode instead of short-circuiting.
         """
+        if "/" in folder_name:
+            return self._resolve_folder_path(folder_name)
+
         folder_lower = folder_name.lower()
 
         distinguished_id = DISTINGUISHED_FOLDERS.get(folder_lower)
@@ -222,7 +235,48 @@ class OWAClient:
                 return distinguished_id
             return self._resolve_distinguished_folder_id(distinguished_id) or distinguished_id
 
-        # Fall back to searching custom folders by name
+        root_ref = {"__type": "DistinguishedFolderId:#Exchange", "Id": "msgfolderroot"}
+        return self._find_child_folder_id(root_ref, folder_name)
+
+    def _resolve_folder_path(self, folder_path: str) -> str | None:
+        """Resolve a "/"-delimited folder path by walking one Shallow
+        FindFolder per segment.
+
+        get_folder_id()'s plain-name lookup only searches direct children
+        of msgfolderroot (Shallow traversal), so a folder nested under
+        another custom folder (e.g. "ACE-NewGeco" under "Progetti") or
+        under a distinguished folder (e.g. "Quarantena" under "Inbox") is
+        invisible to it - confirmed live: neither the bare name nor a
+        literal "Progetti/ACE-NewGeco" string (which can never equal a
+        single-segment DisplayName) matched. Walking the path segment by
+        segment, resolving each as a child of the previous, handles any
+        depth and disambiguates same-named folders living at different
+        levels (this mailbox has both a top-level "ACE - NewGeco" and a
+        nested "ACE-NewGeco" under "Progetti").
+        """
+        segments = [s for s in folder_path.split("/") if s]
+        if not segments:
+            return None
+
+        first = segments[0].lower()
+        distinguished_id = DISTINGUISHED_FOLDERS.get(first)
+        if distinguished_id:
+            parent_ref = {"__type": "DistinguishedFolderId:#Exchange", "Id": distinguished_id}
+            segments = segments[1:]
+        else:
+            parent_ref = {"__type": "DistinguishedFolderId:#Exchange", "Id": "msgfolderroot"}
+
+        folder_id = None
+        for segment in segments:
+            folder_id = self._find_child_folder_id(parent_ref, segment)
+            if folder_id is None:
+                return None
+            parent_ref = {"__type": "FolderId:#Exchange", "Id": folder_id}
+
+        return folder_id if segments else parent_ref.get("Id")
+
+    def _find_child_folder_id(self, parent_ref: dict, child_name: str) -> str | None:
+        """Shallow FindFolder for a single child folder by DisplayName under parent_ref."""
         payload = {
             "__type": "FindFolderJsonRequest:#Exchange",
             "Header": {
@@ -235,12 +289,7 @@ class OWAClient:
                     "__type": "FolderResponseShape:#Exchange",
                     "BaseShape": "Default",
                 },
-                "ParentFolderIds": [
-                    {
-                        "__type": "DistinguishedFolderId:#Exchange",
-                        "Id": "msgfolderroot",
-                    }
-                ],
+                "ParentFolderIds": [parent_ref],
                 "Traversal": "Shallow",
                 "Paging": {
                     "__type": "IndexedPageView:#Exchange",
@@ -252,10 +301,11 @@ class OWAClient:
         }
 
         data = self.request("FindFolder", payload)
+        child_lower = child_name.lower()
         for msg in self.extract_items(data):
             if "RootFolder" in msg and "Folders" in msg["RootFolder"]:
                 for f in msg["RootFolder"]["Folders"]:
-                    if f.get("DisplayName", "").lower() == folder_lower:
+                    if f.get("DisplayName", "").lower() == child_lower:
                         return f.get("FolderId", {}).get("Id")
 
         return None
