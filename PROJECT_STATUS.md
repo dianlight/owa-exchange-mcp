@@ -79,12 +79,14 @@ too. The 5 mutating tools share one chained test
 ([test_folder_lifecycle.py](tests/smoke/tests/test_folder_lifecycle.py)) around one
 disposable, uniquely-tagged folder: create under Inbox → rename → move to `msgfolderroot` →
 drop one disposable tagged email into it (via the already-verified `send_email`/`move_email`)
-→ empty (verified gone) → permanently delete. The move-before-populate ordering isn't
-arbitrary: `move_email`'s `target_folder` and `get_emails`'s `folder` argument both resolve a
-folder *name* via a **Shallow** `FindFolder` search rooted at `msgfolderroot`
+→ empty (verified gone) → permanently delete. The move-before-populate ordering wasn't
+arbitrary at the time: `move_email`'s `target_folder` and `get_emails`'s `folder` argument both
+resolved a folder *name* via a **Shallow** `FindFolder` search rooted at `msgfolderroot`
 ([owa_client.py](exchange_mcp/owa_client.py) `get_folder_id()`), so a folder nested one level
-under Inbox is invisible to those lookups until `move_folder` promotes it to a direct child of
-`msgfolderroot`.
+under Inbox was invisible to those lookups until `move_folder` promoted it to a direct child of
+`msgfolderroot`. **Superseded 2026-09-09** — see the update below; `get_folder_id()` now walks
+`/`-delimited paths, so this ordering constraint no longer applies (kept here for historical
+context on why the original test was written this way).
 
 A one-off operational incident during this test (not a tool bug, logged for awareness):
 after a long idle gap mid-session, the persistent browser session's `launch_persistent_context`
@@ -290,6 +292,34 @@ verified live: single-folder (AQS-empty-then-fallback) via
 [test_search_emails.py](tests/smoke/tests/test_search_emails.py), and
 `search_all_folders=True` via a direct MCP call returning results with no error.
 
+**Update 2026-09-09 — `move_email` couldn't resolve nested destination folders.** Reported
+from real usage: every attempt to move an email into any of several `Progetti/*` subfolders
+(e.g. `Progetti/ACE-NewGeco`) failed with "Folder not found," trying both the full path and
+the bare folder name (10 attempts, all failed) — consistent with an earlier failure moving
+into `Quarantena`, a folder nested one level under Inbox. Root cause: `get_folder_id()`
+([owa_client.py](exchange_mcp/owa_client.py)) only ran a single **Shallow** `FindFolder`
+rooted at `msgfolderroot` with a literal `DisplayName` match, so it could see direct children
+of `msgfolderroot` and nothing else — a folder nested under another custom folder, or under a
+distinguished folder like Inbox, was invisible to it regardless of whether the caller passed
+the bare name or a `/`-delimited path (no path-splitting logic existed at all; a literal
+string like `"Progetti/ACE-NewGeco"` could never equal a single-segment `DisplayName`).
+Confirmed live against the real mailbox structure that `Progetti` is top-level with
+`ACE-NewGeco` nested inside it, that a distinct top-level folder `ACE - NewGeco` (with spaces)
+also exists — ruling out a naive Deep-search-by-bare-name fallback as unsafe/ambiguous — and
+that `Quarantena` is nested one level under `Posta in arrivo` (Inbox).
+
+Fixed by adding `_resolve_folder_path()`/`_find_child_folder_id()` to `get_folder_id()`: a
+`/`-delimited path is now walked one Shallow `FindFolder` per segment, starting from a
+distinguished folder (e.g. `Inbox`) when the first segment names one, otherwise from
+`msgfolderroot`, resolving each subsequent segment as a child of the previous. This is
+additive — bare single-segment names (the only other call shape used anywhere in the
+codebase, by `email.py`/`calendar.py`/`analytics.py`/`availability.py`) are unaffected. New
+regression test [test_move_email_nested_folder.py](tests/smoke/tests/test_move_email_nested_folder.py)
+reproduces both bug shapes from the report against disposable, uniquely-tagged folders (a
+custom folder nested under another custom folder, and a folder nested under the Inbox
+distinguished folder) rather than the real `Progetti`/`Quarantena` trees; both cases verified
+live end-to-end (move + confirm landed at the nested path), passing after the fix.
+
 ## 2. How to read the table
 
 - **ID** — a permanent 3-digit identifier: digit 1 is the module number (fixed per
@@ -331,7 +361,7 @@ verified live: single-folder (AQS-empty-then-fallback) via
 | 104 | `reply_email` | Reply (or reply-all) to an email | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
 | 105 | `forward_email` | Forward an email to new recipients | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
 | 106 | `mark_email_read` | Mark one or more emails read/unread | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
-| 107 | `move_email` | Move one or more emails to another folder | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
+| 107 | `move_email` | Move one or more emails to another folder; `target_folder` accepts a bare name (direct child of `msgfolderroot`/a distinguished folder) or a `/`-delimited path for folders nested deeper (e.g. `Progetti/ACE-NewGeco`, `Inbox/Quarantena`) | `tests/smoke/tests/test_email_lifecycle.py`, `tests/smoke/tests/test_move_email_nested_folder.py` | OK (2026-09-09, re-verified) — see "Update 2026-09-09 — move_email couldn't resolve nested destination folders" below | Stable |
 | 108 | `delete_email` | Delete (soft or permanent) one or more emails | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
 | 109 | `download_attachments` | Download all file attachments from an email to disk | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
 | 110 | `get_email_links` | Extract hyperlinks from an email's HTML body | `tests/smoke/tests/test_get_email_detail.py` | OK (2026-09-07) | Stable |
