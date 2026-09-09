@@ -8,7 +8,7 @@ import json
 from mcp.server.fastmcp import Context
 
 from exchange_mcp.server import mcp, AppContext
-from exchange_mcp.owa_client import OWAClient
+from exchange_mcp.owa_client import BearerModeRequiredError, OWAClient
 
 
 def _get_client(ctx: Context) -> OWAClient:
@@ -89,12 +89,51 @@ def _parse_person(resolution: dict) -> dict:
     return person
 
 
+def _parse_suggestion(suggestion: dict) -> dict:
+    """Parse person data from a substrate /search/api/v1/suggestions entry.
+
+    Same output shape as _parse_person() for a uniform find_person() result,
+    but the suggestions API doesn't return manager/direct-reports/postal
+    address at all - those stay empty, same as when ResolveNames' Contact
+    data happens to be sparse.
+    """
+    emails = suggestion.get("EmailAddresses") or []
+    person = {
+        "name": suggestion.get("DisplayName", ""),
+        "email": emails[0] if emails else "",
+        "type": suggestion.get("PeopleType", ""),
+        "first_name": suggestion.get("GivenName", ""),
+        "last_name": suggestion.get("Surname", ""),
+        "job_title": suggestion.get("JobTitle", ""),
+        "department": suggestion.get("Department", ""),
+        "company": suggestion.get("CompanyName", ""),
+        "office": suggestion.get("OfficeLocation", ""),
+        "manager": "",
+        "manager_email": "",
+        "phones": {},
+        "address": {},
+        "direct_reports": [],
+        "alias": suggestion.get("Alias", ""),
+    }
+
+    for phone in suggestion.get("Phones", []):
+        key = phone.get("Type", "")
+        number = phone.get("Number", "")
+        if number:
+            person["phones"][key] = number
+
+    return person
+
+
 @mcp.tool()
 def find_person(query: str, ctx: Context) -> str:
     """Search for people in the corporate directory.
 
-    Looks up employees by name, email, department, or keyword using the
-    Exchange ResolveNames API against Active Directory.
+    On the modern Outlook backend ("new Outlook" tenants), uses the same
+    Substrate Search API the People app's own search box calls - EWS
+    ResolveNames throws a server-side fault on those tenants (see
+    PROJECT_STATUS.md #401). Falls back to ResolveNames on classic OWA
+    (on-prem, or a cloud tenant not yet migrated), where it works fine.
 
     Args:
         query: Name, email address, or keyword to search for.
@@ -102,9 +141,18 @@ def find_person(query: str, ctx: Context) -> str:
     Returns:
         JSON array of matching people with contact details (name, email,
         job_title, department, company, office, phones, address, manager,
-        direct_reports, alias).
+        direct_reports, alias). manager/direct_reports/address are only
+        ever populated via the ResolveNames path.
     """
     client = _get_client(ctx)
+
+    try:
+        suggestions = client.find_people(query)
+        return json.dumps([_parse_suggestion(s) for s in suggestions], ensure_ascii=False)
+    except BearerModeRequiredError:
+        pass  # classic OWA (on-prem, or not yet on the modern backend) - fall back below
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
     try:
         resolutions = client.resolve_names(query)

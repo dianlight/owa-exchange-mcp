@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, date
 from mcp.server.fastmcp import Context
 
 from exchange_mcp.server import mcp, AppContext
-from exchange_mcp.owa_client import OWAClient
+from exchange_mcp.owa_client import BearerModeRequiredError, OWAClient
 
 
 def _get_client(ctx: Context) -> OWAClient:
@@ -25,7 +25,22 @@ def _get_client(ctx: Context) -> OWAClient:
 # ------------------------------------------------------------------
 
 def _resolve_to_email(client: OWAClient, name: str) -> tuple[str, str]:
-    """Resolve a name/email to (display_name, email). Returns ('','') on failure."""
+    """Resolve a name/email to (display_name, email). Returns ('','') on failure.
+
+    Tries the substrate people-search first (same fallback as
+    people.find_person - see PROJECT_STATUS.md #401/#701: ResolveNames
+    throws a server-side fault on this tenant), then falls back to
+    ResolveNames on classic OWA where the substrate surface doesn't exist.
+    """
+    try:
+        suggestions = client.find_people(name)
+        if suggestions:
+            emails = suggestions[0].get("EmailAddresses") or []
+            return suggestions[0].get("DisplayName", name), emails[0] if emails else ""
+        return "", ""
+    except BearerModeRequiredError:
+        pass
+
     resolutions = client.resolve_names(name)
     if resolutions:
         mb = resolutions[0].get("Mailbox", {})
@@ -45,11 +60,20 @@ def _get_availability_events(
     batch_size: int = 5,
     chunk_days: int = 14,
 ) -> tuple[dict[str, list[dict]], list[str]]:
-    """Query GetUserAvailability for multiple people across a date range.
+    """Query availability for multiple people across a date range.
+
+    Prefers GetSchedule, the modern-backend GraphQL operation the
+    Scheduling Assistant UI itself uses - GetUserAvailability returns a
+    server-side NotImplementedException on this tenant (PROJECT_STATUS.md
+    #602/#701), confirmed unfixable client-side. Falls back to the legacy
+    EWS action on classic OWA, where GetSchedule's bearer-only substrate
+    surface doesn't exist - checked once (not per batch/chunk): bearer
+    mode is a session-wide property, so a BearerModeRequiredError on the
+    first attempt means every later one would fail identically.
 
     Returns (results, errors): results maps email -> list of calendar event
     dicts with keys: subject, start_date, busy_type. errors collects one
-    message per failed chunk/batch, so a GetUserAvailability failure shows
+    message per failed chunk/batch, so an availability-query failure shows
     up as a reportable warning instead of silently looking like "no meetings".
     """
     results: dict[str, list[dict]] = {email: [] for email in emails}
@@ -57,11 +81,40 @@ def _get_availability_events(
 
     # Batch people
     email_batches = [emails[i:i+batch_size] for i in range(0, len(emails), batch_size)]
+    use_schedule = True
 
     for batch in email_batches:
         current = start
         while current < end:
             chunk_end = min(current + timedelta(days=chunk_days), end)
+
+            if use_schedule:
+                try:
+                    schedules = client.get_schedule(
+                        batch,
+                        datetime.combine(current, datetime.min.time()),
+                        datetime.combine(chunk_end, datetime.min.time()),
+                    )
+                    for sched in schedules:
+                        email = sched["email"]
+                        if sched.get("error"):
+                            errors.append(
+                                f"GetSchedule failed for {email}: "
+                                f"{sched['error'].get('message', 'Unknown error')}"
+                            )
+                            continue
+                        for ev in sched.get("events", []):
+                            if ev["status"].lower() in ("free", "nodata"):
+                                continue
+                            results[email].append({
+                                'subject': ev.get('subject', ''),
+                                'start_date': ev['start'].strftime('%Y-%m-%d'),
+                                'busy_type': ev.get('status', ''),
+                            })
+                    current = chunk_end
+                    continue
+                except BearerModeRequiredError:
+                    use_schedule = False
 
             mailbox_data = [{
                 '__type': 'MailboxData:#Exchange',

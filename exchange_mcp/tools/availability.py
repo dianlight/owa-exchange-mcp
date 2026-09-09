@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from mcp.server.fastmcp import Context
 
 from exchange_mcp.server import mcp, AppContext
-from exchange_mcp.owa_client import OWAClient
+from exchange_mcp.owa_client import BearerModeRequiredError, OWAClient
 
 
 def _get_client(ctx: Context) -> OWAClient:
@@ -114,7 +114,32 @@ def _format_time(dt: datetime) -> str:
 def _get_availability_events(
     client: OWAClient, email: str, start_date, end_date
 ) -> list[dict]:
-    """Get busy events via GetUserAvailability (expands recurring events)."""
+    """Get busy events (expands recurring events).
+
+    Prefers GetSchedule, the modern-backend GraphQL operation the
+    Scheduling Assistant UI itself uses - GetUserAvailability returns a
+    server-side NotImplementedException on this tenant (PROJECT_STATUS.md
+    #602), confirmed unfixable client-side. Falls back to the legacy EWS
+    action on classic OWA, where GetSchedule's bearer-only substrate
+    surface doesn't exist.
+    """
+    try:
+        schedules = client.get_schedule(
+            [email],
+            datetime.combine(start_date, datetime.min.time()),
+            datetime.combine(end_date + timedelta(days=1), datetime.min.time()),
+        )
+        sched = schedules[0] if schedules else {}
+        if sched.get("error"):
+            raise RuntimeError(sched["error"].get("message") or "GetSchedule failed")
+        return [
+            {"start": ev["start"], "end": ev["end"], "status": ev["status"]}
+            for ev in sched.get("events", [])
+            if ev["status"].lower() not in ("free", "nodata")
+        ]
+    except BearerModeRequiredError:
+        pass
+
     payload = {
         '__type': 'GetUserAvailabilityJsonRequest:#Exchange',
         'Header': {
@@ -426,104 +451,153 @@ def find_meeting_time(
     if not email_list:
         return json.dumps({"error": f"Could not resolve any names to email addresses: {resolve_errors}"})
 
-    # Build mailbox data (reused for each day chunk)
-    mailbox_data = []
-    for email in email_list:
-        mailbox_data.append({
-            '__type': 'MailboxData:#Exchange',
-            'Email': {
-                '__type': 'EmailAddress:#Exchange',
-                'Address': email,
-            },
-            'AttendeeType': 'Required',
-        })
-
-    # Query the full date range at once (API handles multi-day windows)
-    payload = {
-        '__type': 'GetUserAvailabilityJsonRequest:#Exchange',
-        'Header': {
-            '__type': 'JsonRequestHeaders:#Exchange',
-            'RequestServerVersion': 'Exchange2013',
-            'TimeZoneContext': {
-                '__type': 'TimeZoneContext:#Exchange',
-                'TimeZoneDefinition': {
-                    '__type': 'TimeZoneDefinitionType:#Exchange',
-                    'Id': 'Russian Standard Time',
-                },
-            },
-        },
-        'Body': {
-            '__type': 'GetUserAvailabilityRequest:#Exchange',
-            'MailboxDataArray': mailbox_data,
-            'FreeBusyViewOptions': {
-                '__type': 'FreeBusyViewOptions:#Exchange',
-                'TimeWindow': {
-                    '__type': 'Duration:#Exchange',
-                    'StartTime': f'{sd}T00:00:00',
-                    'EndTime': f'{ed + timedelta(days=1)}T00:00:00',
-                },
-                'MergedFreeBusyIntervalInMinutes': 30,
-                'RequestedView': 'DetailedMerged',
-            },
-        },
-    }
-
-    try:
-        data = client.request("GetUserAvailability", payload)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-    body = data.get('Body', {})
-    if 'ErrorCode' in body:
-        return json.dumps({"error": body.get('FaultMessage') or f"GetUserAvailability failed: {body.get('ExceptionName', 'Unknown error')}"})
-
-    # Parse availability responses
+    # Query availability: prefer GetSchedule, the modern-backend GraphQL
+    # operation the Scheduling Assistant UI itself uses - GetUserAvailability
+    # returns a server-side NotImplementedException on this tenant
+    # (PROJECT_STATUS.md #602), confirmed unfixable client-side. Falls back
+    # to the legacy EWS action on classic OWA, where GetSchedule's
+    # bearer-only substrate surface doesn't exist. GetSchedule's
+    # availabilityView uses the identical 0/1/2/3/4-per-interval encoding
+    # as GetUserAvailability's MergedFreeBusy, so _parse_freebusy_string
+    # applies unchanged.
     all_busy = []
     attendee_info = []
-    freebusy_responses = body.get('FreeBusyResponseArray', [])
+    got_schedule = False
 
-    for i, fb_resp in enumerate(freebusy_responses):
-        fb_view = fb_resp.get('FreeBusyView', {})
-        merged_fb = fb_view.get('MergedFreeBusy', '')
-        email = email_list[i] if i < len(email_list) else f"Person {i+1}"
+    try:
+        schedules = client.get_schedule(
+            email_list,
+            datetime.combine(sd, datetime.min.time()),
+            datetime.combine(ed + timedelta(days=1), datetime.min.time()),
+        )
+        got_schedule = True
+        start_time = datetime.combine(sd, datetime.min.time())
 
-        if merged_fb:
-            start_time = datetime.combine(sd, datetime.min.time())
-            busy_periods = _parse_freebusy_string(merged_fb, start_time)
+        for sched in schedules:
+            email = sched["email"]
+            if sched.get("error"):
+                attendee_info.append({"email": email, "status": "no_data"})
+                continue
 
-            busy_count = sum(1 for c in merged_fb if c != '0')
-            free_count = sum(1 for c in merged_fb if c == '0')
-            attendee_info.append({
-                "email": email,
-                "busy_slots": busy_count,
-                "free_slots": free_count,
+            av = sched.get("availability_view", "")
+            if av:
+                busy_periods = _parse_freebusy_string(av, start_time)
+                attendee_info.append({
+                    "email": email,
+                    "busy_slots": sum(1 for c in av if c != '0'),
+                    "free_slots": sum(1 for c in av if c == '0'),
+                })
+                all_busy.extend(busy_periods)
+                continue
+
+            busy_events = [
+                ev for ev in sched.get("events", [])
+                if ev["status"].lower() not in ("free", "nodata")
+            ]
+            if busy_events:
+                attendee_info.append({"email": email, "calendar_events": len(busy_events)})
+                all_busy.extend((ev["start"], ev["end"]) for ev in busy_events)
+            else:
+                attendee_info.append({"email": email, "status": "no_data"})
+    except BearerModeRequiredError:
+        got_schedule = False
+
+    if not got_schedule:
+        # Build mailbox data (reused for each day chunk)
+        mailbox_data = []
+        for email in email_list:
+            mailbox_data.append({
+                '__type': 'MailboxData:#Exchange',
+                'Email': {
+                    '__type': 'EmailAddress:#Exchange',
+                    'Address': email,
+                },
+                'AttendeeType': 'Required',
             })
 
-            all_busy.extend(busy_periods)
-        else:
-            # Fallback: parse CalendarEventArray
-            cal_events_raw = fb_view.get('CalendarEventArray', {})
-            cal_events = cal_events_raw.get('Items', []) if isinstance(cal_events_raw, dict) else (cal_events_raw if isinstance(cal_events_raw, list) else [])
-            if cal_events:
+        # Query the full date range at once (API handles multi-day windows)
+        payload = {
+            '__type': 'GetUserAvailabilityJsonRequest:#Exchange',
+            'Header': {
+                '__type': 'JsonRequestHeaders:#Exchange',
+                'RequestServerVersion': 'Exchange2013',
+                'TimeZoneContext': {
+                    '__type': 'TimeZoneContext:#Exchange',
+                    'TimeZoneDefinition': {
+                        '__type': 'TimeZoneDefinitionType:#Exchange',
+                        'Id': 'Russian Standard Time',
+                    },
+                },
+            },
+            'Body': {
+                '__type': 'GetUserAvailabilityRequest:#Exchange',
+                'MailboxDataArray': mailbox_data,
+                'FreeBusyViewOptions': {
+                    '__type': 'FreeBusyViewOptions:#Exchange',
+                    'TimeWindow': {
+                        '__type': 'Duration:#Exchange',
+                        'StartTime': f'{sd}T00:00:00',
+                        'EndTime': f'{ed + timedelta(days=1)}T00:00:00',
+                    },
+                    'MergedFreeBusyIntervalInMinutes': 30,
+                    'RequestedView': 'DetailedMerged',
+                },
+            },
+        }
+
+        try:
+            data = client.request("GetUserAvailability", payload)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+        body = data.get('Body', {})
+        if 'ErrorCode' in body:
+            return json.dumps({"error": body.get('FaultMessage') or f"GetUserAvailability failed: {body.get('ExceptionName', 'Unknown error')}"})
+
+        freebusy_responses = body.get('FreeBusyResponseArray', [])
+
+        for i, fb_resp in enumerate(freebusy_responses):
+            fb_view = fb_resp.get('FreeBusyView', {})
+            merged_fb = fb_view.get('MergedFreeBusy', '')
+            email = email_list[i] if i < len(email_list) else f"Person {i+1}"
+
+            if merged_fb:
+                start_time = datetime.combine(sd, datetime.min.time())
+                busy_periods = _parse_freebusy_string(merged_fb, start_time)
+
+                busy_count = sum(1 for c in merged_fb if c != '0')
+                free_count = sum(1 for c in merged_fb if c == '0')
                 attendee_info.append({
                     "email": email,
-                    "calendar_events": len(cal_events),
+                    "busy_slots": busy_count,
+                    "free_slots": free_count,
                 })
-                for event in cal_events:
-                    start_str = event.get('StartTime', '')
-                    end_str = event.get('EndTime', '')
-                    if start_str and end_str:
-                        try:
-                            start = datetime.fromisoformat(start_str.replace('Z', '+00:00'))
-                            end = datetime.fromisoformat(end_str.replace('Z', '+00:00'))
-                            all_busy.append((start, end))
-                        except Exception:
-                            pass
+
+                all_busy.extend(busy_periods)
             else:
-                attendee_info.append({
-                    "email": email,
-                    "status": "no_data",
-                })
+                # Fallback: parse CalendarEventArray
+                cal_events_raw = fb_view.get('CalendarEventArray', {})
+                cal_events = cal_events_raw.get('Items', []) if isinstance(cal_events_raw, dict) else (cal_events_raw if isinstance(cal_events_raw, list) else [])
+                if cal_events:
+                    attendee_info.append({
+                        "email": email,
+                        "calendar_events": len(cal_events),
+                    })
+                    for event in cal_events:
+                        start_str = event.get('StartTime', '')
+                        end_str = event.get('EndTime', '')
+                        if start_str and end_str:
+                            try:
+                                start = datetime.fromisoformat(start_str.replace('Z', '+00:00'))
+                                end = datetime.fromisoformat(end_str.replace('Z', '+00:00'))
+                                all_busy.append((start, end))
+                            except Exception:
+                                pass
+                else:
+                    attendee_info.append({
+                        "email": email,
+                        "status": "no_data",
+                    })
 
     merged_busy = _merge_busy_periods(all_busy)
 
