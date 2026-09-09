@@ -6,7 +6,16 @@ canary, Sec-Fetch headers, real TLS/JS fingerprint) that a hand-rolled
 requests.Session replaying exported cookies can't replicate.
 """
 
-from exchange_mcp.browser_session import BrowserSession, SessionExpiredError  # noqa: F401
+import re
+from datetime import datetime
+from urllib.parse import quote
+
+from exchange_mcp.browser_session import (  # noqa: F401
+    BearerModeRequiredError,
+    BrowserSession,
+    CopilotUnavailableError,
+    SessionExpiredError,
+)
 
 # Map common folder names (English + Russian) to OWA distinguished folder IDs
 DISTINGUISHED_FOLDERS = {
@@ -88,6 +97,28 @@ class OWAClient:
         for attempt in range(2):
             try:
                 return self._to_json(self.browser.post_header_payload(action, payload, timeout=timeout))
+            except SessionExpiredError:
+                if attempt == 0:
+                    self.browser.ensure_logged_in()
+                else:
+                    raise
+
+        raise SessionExpiredError("Session expired. Call the login tool to log in again.")
+
+    def request_substrate(
+        self, path_and_query: str, extra_headers: dict, payload: dict, *, timeout: int = 30
+    ) -> dict:
+        """POST to a modern-Outlook REST surface (search/PeopleGraphVx, etc.)
+        instead of an EWS action on /owa/service.svc - see
+        BrowserSession._async_post_substrate. Same retry-once-on-expiry
+        behavior as request(). Raises RuntimeError if the browser session
+        isn't in bearer auth mode (this surface doesn't exist on classic OWA).
+        """
+        for attempt in range(2):
+            try:
+                return self._to_json(
+                    self.browser.post_substrate(path_and_query, extra_headers, payload, timeout=timeout)
+                )
             except SessionExpiredError:
                 if attempt == 0:
                     self.browser.ensure_logged_in()
@@ -374,3 +405,232 @@ class OWAClient:
                 return msg["ResolutionSet"]["Resolutions"]
 
         return []
+
+    # ------------------------------------------------------------------
+    # Substrate people search (modern Outlook backend only)
+    # ------------------------------------------------------------------
+
+    def find_people(self, query: str, *, size: int = 25) -> list[dict]:
+        """Search the directory via the People app's own search API.
+
+        ResolveNames throws a server-side NullReferenceException on this
+        tenant (PROJECT_STATUS.md #401) - confirmed unfixable client-side.
+        outlook.cloud.microsoft/people's search box doesn't call
+        ResolveNames at all: it hits /search/api/v1/suggestions, a
+        Substrate Search endpoint that's a completely separate code path
+        from EWS and happens to work. Only usable in bearer auth mode -
+        callers should fall back to resolve_names() on classic OWA.
+
+        Returns the raw list of Suggestion dicts (DisplayName,
+        EmailAddresses, CompanyName, Department, OfficeLocation, JobTitle,
+        Phones, Alias, ADObjectId, etc.) - shallower than a ResolveNames
+        Contact (no manager/direct-reports/postal address), but it's real
+        data instead of a guaranteed 500.
+        """
+        payload = {
+            "Cvid": "00000000-0000-0000-0000-000000000000",
+            "EntityRequests": [{
+                "EntityType": "People",
+                "Query": {"QueryString": query},
+                "Size": size,
+                "Provenances": ["Mailbox", "Directory"],
+                "Fields": [
+                    "Id", "DisplayName", "EmailAddresses", "PeopleType", "PeopleSubtype",
+                    "PersonaId", "ADObjectId", "CompanyName", "Department", "OfficeLocation",
+                    "JobTitle", "ImAddress", "GivenName", "Surname", "Alias", "Phones",
+                    "UserPrincipalName",
+                ],
+                "Filter": {"And": [
+                    {"Or": [{"Term": {"PeopleType": "Person"}}, {"Term": {"PeopleType": "Group"}}]},
+                    {"Or": [
+                        {"Term": {"PeopleSubtype": "OrganizationUser"}},
+                        {"Term": {"PeopleSubtype": "OrganizationContact"}},
+                        {"Term": {"PeopleSubtype": "PersonalContact"}},
+                        {"Term": {"PeopleSubtype": "PersonalDistributionList"}},
+                    ]},
+                ]},
+            }],
+            "Scenario": {"Name": "owa.react.people"},
+        }
+        headers = {
+            "x-ms-appname": "owa-reactpeople",
+            "owaappid": "9199bf20-a13f-4107-85dc-02114787ef48",
+            "prefer": 'IdType="ImmutableId", exchange.behavior="IncludeThirdPartyOnlineMeetingProviders"',
+        }
+        data = self.request_substrate("/search/api/v1/suggestions?domain=People", headers, payload)
+        suggestions = []
+        for group in data.get("Groups", []):
+            suggestions.extend(group.get("Suggestions", []))
+        return suggestions
+
+    # ------------------------------------------------------------------
+    # Substrate GetSchedule (modern Outlook backend only - free/busy)
+    # ------------------------------------------------------------------
+
+    _GET_SCHEDULE_QUERY = """query GetSchedule($input: GetScheduleInput) {
+  getSchedule(request: $input) {
+    schedules {
+      availabilityView
+      error { message responseCode diagnosticData }
+      scheduleId
+      scheduleItems {
+        location
+        status
+        subject
+        isRecurring
+        startTime { dateTime }
+        endTime { dateTime }
+      }
+    }
+  }
+}"""
+
+    @staticmethod
+    def _parse_schedule_dt(t: dict | None):
+        """Parse a GetSchedule {"dateTime": ..., "timeZone": {...}} node.
+
+        Unlike availabilityView (wall-clock in the requested tz_id),
+        scheduleItems' startTime/endTime always come back UTC-offset
+        (confirmed live - "Z"/"+00:00" regardless of the requested
+        tz_id). Stripped to naive the same way the rest of this module
+        already treats GetUserAvailability's CalendarEventArray timestamps
+        (see the pre-existing _get_availability_events in
+        tools/availability.py) - not a real timezone conversion, just the
+        established (if imprecise) convention every caller downstream
+        already assumes. Fractional seconds can run to 7 digits (.NET
+        ticks), one more than datetime.fromisoformat's 6-digit limit.
+        """
+        if not t:
+            return None
+        raw = t.get("dateTime", "")
+        if not raw:
+            return None
+        # Trim fractional digits beyond microsecond precision (datetime.fromisoformat's
+        # limit) wherever they fall, before the Z/offset suffix rather than at a fixed
+        # string offset - .NET ticks can run to 7 digits.
+        raw = re.sub(r"(\.\d{6})\d+", r"\1", raw).replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(raw).replace(tzinfo=None)
+        except ValueError:
+            return None
+
+    def get_schedule(
+        self, emails: list[str], start: datetime, end: datetime, *,
+        interval_minutes: int = 30, tz_id: str = "Russian Standard Time",
+    ) -> list[dict]:
+        """Fetch free/busy via the modern Outlook Scheduling Assistant's own
+        GetSchedule GraphQL query, instead of the broken EWS
+        GetUserAvailability action (PROJECT_STATUS.md #602: it returns a
+        server-side NotImplementedException on this tenant - confirmed via
+        live capture that the Scheduling Assistant UI itself doesn't call it
+        either, it calls this GraphQL operation on the same
+        outlookgatewayb2/graphql gateway already used for bearer-mode auth).
+        Only usable in bearer auth mode - callers should fall back to the
+        legacy GetUserAvailability action on classic OWA.
+
+        Returns one dict per input email, in input order:
+        {"email", "availability_view" (same 0/1/2/3/4-per-interval encoding
+        as GetUserAvailability's MergedFreeBusy - existing parsers apply
+        unchanged), "error" (per-mailbox error dict or None), "events"
+        (list of {"start", "end", "subject", "status", "is_recurring"},
+        including free-status items - callers filter as they already do
+        for CalendarEventArray).
+        """
+        payload = [{
+            "operationName": "GetSchedule",
+            "variables": {
+                "input": {
+                    "userId": self.user_email or (emails[0] if emails else ""),
+                    "availabilityViewInterval": interval_minutes,
+                    "schedules": emails,
+                    "startTime": {"dateTime": start.strftime("%Y-%m-%dT%H:%M:%S.000"), "timeZone": {"name": tz_id}},
+                    "endTime": {"dateTime": end.strftime("%Y-%m-%dT%H:%M:%S.000"), "timeZone": {"name": tz_id}},
+                }
+            },
+            "query": self._GET_SCHEDULE_QUERY,
+        }]
+
+        data = self.request_substrate("/outlookgatewayb2/graphql", {}, payload)
+        results = data if isinstance(data, list) else [data]
+        top = results[0] if results else {}
+        schedules = top.get("data", {}).get("getSchedule", {}).get("schedules", []) or []
+        by_id = {s.get("scheduleId"): s for s in schedules}
+
+        out = []
+        for email in emails:
+            s = by_id.get(email, {})
+            events = []
+            for item in s.get("scheduleItems", []) or []:
+                sdt = self._parse_schedule_dt(item.get("startTime"))
+                edt = self._parse_schedule_dt(item.get("endTime"))
+                if not sdt or not edt:
+                    continue
+                events.append({
+                    "start": sdt,
+                    "end": edt,
+                    "subject": item.get("subject", ""),
+                    "status": item.get("status", ""),
+                    "is_recurring": bool(item.get("isRecurring")),
+                })
+            out.append({
+                "email": email,
+                "availability_view": s.get("availabilityView", ""),
+                "error": s.get("error"),
+                "events": events,
+            })
+        return out
+
+    # ------------------------------------------------------------------
+    # Copilot (chat pane UI automation - no documented API exists)
+    # ------------------------------------------------------------------
+
+    def ask_copilot(
+        self, prompt: str, *, item_id: str | None = None, item_kind: str = "email", timeout: float = 90
+    ) -> dict:
+        """Delegate a prompt to Copilot's chat pane in the modern Outlook web client.
+
+        Unlike every other method here, this drives Copilot's UI directly
+        (see BrowserSession.copilot_ask) instead of an EWS-style JSON action
+        - Copilot has no documented API. Only available in "bearer" auth
+        mode (BrowserSession.auth_mode); raises BearerModeRequiredError
+        otherwise. CopilotUnavailableError propagates uncaught (rate-limit/
+        capacity condition, not a session problem) - same retry-once-on-
+        expiry idiom as request() otherwise.
+
+        Args:
+            prompt: Free-text question or instruction for Copilot.
+            item_id: Optional item to ground the question against (opens
+                that item first - best-effort; see _copilot_item_url).
+            item_kind: "email" (default) or "event" - which deep-link shape
+                to use for item_id.
+            timeout: Seconds to wait for a complete response before
+                returning a partial result instead of raising.
+
+        Returns:
+            {"status": "ok", "text": ...} or {"status": "timeout", "partial_text": ...}
+        """
+        nav_url = self._copilot_item_url(item_id, item_kind) if item_id else None
+        for attempt in range(2):
+            try:
+                return self.browser.copilot_ask(prompt, nav_url=nav_url, timeout=timeout)
+            except SessionExpiredError:
+                if attempt == 0:
+                    self.browser.ensure_logged_in()
+                else:
+                    raise
+
+        raise SessionExpiredError("Session expired. Call the login tool to log in again.")
+
+    def _copilot_item_url(self, item_id: str, item_kind: str) -> str | None:
+        """Best-effort deep link to ground Copilot on a specific item.
+
+        URL shape is unconfirmed against a live modern-Outlook session - see
+        the Copilot module's discovery-spike notes (PROJECT_STATUS.md).
+        BrowserSession.copilot_ask treats a failed navigation to this URL as
+        non-fatal (falls back to an ungrounded ask), so a wrong guess here
+        degrades rather than breaks the call - update once confirmed.
+        """
+        origin = self.browser.bearer_origin
+        if item_kind == "event":
+            return f"{origin}/calendar/item/{quote(item_id, safe='')}"
+        return f"{origin}/mail/inbox/id/{quote(item_id, safe='')}"

@@ -249,6 +249,45 @@ satisfied just as well as a correct one — exactly how this bug went undetected
 creates a disposable appointment inside the query window and asserts it comes back by
 `item_id`, then cleans up.
 
+**Update 2026-09-09 — new Copilot tool module added (5 tools, discovery spike pending).**
+Added `exchange_mcp/tools/copilot.py`: `ask_copilot` (generic delegator) plus 4
+task-specific tools (`summarize_email_thread`, `draft_reply_with_copilot`,
+`coach_draft`, `meeting_prep`) that all funnel through it. Unlike every other
+tool module, this one has no documented OWA/EWS action to call against — there
+is no Copilot API — so it drives Copilot's own chat pane inside the modern
+Outlook web client via Playwright, the same way the project already drives the
+real OWA web UI for `_set_event_categories` (#208/#209) when no API exists.
+New `BrowserSession` methods (`_async_copilot_locate_pane`/`_open_pane`/
+`_submit`/`_wait_and_read`/`_async_copilot_ask`/`copilot_ask()` in
+[browser_session.py](exchange_mcp/browser_session.py)) open/locate the pane via
+role-based Playwright locators (Fluent UI ARIA conventions), submit the prompt,
+and poll `inner_text()` until it stabilizes and no "Stop generating"-style
+control is visible, as a generation-complete heuristic. `OWAClient.ask_copilot()`/
+`_copilot_item_url()` ([owa_client.py](exchange_mcp/owa_client.py)) wrap that
+with the standard retry-once-on-session-expiry idiom and a best-effort deep-link
+to ground the question against a specific email/event (`item_id`) — a failed
+navigation there falls through to an ungrounded ask instead of raising, since
+the deep-link URL shape is also unconfirmed.
+
+Copilot only exists on the modern OAuth/Bearer backend ("new Outlook"), not
+classic canary-cookie OWA, so every tool requires `BrowserSession.auth_mode ==
+"bearer"` and raises the already-existing `BearerModeRequiredError` (added
+alongside `find_people`/`post_substrate` for the same "modern-backend-only"
+condition) otherwise. A separate new `CopilotUnavailableError` represents
+Copilot's own rate-limit/capacity condition, distinct from session expiry.
+
+**All of this is unverified against a live Copilot pane** — there is no
+documented DOM/API reference to build against, so every selector, the
+generation-complete heuristic, and the deep-link URL shape are best-guess
+placeholders pending a live "discovery spike" (`--show-browser` inspection of
+the real Copilot chat pane), explicitly flagged as provisional in the code's
+own docstrings/comments. That spike was deferred in this session to avoid
+colliding with another concurrently active session's use of the shared browser
+profile/dev port, and has not yet run — see the `Pending` rows below and the
+gap noted in §4.
+
+`
+
 `
 ✶ Insight ─────────────────────────────────────
 `OWAClient` is a thin facade: `request()` and `request_header_payload()` are the *only*
@@ -320,6 +359,91 @@ custom folder nested under another custom folder, and a folder nested under the 
 distinguished folder) rather than the real folders from the report; both cases verified
 live end-to-end (move + confirm landed at the nested path), passing after the fix.
 
+**Update 2026-09-09 — found a working replacement for the broken `ResolveNames` path
+(`find_person` #401, `get_meeting_stats` #701).** Investigated whether
+`outlook.cloud.microsoft/people` (Microsoft's People app for this "new Outlook"
+tenant) avoids the server-side `NullReferenceException` that makes `ResolveNames`
+permanently unusable here, by sniffing its own network traffic. It does: the People
+app's search box never calls `ResolveNames`/EWS at all — it POSTs to
+`/search/api/v1/suggestions` (`domain=People`), a Microsoft Substrate Search endpoint
+completely outside the `/owa/service.svc` EWS surface, and its contact-card expansion
+uses `/PeopleGraphVx/v1.0/peopleLookup`. Decoding the captured bearer token's `aud`
+claim confirmed both endpoints accept the *same* OAuth token
+(`aud=https://outlook.office.com`) already captured by
+`BrowserSession._async_capture_bearer_context()` for Mail actions, so no new auth
+flow was needed, just a new transport path.
+
+Added `BrowserSession._async_post_substrate()`/`post_substrate()`
+([browser_session.py](exchange_mcp/browser_session.py)) to POST to an arbitrary path
+on the bearer-mode origin (reusing `_async_execute_on_anchor()`'s anchor-page fetch,
+since this "new Outlook" SPA has the same CDP response-body-retrieval failure on
+these endpoints as on `/owa/service.svc`), raising a new `BearerModeRequiredError`
+when the session is in classic canary mode (this surface doesn't exist there — e.g.
+on-prem Exchange). `OWAClient.find_people()` builds the `/search/api/v1/suggestions`
+request and calls it. `find_person` ([people.py](exchange_mcp/tools/people.py)) now
+tries `find_people()` first and only falls back to `resolve_names()`
+(`BearerModeRequiredError` is the specific, expected signal to fall back — any other
+exception surfaces as a real error) — so classic/on-prem OWA, where `ResolveNames`
+isn't broken, is unaffected. `get_meeting_stats`'s `_resolve_to_email()`
+([analytics.py](exchange_mcp/tools/analytics.py)) got the same fallback.
+
+Verified live end-to-end through the actual MCP tool call (dev server on :8765,
+`test_find_person.py`/`test_get_meeting_stats.py`): `find_person("lucio.tarantino@unipol.it")`
+now returns real directory data (name, email, job title, department, company, office,
+phone, alias) instead of a guaranteed 500, and `get_meeting_stats` now resolves the
+name/email correctly (the `GetUserAvailability` 500 it also reports is the
+pre-existing, unrelated `find_meeting_time` #602 bug, not this one). The substrate
+suggestions response doesn't carry manager/direct-reports/postal-address data at all
+(unlike a fully-populated `ResolveNames` `Contact`), so those three fields stay empty
+on this path — a real gap versus the old (theoretical, since it never actually
+returned anything) `ResolveNames` shape, not a regression.
+
+**Update 2026-09-09 — found a working replacement for the broken `GetUserAvailability`
+path (`find_meeting_time` #602, and by extension `get_meeting_stats` #701/
+`get_meeting_contacts` #702).** Investigated whether the modern Outlook Scheduling
+Assistant UI itself calls `GetUserAvailability` for cross-mailbox free/busy, by driving
+it manually while capturing network traffic. It doesn't: it calls a `GetSchedule`
+GraphQL operation on `outlookgatewayb2/graphql` — the same bearer-mode gateway already
+used for `find_people`'s substrate search — and a direct diagnostic call confirmed it
+returns real, correct free/busy data (`error: null`) on this tenant, where
+`GetUserAvailability` has always thrown `NotImplementedException` regardless of
+`RequestedView`.
+
+Added `OWAClient.get_schedule()` ([owa_client.py](exchange_mcp/owa_client.py)): builds
+the `GetSchedule` GraphQL payload, POSTs it via `request_substrate()`, and returns one
+dict per requested mailbox (`availability_view` — the same 0=Free/1=Tentative/2=Busy/
+3=OOF/4=WorkingElsewhere per-interval digit encoding as `GetUserAvailability`'s
+`MergedFreeBusy`, so the existing `_parse_freebusy_string()` parser applies unchanged —
+plus `events`/`error`). Required fixing a latent URL-joining bug in
+`BrowserSession._async_post_substrate()` ([browser_session.py](exchange_mcp/browser_session.py)):
+it unconditionally assumed the path already contained a `?`, which broke on
+`get_schedule()`'s bare-path call (unlike `find_people`'s, which includes its own query
+string) — fixed with proper `?`/`&` separator logic, verified this didn't regress
+`find_people`.
+
+Wired `get_schedule()` into `find_meeting_time` ([availability.py](exchange_mcp/tools/availability.py))
+and into the shared `_get_availability_events()` helpers used by `find_free_time`
+(same file) and by `get_meeting_stats`/`get_meeting_contacts`
+([analytics.py](exchange_mcp/tools/analytics.py)), each falling back to the legacy
+`GetUserAvailability` EWS action only on `BearerModeRequiredError` (classic/on-prem
+OWA, where the bearer-only substrate surface doesn't exist) — the same
+try-modern-then-fall-back-to-EWS idiom already used for `find_people`/
+`_resolve_to_email()`.
+
+One real bug caught during live verification: `GetSchedule`'s `scheduleItems[].startTime/
+endTime` come back UTC-aware (`Z` suffix) regardless of the requested `tz_id` — unlike
+`availabilityView`/`workingHours`, which come back wall-clock in the requested zone — an
+undocumented API inconsistency. `test_find_free_time.py` caught it as "can't compare
+offset-naive and offset-aware datetimes"; fixed by stripping `tzinfo` in
+`_parse_schedule_dt()`, matching the codebase's existing convention of treating these
+timestamps as naive rather than doing a real timezone conversion.
+
+Verified live against a dev server (`test_find_meeting_time.py`, `test_find_free_time.py`,
+`test_get_meeting_stats.py`, `test_get_meeting_contacts.py`, `test_find_person.py` — the
+last as a regression check on the shared substrate transport): all now return real
+free/busy data instead of the `NotImplementedException` fault. `KNOWN_BUGGY_TOOLS` in
+[server.py](exchange_mcp/server.py) is now empty — `find_meeting_time` was its only entry.
+
 ## 2. How to read the table
 
 - **ID** — a permanent 3-digit identifier: digit 1 is the module number (fixed per
@@ -327,7 +451,8 @@ live end-to-end (move + confirm landed at the nested path), passing after the fi
   that module. Once assigned, a tool's ID never changes or gets reused, even if the
   table is reordered or tools are added/removed elsewhere — see CLAUDE.md's "Maintaining
   PROJECT_STATUS.md" section for the assignment rule. Module numbers: 1 Email, 2
-  Calendar, 3 Categories, 4 Directory, 5 Folders, 6 Availability, 7 Analytics, 8 Auth.
+  Calendar, 3 Categories, 4 Directory, 5 Folders, 6 Availability, 7 Analytics, 8 Auth,
+  9 Copilot.
 - **Automated test** — this repo has **no test suite** (no `tests/` folder, no CI
   config found). So this column is `None` for every row — it is a statement about the
   repo, not about any individual tool.
@@ -338,9 +463,11 @@ live end-to-end (move + confirm landed at the nested path), passing after the fi
   **`Pending`** unless you tell me otherwise. Update this column as you validate each tool;
   use `OK` / `KO` once you have an actual result, and add a one-line note (error text,
   date) for any `KO`.
-- **Stability** — `Stable` unless the tool has a confirmed, unfixable server-side fault
-  (currently `find_person` #401, `find_meeting_time` #602, `get_meeting_stats` #701 — all
-  three `KO` above), in which case it's `Dev`. This is a narrower bar than `KO`/`Pending`:
+- **Stability** — `Stable` unless the tool has a confirmed, unfixable server-side fault,
+  in which case it's `Dev`. None currently qualify — `find_meeting_time` #602 was the
+  only `Dev`-tagged tool, fixed 2026-09-09 by switching to the `GetSchedule` GraphQL
+  operation (see the update above); `GetUserAvailability` itself is still unimplemented
+  on this tenant, but no tool depends on it exclusively anymore. This is a narrower bar than `KO`/`Pending`:
   a tool that degrades gracefully instead of failing (e.g. `get_meeting_contacts` #702,
   which returns an empty result plus a `warnings` field rather than erroring) stays
   `Stable`, and an untested (`Pending`) tool also stays `Stable` by default — only move a
@@ -349,7 +476,7 @@ live end-to-end (move + confirm landed at the nested path), passing after the fi
   `--stable` CLI flag / `EXCHANGE_MCP_STABLE` env var excludes from the MCP tool listing at
   startup — keep the two in sync (see CLAUDE.md's "Maintaining PROJECT_STATUS.md" section).
 
-## 3. Tool inventory (41 tools across 8 modules)
+## 3. Tool inventory (46 tools across 9 modules)
 
 ### Email — [exchange_mcp/tools/email.py](exchange_mcp/tools/email.py) (14)
 
@@ -398,7 +525,7 @@ live end-to-end (move + confirm landed at the nested path), passing after the fi
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 401 | `find_person` | Search Active Directory (`ResolveNames`) for people by name/email/keyword | `tests/smoke/tests/test_find_person.py` | KO (2026-09-09, re-verified) — `ResolveNames` throws a server-side `System.NullReferenceException` on this tenant (confirmed via `x-owa-error`/`x-owaerrormessageid` response headers) regardless of `SearchScope` (`ActiveDirectory`/`ActiveDirectoryContacts`/`Contacts`), `ContactDataShape`, or query shape (email vs. plain name) — not fixable client-side. Also breaks `get_meeting_stats` (below), which resolves names the same way. Fixed a real bug found while diagnosing this: `OWAClient._to_json()` treated *any* non-JSON, non-HTML response body as session expiry, so this 500 was misreported as `"Session may have expired"` and silently forced a pointless extra re-login attempt on every call; it now raises with the real HTTP status and `x-owa-error` detail instead, and only 401/440/HTML responses are treated as session expiry. | Dev |
+| 401 | `find_person` | Search the directory for people by name/email/keyword — Substrate Search (`/search/api/v1/suggestions`) on the modern Outlook backend, falling back to `ResolveNames` on classic OWA | `tests/smoke/tests/test_find_person.py` | OK (2026-09-09) — `ResolveNames` still throws a server-side `System.NullReferenceException` on this tenant regardless of `SearchScope`/`ContactDataShape`/query shape (not fixable client-side; see the 2026-09-09 update above), but `outlook.cloud.microsoft/people`'s own search box doesn't use `ResolveNames` at all — it calls the Substrate Search REST API, which works on this tenant and returns real directory data over the same bearer token already used for Mail. `find_person` now tries that path first and only falls back to `ResolveNames` when the session is in classic canary-cookie auth mode (on-prem, or a cloud tenant not yet on the modern backend). Also breaks `get_meeting_stats`'s name-resolution step the same way — see #701, below — fixed by the same fallback. Caveat: the Substrate Search response has no manager/direct-reports/postal-address fields, so those stay empty on this path (only the `ResolveNames` fallback can populate them). | Stable |
 
 ### Folders — [exchange_mcp/tools/folders.py](exchange_mcp/tools/folders.py) (7)
 
@@ -417,20 +544,30 @@ live end-to-end (move + confirm landed at the nested path), passing after the fi
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
 | 601 | `find_free_time` | Find free slots in your own calendar within working hours | `tests/smoke/tests/test_find_free_time.py` | OK (2026-09-08) | Stable |
-| 602 | `find_meeting_time` | Find common free slots across multiple attendees (`GetUserAvailability`) | `tests/smoke/tests/test_find_meeting_time.py` | KO (2026-09-08) — `GetUserAvailability` returns a structured error body (`ErrorCode: 500, ExceptionName: NotImplementedException`) on this tenant; the action isn't implemented on this OWA backend at all. Also breaks `get_meeting_stats`/`get_meeting_contacts` (below), which share this call. Fixed a real bug found while diagnosing this: the error path read `body.get('FaultMessage', 'Unknown error')`, which doesn't fall back when the key is present-but-`null` (as here) — now falls back to `ExceptionName` so the real error surfaces instead of `{"error": null}`. | Dev |
+| 602 | `find_meeting_time` | Find common free slots across multiple attendees — tries the modern-backend `GetSchedule` GraphQL operation first, falling back to EWS `GetUserAvailability` only on classic/on-prem OWA | `tests/smoke/tests/test_find_meeting_time.py` | OK (2026-09-09) — `GetUserAvailability` still returns `{ErrorCode: 500, ExceptionName: NotImplementedException}` on this tenant and is unfixable server-side, but the Scheduling Assistant UI's own `GetSchedule` operation works correctly here (confirmed via live network capture) and returns free/busy data in the same `MergedFreeBusy`-compatible encoding; see "Update 2026-09-09 — found a working replacement for the broken GetUserAvailability path" above. Also fixes `get_meeting_stats`/`get_meeting_contacts` (below), which share the underlying helper. A prior fix (2026-09-08) to the legacy fallback's error path (`FaultMessage`→`ExceptionName` when the former is present-but-`null`) still applies to that branch. | Stable |
 
 ### Analytics — [exchange_mcp/tools/analytics.py](exchange_mcp/tools/analytics.py) (2)
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 701 | `get_meeting_stats` | Meeting-count statistics for one or more people over a date range | `tests/smoke/tests/test_get_meeting_stats.py` | KO (2026-09-08) — fails at the `ResolveNames` step (same `NullReferenceException` as `find_person`) before it ever reaches `GetUserAvailability`. Benefits from the same-day error-classification fix noted on `find_person` (401, above): now surfaces the real `NullReferenceException` instead of a misleading "session may have expired". | Dev |
-| 702 | `get_meeting_contacts` | Weighted "who you meet with most" connection matrix from your own calendar | `tests/smoke/tests/test_get_meeting_contacts.py` | OK (2026-09-08), with caveats — doesn't call `ResolveNames`, so it doesn't hit that bug, but its sole data source (`GetUserAvailability`) is the same unimplemented action as `find_meeting_time`, so it always returns 0 meetings/0 contacts on this backend. Fixed a real bug found here: `_get_availability_events()` silently swallowed that failure (`except Exception: pass`) and never checked for an `ErrorCode` in a successfully-parsed error body either, so both this tool and `get_meeting_stats` were reporting a false-clean empty result instead of a diagnosable one. Now returns `(results, errors)` and both tools add a `"warnings"` field when `errors` is non-empty — verified live: a 30-day query now returns `"warnings": ["GetUserAvailability failed for [...]: NotImplementedException", ...]` instead of silently looking like "no meetings". [test_get_meeting_contacts.py](tests/smoke/tests/test_get_meeting_contacts.py)/[test_get_meeting_stats.py](tests/smoke/tests/test_get_meeting_stats.py) now include `warnings` in their recorded note when present, so a passing smoke-test run no longer hides this behind a bare `OK` — the underlying data is still empty on this backend (that part is unfixable here), but it's no longer silent about why. | Stable |
+| 701 | `get_meeting_stats` | Meeting-count statistics for one or more people over a date range | `tests/smoke/tests/test_get_meeting_stats.py` | OK (2026-09-09) — used to fail at the `ResolveNames` step (same `NullReferenceException` as `find_person` #401) before ever reaching availability data. `_resolve_to_email()` tries the Substrate Search path first (see #401, above) and falls back to `ResolveNames` only in classic canary-cookie auth mode. Its shared `_get_availability_events()` helper now tries `GetSchedule` first (see #602, above) and only falls back to the still-unimplemented `GetUserAvailability` on classic OWA, so this tool now returns real per-person stats without needing the `warnings` fallback in the common case — `warnings` remains for the classic-OWA/`GetUserAvailability`-failure path. | Stable |
+| 702 | `get_meeting_contacts` | Weighted "who you meet with most" connection matrix from your own calendar | `tests/smoke/tests/test_get_meeting_contacts.py` | OK (2026-09-09) — doesn't call `ResolveNames`, so it doesn't hit that bug. Its sole data source (own-mailbox availability via the shared `_get_availability_events()` helper) now tries `GetSchedule` first (see #602, above) and returns real meeting/contact data instead of the empty result `GetUserAvailability` always produced on this tenant. A real bug fixed while diagnosing this originally (2026-09-08): `_get_availability_events()` silently swallowed the `GetUserAvailability` failure (`except Exception: pass`) and never checked for an `ErrorCode` in a successfully-parsed error body either, so both this tool and `get_meeting_stats` were reporting a false-clean empty result instead of a diagnosable one — it now returns `(results, errors)`, and both tools add a `"warnings"` field when `errors` is non-empty (still relevant on classic OWA, where the legacy fallback is the only option). [test_get_meeting_contacts.py](tests/smoke/tests/test_get_meeting_contacts.py)/[test_get_meeting_stats.py](tests/smoke/tests/test_get_meeting_stats.py) include `warnings` in their recorded note when present. | Stable |
 
 ### Auth — [exchange_mcp/tools/auth.py](exchange_mcp/tools/auth.py) (1)
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
 | 801 | `login` | Credential setup + two-call, non-blocking 2FA login against the shared browser session | `tests/smoke/tests/test_login.py` (idempotent "already active" path only — see note below) | OK (2026-09-08) | Stable |
+
+### Copilot — [exchange_mcp/tools/copilot.py](exchange_mcp/tools/copilot.py) (5)
+
+| ID | Tool | Description | Automated test | Manual QA / Status | Stability |
+|---|---|---|---|---|---|
+| 901 | `ask_copilot` | Generic delegator: sends a free-text prompt to Copilot's chat pane, optionally grounded against an email/event via a best-effort deep link | None | Pending — see "Update 2026-09-09 — new Copilot tool module added" above; DOM selectors are unverified placeholders pending a live discovery spike | Stable |
+| 902 | `summarize_email_thread` | Ask Copilot to summarize an email thread and list action items | None | Pending — same caveats as #901 | Stable |
+| 903 | `draft_reply_with_copilot` | Ask Copilot to draft a reply to an email per free-text instructions/tone; returns text only, doesn't send | None | Pending — same caveats as #901; whether Copilot's compose-time drafting needs a live reply window instead of the plain chat pane is also unconfirmed | Stable |
+| 904 | `coach_draft` | Ask Copilot's compose coaching for feedback on a draft reply's tone/clarity | None | Pending — same caveats as #901; Copilot's "Coaching" affordance may live inside an in-progress compose window rather than the chat pane this tool drives, unconfirmed | Stable |
+| 905 | `meeting_prep` | Ask Copilot to prepare a briefing for an upcoming meeting (context, documents, action items) | None | Pending — same caveats as #901 | Stable |
 
 ## 4. Gaps worth closing
 
@@ -441,9 +578,17 @@ live end-to-end (move + confirm landed at the nested path), passing after the fi
   picking the right `__type` for a distinguished vs. opaque folder ID — both would be
   cheap to unit test without a live mailbox and remain a gap.
 - **No live/manual QA log.** There's no record (changelog, issue tracker, etc.) of which
-  of the 41 tools have actually been run against a real OWA mailbox since the
+  of the 46 tools have actually been run against a real OWA mailbox since the
   browser-session rewrite. This document's "Manual QA / Status" column is a template for
   that log — fill it in as you verify each tool.
+- **Copilot module (#901-905) needs a live discovery spike.** Every DOM selector,
+  the generation-complete polling heuristic, and the item-grounding deep-link URL
+  shape in `browser_session.py`'s Copilot section are best-guess placeholders — there
+  is no documented Copilot API/DOM reference to build against. Needs a
+  `--show-browser` session against a real Copilot chat pane to confirm/correct the
+  selectors before any of the 5 rows above can move past `Pending`. Deferred in the
+  session that added this module to avoid colliding with another concurrently
+  active session's use of the shared browser profile/dev port.
 - **`BrowserSession`'s crash recovery doesn't cover a stuck profile lock.** Its documented
   recovery path (see CLAUDE.md's "Recovery" section) relaunches on the same profile directory
   and retries once if the browser process/context crashes. Observed during folder-tool testing

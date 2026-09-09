@@ -19,6 +19,7 @@ via asyncio.run_coroutine_threadsafe(...).result().
 import asyncio
 import base64
 import json as _json
+import re
 import threading
 import time
 from pathlib import Path
@@ -31,9 +32,40 @@ _CRASH_HINTS = (
     "has been closed",
 )
 
+# Copilot has no documented API - text hints scraped from its own chat pane
+# are the only signal available for these conditions. Update if the live
+# wording turns out different (see the Copilot module's discovery-spike notes).
+_COPILOT_RATE_LIMIT_HINTS = (
+    "unable to respond",
+    "try again later",
+    "too many requests",
+    "high demand",
+)
+_COPILOT_SIGNIN_HINTS = (
+    "sign in",
+    "session has expired",
+    "you've been signed out",
+)
+
 
 class SessionExpiredError(Exception):
     """Raised when the OWA session has expired (HTTP 401/440 or HTML redirect)."""
+
+
+class BearerModeRequiredError(Exception):
+    """Raised by post_substrate() when the session is in canary (classic OWA) auth mode.
+
+    Callers should catch this and fall back to the equivalent EWS action
+    instead - see OWAClient.find_people() / people.py's find_person().
+    """
+
+
+class CopilotUnavailableError(Exception):
+    """Raised when Copilot itself reports a capacity/rate-limit condition.
+
+    Distinct from SessionExpiredError (auth problem) and a plain RuntimeError
+    (broken selector/unexpected DOM) - see copilot_ask().
+    """
 
 
 class BrowserResponse:
@@ -90,10 +122,17 @@ class BrowserSession:
         self._bearer_lock: asyncio.Lock | None = None
         self._request_counter = 0
 
+        self._copilot_lock: asyncio.Lock | None = None  # created lazily, on the browser loop
+
     @property
     def auth_mode(self) -> str:
         """"canary" (classic cookie CSRF token) or "bearer" (OAuth JWT, modern Outlook)."""
         return self._auth_mode
+
+    @property
+    def bearer_origin(self) -> str:
+        """Origin of the modern Outlook SPA once bearer auth has been captured, else owa_url."""
+        return self._bearer.get("origin") or self.owa_url
 
     # ------------------------------------------------------------------
     # Loop plumbing
@@ -575,6 +614,163 @@ class BrowserSession:
     def post_header_payload(self, action: str, payload: dict, timeout: float = 30) -> BrowserResponse:
         return self._run_with_recovery(
             lambda: self._async_post_header_payload(action, payload, timeout), timeout=timeout + 30
+        )
+
+    async def _async_post_substrate(
+        self, path_and_query: str, extra_headers: dict, payload: dict, timeout: float
+    ) -> BrowserResponse:
+        """POST to a modern-Outlook REST surface outside /owa/service.svc.
+
+        The People app (outlook.cloud.microsoft/people) doesn't use EWS
+        actions like ResolveNames at all - its search box hits
+        /search/api/v1/suggestions and its contact-card expansion hits
+        /PeopleGraphVx/v1.0/peopleLookup, both on the same origin and,
+        confirmed by decoding the token, the same OAuth audience
+        (aud=https://outlook.office.com) already captured for Mail actions
+        by _async_capture_bearer_context - so no separate auth flow is
+        needed, just different paths/headers. Only exists in bearer mode:
+        classic canary-cookie OWA (on-prem, or a cloud tenant not yet on
+        the modern backend) has no equivalent surface.
+        """
+        await self._async_ensure_context()
+        await self._async_ensure_auth()
+        if self._auth_mode != "bearer":
+            raise BearerModeRequiredError(
+                "This action requires the modern Outlook (bearer-auth) backend; "
+                "not available on this tenant's classic OWA."
+            )
+
+        self._request_counter += 1
+        origin = self._bearer.get("origin", self.owa_url)
+        sep = "&" if "?" in path_and_query else "?"
+        url = f"{origin}{path_and_query}{sep}n={self._request_counter}"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": self._bearer.get("authorization", ""),
+            "x-anchormailbox": self._bearer.get("x-anchormailbox", ""),
+            "x-tenantid": self._bearer.get("x-tenantid", ""),
+            "x-owa-sessionid": self._bearer.get("x-owa-sessionid", ""),
+            "X-Requested-With": "XMLHttpRequest",
+            **extra_headers,
+        }
+        body = _json.dumps(payload)
+        return await self._async_execute_on_anchor(url, headers, body, timeout)
+
+    def post_substrate(
+        self, path_and_query: str, extra_headers: dict, payload: dict, timeout: float = 30
+    ) -> BrowserResponse:
+        return self._run_with_recovery(
+            lambda: self._async_post_substrate(path_and_query, extra_headers, payload, timeout),
+            timeout=timeout + 30,
+        )
+
+    # ------------------------------------------------------------------
+    # Copilot (chat pane UI automation - no documented API exists)
+    # ------------------------------------------------------------------
+    #
+    # Everything below drives Copilot's actual chat pane DOM inside the
+    # already-rendered anchor page, instead of a JSON action - Copilot has
+    # no service.svc equivalent. The selectors are best-effort guesses based
+    # on Fluent UI ARIA conventions used elsewhere in the modern Outlook web
+    # client (role-based queries, since Fluent UI consistently annotates
+    # interactive elements with accessible names/roles) and have NOT been
+    # confirmed against a live Copilot pane. Run the discovery spike
+    # (--show-browser, inspect the real DOM) and correct these methods -
+    # they're deliberately the only place selector knowledge lives, so a
+    # correction only has to happen here.
+
+    async def _async_copilot_locate_pane(self, page):
+        pane = page.get_by_role("complementary", name=re.compile("copilot", re.I))
+        if await pane.count() == 0:
+            pane = page.locator('[class*="Copilot" i][role]').first
+        return pane
+
+    async def _async_copilot_open_pane(self, page, timeout: float):
+        pane = await self._async_copilot_locate_pane(page)
+        if await pane.count() and await pane.first.is_visible():
+            return pane.first
+
+        launcher = page.get_by_role("button", name=re.compile("copilot", re.I))
+        if await launcher.count() == 0:
+            raise RuntimeError(
+                "Could not find a Copilot launch button on the current page - "
+                "selectors need updating (see discovery spike notes)."
+            )
+        await launcher.first.click(timeout=timeout * 1000)
+
+        pane = await self._async_copilot_locate_pane(page)
+        await pane.first.wait_for(state="visible", timeout=timeout * 1000)
+        return pane.first
+
+    async def _async_copilot_submit(self, pane, prompt: str, timeout: float) -> None:
+        input_box = pane.get_by_role("textbox").first
+        await input_box.wait_for(state="visible", timeout=timeout * 1000)
+        await input_box.fill(prompt)
+        await input_box.press("Enter")
+
+    async def _async_copilot_wait_and_read(self, pane, timeout: float) -> dict:
+        """Poll the pane until generation settles, a rate-limit banner appears, or timeout.
+
+        "Settled" is approximated as: no visible "Stop generating"-style
+        control, and the pane's text hasn't changed since the last poll -
+        a real generation-complete DOM signal (data-* state attribute, etc.)
+        should replace this once the spike identifies one; text-stability
+        polling is a reasonable but slower fallback.
+        """
+        deadline = time.time() + timeout
+        last_text = ""
+        stop_button = pane.get_by_role("button", name=re.compile("stop", re.I))
+
+        while time.time() < deadline:
+            text = (await pane.inner_text()).strip()
+            lowered = text.lower()
+
+            if any(hint in lowered for hint in _COPILOT_RATE_LIMIT_HINTS):
+                raise CopilotUnavailableError("Copilot reported a capacity/rate-limit condition.")
+            if any(hint in lowered for hint in _COPILOT_SIGNIN_HINTS):
+                raise SessionExpiredError("Copilot pane shows a sign-in prompt; session likely expired.")
+
+            still_generating = await stop_button.count() > 0
+            if not still_generating and text and text == last_text:
+                return {"status": "ok", "text": text}
+
+            last_text = text
+            await asyncio.sleep(1)
+
+        return {"status": "timeout", "partial_text": last_text}
+
+    async def _async_copilot_ask(self, prompt: str, nav_url: str | None, timeout: float) -> dict:
+        await self._async_ensure_context()
+        await self._async_ensure_auth()
+        if self._auth_mode != "bearer":
+            raise BearerModeRequiredError(
+                "Copilot requires the modern Outlook (bearer-auth) backend; "
+                "not available on this tenant's classic OWA."
+            )
+
+        if self._copilot_lock is None:
+            self._copilot_lock = asyncio.Lock()
+
+        async with self._copilot_lock:
+            page = self._anchor_page
+            if nav_url:
+                try:
+                    await page.goto(nav_url, wait_until="networkidle", timeout=15000)
+                except Exception:
+                    pass  # grounding is best-effort - fall through and ask ungrounded
+
+            pane = await self._async_copilot_open_pane(page, timeout=10)
+            await self._async_copilot_submit(pane, prompt, timeout=10)
+            return await self._async_copilot_wait_and_read(pane, timeout=timeout)
+
+    def copilot_ask(self, prompt: str, *, nav_url: str | None = None, timeout: float = 90) -> dict:
+        """Ask Copilot a question via its chat pane. See _async_copilot_ask for caveats.
+
+        Returns {"status": "ok", "text": ...} or {"status": "timeout", "partial_text": ...}.
+        Raises BearerModeRequiredError, SessionExpiredError, or CopilotUnavailableError.
+        """
+        return self._run_with_recovery(
+            lambda: self._async_copilot_ask(prompt, nav_url, timeout), timeout=timeout + 30
         )
 
     # ------------------------------------------------------------------

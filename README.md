@@ -2,7 +2,7 @@
 
 # OWA Exchange MCP Server
 
-MCP (Model Context Protocol) server for any Microsoft Exchange / OWA (Outlook Web Access) deployment. Gives LLM agents access to email, calendar, directory search, folders, categories, availability, and meeting analytics via 41 tools.
+MCP (Model Context Protocol) server for any Microsoft Exchange / OWA (Outlook Web Access) deployment. Gives LLM agents access to email, calendar, directory search, folders, categories, availability, meeting analytics, and Copilot delegation via 46 tools.
 
 Works with any on-premise or hosted Exchange server that exposes OWA.
 
@@ -154,7 +154,7 @@ profile for the MCP server to pick up. Credentials are encrypted at rest
 with AES-256 (PBKDF2 key derivation, 480k iterations); the browser profile
 itself holds the live session (cookies) the way a real browser would.
 
-## Tools (41)
+## Tools (46)
 
 ### Email (14)
 | Tool | Description |
@@ -229,6 +229,20 @@ itself holds the live session (cookies) the way a real browser would.
 |---|---|
 | `login` | Authenticate to OWA (credential setup + 2FA login) |
 
+### Copilot (5)
+| Tool | Description |
+|---|---|
+| `ask_copilot` | Delegate a free-text question/instruction to Microsoft Copilot's chat pane |
+| `summarize_email_thread` | Ask Copilot to summarize an email thread with action items |
+| `draft_reply_with_copilot` | Ask Copilot to draft a reply to an email (returns text, doesn't send) |
+| `coach_draft` | Ask Copilot's compose coaching for feedback on a draft reply |
+| `meeting_prep` | Ask Copilot to prepare a briefing for an upcoming meeting |
+
+Copilot tools only work against the modern Outlook backend (bearer auth mode)
+and drive Copilot's chat pane via Playwright UI automation, since Copilot has
+no documented API — see `exchange_mcp/tools/copilot.py` and PROJECT_STATUS.md
+for the current (unverified, pending a live discovery spike) status.
+
 ## Files
 
 ```
@@ -247,6 +261,7 @@ exchange_mcp/
     availability.py       # Free time / meeting time
     analytics.py          # Meeting stats & contacts
     auth.py               # Login tool
+    copilot.py            # Copilot chat-pane delegation (UI automation)
 pyproject.toml            # Package config
 ```
 

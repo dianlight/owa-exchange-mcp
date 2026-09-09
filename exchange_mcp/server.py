@@ -197,16 +197,13 @@ import exchange_mcp.tools.availability  # noqa: E402, F401
 import exchange_mcp.tools.analytics     # noqa: E402, F401
 import exchange_mcp.tools.auth          # noqa: E402, F401
 import exchange_mcp.tools.categories     # noqa: E402, F401
+import exchange_mcp.tools.copilot        # noqa: E402, F401
 
 # Tools with a known, unfixable server-side bug (see PROJECT_STATUS.md KO rows)
 # rather than merely untested or degraded-but-working ones (e.g. get_meeting_contacts,
 # which returns an empty result plus a `warnings` field instead of failing). Excluded
 # from the MCP tool listing under --stable so a client can't call them and hit a fault.
-KNOWN_BUGGY_TOOLS: dict[str, str] = {
-    "find_person": "ResolveNames throws a server-side System.NullReferenceException on this tenant (PROJECT_STATUS.md #401).",
-    "find_meeting_time": "Server-side fault in the availability service (PROJECT_STATUS.md #602).",
-    "get_meeting_stats": "Depends on ResolveNames, same NullReferenceException as find_person (PROJECT_STATUS.md #701).",
-}
+KNOWN_BUGGY_TOOLS: dict[str, str] = {}
 
 
 def _apply_stable_mode() -> None:
