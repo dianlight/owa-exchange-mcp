@@ -41,18 +41,28 @@ from exchange_mcp.auth_errors import (  # noqa: F401  (re-exported for callers)
 _INSTALLED_PROFILE_DIR = Path.home() / "owa-mcp" / ".browser-profile"
 
 
+def is_source_checkout() -> bool:
+    """True when this package is being run from a source tree, not site-packages.
+
+    Detected by pyproject.toml sitting next to the package directory. Note that
+    an *editable* install (`pip install -e .`) is still a source checkout by this
+    test, because its `exchange_mcp` package resolves back into the repo - which
+    is why `pip install -e .` keeps using `<repo>/.browser-profile` rather than
+    the per-user path.
+    """
+    return (Path(__file__).resolve().parent.parent / "pyproject.toml").exists()
+
+
 def default_profile_dir() -> Path:
     """Resolve the default profile directory for this deployment.
 
-    A source checkout is detected by pyproject.toml sitting next to the package
-    directory - true for `python -m exchange_mcp.server` from the repo, false for
-    the installed `exchange-mcp-server` console script (whose package lives in
-    site-packages, where writing a browser profile would be wrong and often
-    unwritable).
+    A source checkout keeps its profile in the repo, so a developer's signed-in
+    session travels with their working tree. Anything else (a real installed
+    package) uses the per-user path: site-packages is the wrong place, and often
+    unwritable, for a browser profile.
     """
-    package_parent = Path(__file__).resolve().parent.parent
-    if (package_parent / "pyproject.toml").exists():
-        return package_parent / ".browser-profile"
+    if is_source_checkout():
+        return Path(__file__).resolve().parent.parent / ".browser-profile"
     return _INSTALLED_PROFILE_DIR
 
 

@@ -10,6 +10,7 @@ import asyncio
 import atexit
 import os
 import sys
+import threading
 import warnings
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -27,7 +28,8 @@ warnings.filterwarnings("ignore", category=IncompleteFieldDefinitionWarning)
 from mcp.server.fastmcp import FastMCP
 
 from exchange_mcp import auth_errors
-from exchange_mcp.browser_session import BrowserSession
+from exchange_mcp import __version__
+from exchange_mcp.browser_session import BrowserSession, is_source_checkout
 from exchange_mcp.owa_client import OWAClient
 
 
@@ -36,7 +38,7 @@ class AppContext:
     """Shared application state available to all tools via lifespan context.
 
     `pending_login` is backed by the module-level `_shared_pending_login`
-    (see _get_shared_client) rather than a per-instance field: AppContext
+    (see _ensure_started) rather than a per-instance field: AppContext
     itself is created fresh per client session (one per app_lifespan() call),
     but the login tool's two-call 2FA flow needs the *second* call — which
     may arrive on a different MCP client session than the first — to see the
@@ -89,15 +91,62 @@ def _load_env_file() -> None:
 # means typing an address, a password, and approving a push on a phone.
 LOGIN_WINDOW_SECONDS = int(os.environ.get("EXCHANGE_LOGIN_TIMEOUT", "300"))
 
+_shared_state_lock = threading.Lock()
+_shared_browser: BrowserSession | None = None
+_shared_client: OWAClient | None = None
+_shared_startup_thread: threading.Thread | None = None
+_shared_pending_login: asyncio.Task | None = None
 
-async def _startup(browser: BrowserSession, client: OWAClient) -> None:
+
+def _log(message: str) -> None:
+    """Everything goes to stderr - stdout is the stdio transport's JSON-RPC stream."""
+    print(f"[exchange-mcp] {message}", file=sys.stderr, flush=True)
+
+
+def _profile_dir_source() -> str:
+    """Explain *why* the profile directory is what it is, for the startup banner.
+
+    Worth logging explicitly: the source-checkout vs. installed-package split is
+    invisible otherwise, and an editable install (`pip install -e .`) counts as a
+    checkout - so someone expecting ~/owa-mcp/ after `pip install -e .` gets the
+    repo path instead and has no way to tell why.
+    """
+    if os.environ.get("EXCHANGE_BROWSER_PROFILE_DIR"):
+        return "EXCHANGE_BROWSER_PROFILE_DIR"
+    if is_source_checkout():
+        return "default for a source checkout (incl. `pip install -e .`)"
+    return "default for an installed package"
+
+
+def _log_startup_banner(browser: BrowserSession) -> None:
+    """Report version and resolved configuration before anything can go wrong.
+
+    Printed once per process, from _ensure_started(), so it lands ahead of the
+    browser launch and the auth check on every entry path and both transports.
+    """
+    _log(f"exchange-mcp-server {__version__}")
+    _log(f"OWA URL:     {browser.owa_url}")
+    _log(f"Profile dir: {browser.profile_dir}")
+    _log(f"  source:    {_profile_dir_source()}")
+    _log(f"  state:     {'exists, reusing it' if browser.profile_existed else 'does not exist, will be created'}")
+    _log(f"Browser:     {'headless' if browser.headless else 'visible window'}")
+
+
+def _startup(browser: BrowserSession) -> None:
     """Launch the browser on the persistent profile and make sure it's signed in.
 
-    Runs as a background task instead of inline in app_lifespan(): a cold
-    Chromium launch plus a human-paced interactive sign-in takes well past any
-    MCP client's connect timeout, so the handshake must complete before any of
-    this finishes. Tool calls that hit the browser wait for it lazily
-    (BrowserSession ensures its own context is up on first real use).
+    Runs on a plain background thread (see _ensure_started) rather than inline or
+    as an asyncio task, for two reasons:
+
+    - A cold Chromium launch plus a human-paced interactive sign-in takes well
+      past any MCP client's connect timeout, so it must not block the handshake -
+      nor, under --transport http, the port opening (the smoke-test runner gives
+      the server 90s to start listening, far less than a sign-in can take).
+    - A thread works identically on both transports. An asyncio task would have
+      to be created on whichever loop the transport happens to run, and under
+      --transport http there *is* no such loop until a client connects. Every
+      BrowserSession method is already synchronous (it owns its own loop on its
+      own thread), so there is nothing to await here anyway.
 
     The flow is profile-first, with no credentials anywhere:
     1. Reuse the profile directory if it exists, create it if it doesn't.
@@ -111,59 +160,53 @@ async def _startup(browser: BrowserSession, client: OWAClient) -> None:
        for that reason would be worse than waiting to be asked.
     """
     try:
-        print(f"[exchange-mcp] Browser profile: {browser.profile_dir} "
-              f"({'reusing existing' if browser.profile_existed else 'creating new'})",
-              file=sys.stderr, flush=True)
-        print("[exchange-mcp] Launching browser...", file=sys.stderr, flush=True)
-        await asyncio.to_thread(browser.start)
+        _log("Launching browser...")
+        browser.start()
 
-        if await asyncio.to_thread(browser.has_active_session):
-            print("[exchange-mcp] Profile is already authenticated; ready to serve.",
-                  file=sys.stderr, flush=True)
+        if browser.has_active_session():
+            _log("Auth status: AUTHENTICATED (the profile's OWA session is still valid). Ready.")
             return
 
-        print("[exchange-mcp] Profile is not authenticated - opening a browser window for "
-              f"sign-in (waiting up to {LOGIN_WINDOW_SECONDS}s). Please sign in to OWA in that "
-              "window, 2FA included.", file=sys.stderr, flush=True)
-        result = await asyncio.to_thread(browser.interactive_login, LOGIN_WINDOW_SECONDS)
+        _log("Auth status: NOT AUTHENTICATED - opening a browser window on the OWA sign-in "
+             f"page (waiting up to {LOGIN_WINDOW_SECONDS}s). Please sign in there, 2FA included.")
+        result = browser.interactive_login(LOGIN_WINDOW_SECONDS)
 
         if result.get("success"):
-            print(f"[exchange-mcp] {result.get('message', 'Signed in successfully.')}",
-                  file=sys.stderr, flush=True)
+            _log(f"Auth status: AUTHENTICATED. {result.get('message', 'Signed in successfully.')}")
             return
 
         reason = result.get("reason") or auth_errors.LOGIN_TIMEOUT
-        print(f"[exchange-mcp] Sign-in not completed ({reason}): {result.get('error')}",
-              file=sys.stderr, flush=True)
-        print(f"[exchange-mcp] {auth_errors.remediation(reason)}", file=sys.stderr, flush=True)
-        print("[exchange-mcp] The server keeps running; tools will report that authorization "
-              "is required until then.", file=sys.stderr, flush=True)
+        _log(f"Auth status: NOT AUTHENTICATED ({reason}): {result.get('error')}")
+        _log(auth_errors.remediation(reason))
+        _log("The server keeps serving; tools will report that authorization is required "
+             "until someone signs in.")
     except Exception as exc:
-        print(f"[exchange-mcp] Background startup failed: {exc}. "
-              "The `login` tool remains available.", file=sys.stderr, flush=True)
+        _log(f"Auth status: UNKNOWN - startup failed: {exc}. The `login` tool remains available.")
 
 
-_shared_state_lock = asyncio.Lock()
-_shared_browser: BrowserSession | None = None
-_shared_client: OWAClient | None = None
-_shared_startup_task: asyncio.Task | None = None
-_shared_pending_login: asyncio.Task | None = None
+def _ensure_started() -> OWAClient:
+    """Create the shared BrowserSession/OWAClient and kick off startup, once.
 
+    Called from main() at process start *and* from app_lifespan, because those are
+    two genuinely different entry points:
 
-async def _get_shared_client() -> OWAClient:
-    """Create the BrowserSession/OWAClient once, on first use, and reuse it for
-    the life of the process.
+    - Under --transport http, the mcp SDK's StreamableHTTPSessionManager runs a
+      fresh low-level Server.run() - and therefore a fresh app_lifespan() call -
+      per client session. Nothing runs at all before the first client connects, so
+      relying on the lifespan alone meant no browser, no profile directory and no
+      sign-in window until something connected. main() calling this fixes that.
+    - Under stdio, main() covers it too, but app_lifespan still calls it so that
+      anything importing `mcp` and serving it directly (a test harness, an ASGI
+      embed) gets the same setup instead of an uninitialized client.
 
-    Under --transport http, the mcp SDK's StreamableHTTPSessionManager runs a
-    fresh low-level Server.run() - and therefore a fresh app_lifespan() call -
-    per client session, not once for the whole process. Without this module-level
-    singleton, app_lifespan would launch a new browser and log in again on every
-    single client connection, then tear it down when that connection closed,
-    instead of staying warm and shared as intended.
+    Guarded by a threading.Lock, not an asyncio.Lock: this now runs from main()'s
+    bare thread, from a transport's event loop, or from either, and an
+    asyncio.Lock binds itself to the first loop that touches it and then refuses
+    every other one.
     """
-    global _shared_browser, _shared_client, _shared_startup_task
+    global _shared_browser, _shared_client, _shared_startup_thread
 
-    async with _shared_state_lock:
+    with _shared_state_lock:
         if _shared_client is not None:
             return _shared_client
 
@@ -173,11 +216,15 @@ async def _get_shared_client() -> OWAClient:
 
         profile_dir = os.environ.get("EXCHANGE_BROWSER_PROFILE_DIR") or None
         browser = BrowserSession(owa_url, headless=_resolve_headless(), profile_dir=profile_dir)
-        client = OWAClient(browser)
-        _shared_startup_task = asyncio.create_task(_startup(browser, client))
         _shared_browser = browser
-        _shared_client = client
-        return client
+        _shared_client = OWAClient(browser)
+
+        _log_startup_banner(browser)
+        _shared_startup_thread = threading.Thread(
+            target=_startup, args=(browser,), daemon=True, name="owa-startup"
+        )
+        _shared_startup_thread.start()
+        return _shared_client
 
 
 @atexit.register
@@ -188,13 +235,14 @@ def _stop_shared_browser() -> None:
 
 @asynccontextmanager
 async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
-    """Yield the process-wide shared OWAClient (see _get_shared_client).
+    """Yield the process-wide shared OWAClient (see _ensure_started).
 
-    Deliberately does not stop the browser when an individual client session
-    ends - only process exit (_stop_shared_browser, above) does that.
+    Normally a no-op beyond the lookup, because main() has already started
+    everything before the transport came up. Deliberately does not stop the
+    browser when an individual client session ends - only process exit
+    (_stop_shared_browser, above) does that.
     """
-    client = await _get_shared_client()
-    yield AppContext(client=client)
+    yield AppContext(client=_ensure_started())
 
 
 # Create the MCP server instance
@@ -226,11 +274,9 @@ def _apply_stable_mode() -> None:
     for name, reason in KNOWN_BUGGY_TOOLS.items():
         try:
             mcp.remove_tool(name)
-            print(f"[exchange-mcp] --stable: excluded buggy tool '{name}' ({reason})",
-                  file=sys.stderr, flush=True)
+            _log(f"--stable: excluded buggy tool '{name}' ({reason})")
         except Exception as exc:
-            print(f"[exchange-mcp] --stable: could not exclude '{name}': {exc}",
-                  file=sys.stderr, flush=True)
+            _log(f"--stable: could not exclude '{name}': {exc}")
 
 
 def main():
@@ -274,13 +320,28 @@ def main():
     if args.stable:
         _apply_stable_mode()
 
+    # Launch the browser and check/establish the OWA session now, at process
+    # start, rather than leaving it to app_lifespan. Under --transport http the
+    # lifespan doesn't run until a client connects, so waiting for it meant a
+    # freshly started server did nothing at all - no profile directory, no
+    # browser, no sign-in window - until something happened to connect.
+    # _ensure_started() does its work on a background thread, so neither the
+    # stdio handshake nor the http port opening is delayed by it.
+    try:
+        _ensure_started()
+    except ValueError as exc:
+        # Missing EXCHANGE_OWA_URL: fail loudly here instead of once per tool
+        # call. Nothing is listening yet, so exiting is clean.
+        _log(f"Configuration error: {exc}")
+        raise SystemExit(2) from exc
+
     if args.transport == "http":
         mcp.settings.host = args.host
         mcp.settings.port = args.port
-        print(f"[exchange-mcp] Serving streamable-http on http://{args.host}:{args.port}/mcp",
-              file=sys.stderr, flush=True)
+        _log(f"Transport:   streamable-http on http://{args.host}:{args.port}/mcp")
         mcp.run(transport="streamable-http")
     else:
+        _log("Transport:   stdio")
         mcp.run()
 
 

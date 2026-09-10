@@ -500,6 +500,51 @@ covers the reason tables, the false-positive guards, and both branches of
 `default_profile_dir()`. Not verified: an actual completed interactive sign-in (needs a
 human at a real OWA window) — `login` #801 is `Pending` on that.
 
+**Update 2026-09-10 (continued) — startup never ran under `--transport http`; startup
+logging added.** Reported immediately after the change above: starting the server produced
+no profile directory and no sign-in window at all. Root cause was a pre-existing structural
+bug that the new auth flow made visible. `_startup` was only reachable through
+`app_lifespan`, and under `--transport http` the mcp SDK runs the MCP lifespan *per client
+session* — the very reason `_get_shared_client` was a module-level singleton in the first
+place. So with no client connected, nothing ran: no browser, no profile, no window. (Under
+stdio the client spawns the process and connects immediately, which is why it worked there
+and the gap went unnoticed.) Reproduced by starting an http server on an isolated port and
+profile with nothing connecting: only uvicorn's own log lines appeared, and the profile
+directory was never created.
+
+Fixed by making startup transport-independent:
+- `main()` now calls `_ensure_started()` before `mcp.run()`, and `app_lifespan` still calls
+  it (idempotent) so an embedder serving `mcp` directly behaves the same.
+- `_startup` moved from an asyncio task to a `threading.Thread`. Under http there is no
+  event loop yet at that point, and every `BrowserSession` method is already synchronous —
+  and a thread keeps the port opening (or the stdio handshake) from waiting on a
+  human-paced sign-in. That last part matters concretely: `server_manager.py` gives the
+  server 90s to start listening, well short of the 300s login window.
+- `_shared_state_lock` became a `threading.Lock`. It is now touched from `main()`'s bare
+  thread *and* from a transport's event loop, and an `asyncio.Lock` binds itself to the
+  first loop that uses it and rejects every other one.
+
+Also added, as requested: a startup banner (version, OWA URL, resolved profile dir, *why*
+it resolved that way, whether it already existed, headless vs. visible) followed by an
+explicit `Auth status: AUTHENTICATED / NOT AUTHENTICATED / UNKNOWN` line with reason and
+remediation. All of it via `_log()` to stderr. The "why" line exists because of the other
+half of the same report — no `~/owa-mcp/` appeared. That was correct behavior, not a bug:
+`pip install -e .` resolves `exchange_mcp` back into the repo, so `is_source_checkout()` is
+true and the profile stays at `<repo>/.browser-profile` (which already existed and was
+signed in). Invisible before; stated outright now.
+
+`exchange_mcp.__version__` is now the single source of truth, with `pyproject.toml` reading
+it via `[tool.setuptools.dynamic]`. An editable install doesn't refresh its metadata when
+the tree changes — `importlib.metadata.version()` was reporting `2.0.0b0` against a
+`2.0.0b1` tree — and a banner that misreports its own version is worse than no banner.
+
+Verified: http server with no client now prints the banner, launches the browser, creates
+the profile directory and opens the sign-in window, while uvicorn still starts listening
+immediately; stdio prints the same banner; `pip wheel .` builds `2.0.0b1` from the dynamic
+version; and the installed-package branch was confirmed by installing that wheel into a
+throwaway venv and resolving `default_profile_dir()` from outside the repo →
+`~/owa-mcp/.browser-profile`.
+
 ## 2. How to read the table
 
 - **ID** — a permanent 3-digit identifier: digit 1 is the module number (fixed per

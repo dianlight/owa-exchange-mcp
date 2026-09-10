@@ -16,6 +16,7 @@ session-cookies.txt
 __pycache__/
 *.pyc
 *.egg-info/
+build/
 dist/
 .playwright-mcp/
 

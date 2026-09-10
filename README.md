@@ -120,6 +120,34 @@ debugging a stuck call.
 The server holds **no credentials** — no stored password, no master password, no
 setup step, no login script. The persistent browser profile *is* the session.
 
+### What you see at startup
+
+Every line goes to stderr:
+
+```
+[exchange-mcp] exchange-mcp-server 2.0.0b2
+[exchange-mcp] OWA URL:     https://owa.example.com
+[exchange-mcp] Profile dir: /home/you/owa-mcp/.browser-profile
+[exchange-mcp]   source:    default for an installed package
+[exchange-mcp]   state:     does not exist, will be created
+[exchange-mcp] Browser:     headless
+[exchange-mcp] Launching browser...
+[exchange-mcp] Transport:   streamable-http on http://127.0.0.1:8765/mcp
+[exchange-mcp] Auth status: NOT AUTHENTICATED - opening a browser window on the OWA
+               sign-in page (waiting up to 300s). Please sign in there, 2FA included.
+[exchange-mcp] Auth status: AUTHENTICATED. Signed in successfully. ...
+```
+
+`source:` tells you *why* the profile path is what it is — `EXCHANGE_BROWSER_PROFILE_DIR`,
+`default for a source checkout (incl. pip install -e .)`, or `default for an installed
+package`. Note that an **editable install counts as a source checkout**, so
+`pip install -e .` keeps its profile in the repo at `<repo>/.browser-profile` rather than
+under your home directory. Set `EXCHANGE_BROWSER_PROFILE_DIR` if you want it elsewhere.
+
+`state:` says whether that directory already existed (reused) or is about to be created,
+and `Auth status:` is `AUTHENTICATED`, `NOT AUTHENTICATED` (with the reason and what to do
+about it), or `UNKNOWN` if the browser itself failed to start.
+
 ### How it works
 
 1. On start, the server looks for its browser profile directory
@@ -130,7 +158,9 @@ setup step, no login script. The persistent browser profile *is* the session.
    serves. Nothing is shown, nothing is asked.
 3. If it isn't, the server **opens a visible browser window** on your OWA sign-in
    page and waits (default 300s, `EXCHANGE_LOGIN_TIMEOUT`). You sign in there:
-   address, password, 2FA. Nothing is typed for you.
+   address, password, 2FA. Nothing is typed for you. This happens as soon as the
+   process starts, on both transports — it does not wait for a client to connect,
+   and it doesn't hold up the stdio handshake or the http port opening either.
 4. That window stays visible for the rest of the server's lifetime after a
    successful sign-in; restart the server to go back to headless.
 
