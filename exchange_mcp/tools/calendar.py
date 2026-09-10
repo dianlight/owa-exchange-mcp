@@ -4,8 +4,10 @@ Provides MCP tools for calendar event retrieval, meeting creation,
 update, cancellation, and meeting response management via OWA API.
 """
 
+import calendar as _cal
 import html as html_mod
 import json
+import re
 import uuid
 from datetime import datetime, timedelta
 
@@ -56,6 +58,17 @@ def _get_event_details(client: OWAClient, item_id: str) -> dict:
         "attendees_required": [],
         "attendees_optional": [],
         "categories": [],
+        "subject": "",
+        "start": "",
+        "end": "",
+        "is_all_day": False,
+        "is_cancelled": False,
+        "is_recurring": False,
+        "calendar_item_type": "",
+        "sensitivity": "Normal",
+        "my_response": "",
+        "change_key": "",
+        "recurrence": {},
     }
 
     for msg in client.extract_items(data):
@@ -63,6 +76,17 @@ def _get_event_details(client: OWAClient, item_id: str) -> dict:
             continue
         for item in msg["Items"]:
             result["categories"] = item.get("Categories", [])
+            result["subject"] = item.get("Subject", "") or "(No subject)"
+            result["start"] = item.get("Start", "")
+            result["end"] = item.get("End", "")
+            result["is_all_day"] = item.get("IsAllDayEvent", False)
+            result["is_cancelled"] = item.get("IsCancelled", False)
+            result["calendar_item_type"] = item.get("CalendarItemType", "")
+            result["is_recurring"] = result["calendar_item_type"] == "RecurringMaster"
+            result["sensitivity"] = item.get("Sensitivity", "Normal")
+            result["my_response"] = item.get("MyResponseType", "")
+            result["change_key"] = item.get("ItemId", {}).get("ChangeKey", "")
+            result["recurrence"] = item.get("Recurrence", {}) or {}
             # Location
             result["location"] = item.get("Location", "")
             if not result["location"]:
@@ -314,11 +338,343 @@ def _filter_items_by_date_range(
     return kept
 
 
+_MAX_RECURRENCE_ITERATIONS = 2000
+
+_WEEKDAY_NAMES = {
+    "Sunday": 6, "Monday": 0, "Tuesday": 1, "Wednesday": 2,
+    "Thursday": 3, "Friday": 4, "Saturday": 5,
+}
+
+
+_PATTERN_KEYS = (
+    "DailyRecurrence", "WeeklyRecurrence",
+    "AbsoluteMonthlyRecurrence", "RelativeMonthlyRecurrence",
+    "AbsoluteYearlyRecurrence", "RelativeYearlyRecurrence",
+)
+_RANGE_KEYS = ("NoEndRecurrence", "EndDateRecurrence", "NumberedRecurrence")
+
+# Recurrence dates on this backend come as date + UTC offset and no time
+# component ("2024-01-09+01:00"), which parse_iso_datetime() rejects outright
+# (it only strips a tz suffix when a "T" is present). Match the leading date,
+# take an optional time, and ignore the offset -- consistent with the naive
+# datetimes used everywhere else in this module.
+_RECURRENCE_DATE_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2}):(\d{2}))?"
+)
+
+
+def _parse_recurrence_date(value: str) -> datetime:
+    """Parse a Recurrence StartDate/EndDate to a naive datetime."""
+    m = _RECURRENCE_DATE_RE.match((value or "").strip())
+    if not m:
+        raise ValueError(f"unrecognized recurrence date: {value!r}")
+    return datetime(
+        int(m.group(1)), int(m.group(2)), int(m.group(3)),
+        int(m.group(4) or 0), int(m.group(5) or 0), int(m.group(6) or 0),
+    )
+
+
+def _recurrence_block(recurrence: dict, wrapper: str, variants: tuple) -> tuple:
+    """Return (variant_name, block) for a Recurrence pattern or range.
+
+    Handles both shapes seen in the wild:
+      * this OWA backend's -- a fixed wrapper key whose variant is carried in
+        `__type` ({"RecurrencePattern": {"__type": "WeeklyRecurrence:#Exchange"}})
+      * plain EWS-style JSON -- the variant name used as the key itself
+        ({"WeeklyRecurrence": {...}})
+    """
+    block = recurrence.get(wrapper)
+    if isinstance(block, dict) and block:
+        variant = str(block.get("__type", "")).split(":")[0]
+        if variant in variants:
+            return variant, block
+    for key in variants:
+        candidate = recurrence.get(key)
+        if isinstance(candidate, dict) and candidate:
+            return key, candidate
+    return None, None
+
+
+_DAY_OF_WEEK_INDEX = {"First": 0, "Second": 1, "Third": 2, "Fourth": 3, "Last": -1}
+
+
+def _nth_weekday_of_month(year: int, month: int, weekday: int, ordinal: int) -> int | None:
+    """Day-of-month for the `ordinal`-th `weekday` of a month.
+
+    `ordinal` is 0-based (0 = first), or -1 for "last". Returns None when the
+    month has no such occurrence (a 5th Friday, say) -- EWS treats that month
+    as simply having no occurrence rather than clamping to the 4th.
+    """
+    days_in_month = _cal.monthrange(year, month)[1]
+    offset = (weekday - datetime(year, month, 1).weekday()) % 7
+    if ordinal >= 0:
+        day = 1 + offset + ordinal * 7
+        return day if day <= days_in_month else None
+    day = 1 + offset
+    while day + 7 <= days_in_month:
+        day += 7
+    return day
+
+
+def _relative_pattern_weekday(pattern: dict) -> tuple[int | None, int | None]:
+    """(weekday, ordinal) for a Relative{Monthly,Yearly}Recurrence, or (None, None).
+
+    EWS also allows the pseudo-days "Day", "Weekday" and "WeekendDay" in
+    DaysOfWeek. None appear in this mailbox, and each means something different
+    from a plain weekday, so they degrade to "no occurrences" rather than being
+    guessed at.
+    """
+    weekday = _WEEKDAY_NAMES.get((pattern.get("DaysOfWeek") or "").strip())
+    ordinal = _DAY_OF_WEEK_INDEX.get((pattern.get("DayOfWeekIndex") or "").strip())
+    if weekday is None or ordinal is None:
+        return None, None
+    return weekday, ordinal
+
+
+def _add_months(dt: datetime, months: int) -> datetime:
+    """Shift dt by `months`, clamping the day to the target month's length."""
+    month_index = dt.month - 1 + months
+    year = dt.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(dt.day, _cal.monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
+
+
+def _expand_recurrence_occurrences(
+    recurrence: dict,
+    start_dt: datetime,
+    end_dt_exclusive: datetime,
+) -> list[datetime]:
+    """Compute occurrence start datetimes for an EWS Recurrence dict,
+    clipped to [start_dt, end_dt_exclusive).
+
+    Verified against this OWA backend 2026-09-10, which does NOT use the
+    plain-EWS JSON shape: the variant lives in a `__type` field under fixed
+    `RecurrencePattern`/`RecurrenceRange` wrapper keys, and dates arrive as
+    date + offset with no time ("2024-01-09+01:00") --
+
+        {"RecurrencePattern": {"__type": "WeeklyRecurrence:#Exchange",
+                               "Interval": 1, "DaysOfWeek": "Tuesday Thursday",
+                               "FirstDayOfWeek": "Monday"},
+         "RecurrenceRange":   {"__type": "EndDateRecurrence:#Exchange",
+                               "StartDate": "2024-01-09+01:00",
+                               "EndDate": "2024-01-13+01:00"}}
+
+    _recurrence_block() accepts that shape and the plain-EWS one; because the
+    range carries no time-of-day, callers must overlay the series master's
+    own Start time (get_calendar_events does).
+
+    Still defensive: every sub-field access uses .get() with a safe default,
+    and an unrecognized pattern/range variant returns [] rather than raising,
+    so an unexpected payload degrades to "no synthesized occurrences for this
+    series" instead of crashing the whole get_calendar_events call.
+    """
+    if not recurrence:
+        return []
+
+    pattern_key, pattern = _recurrence_block(
+        recurrence, "RecurrencePattern", _PATTERN_KEYS
+    )
+    if not pattern_key:
+        return []
+
+    range_key, rrange = _recurrence_block(
+        recurrence, "RecurrenceRange", _RANGE_KEYS
+    )
+    if not range_key:
+        return []
+
+    try:
+        series_start = _parse_recurrence_date(rrange.get("StartDate", ""))
+    except (ValueError, TypeError):
+        return []
+
+    series_end = None
+    max_occurrences = None
+    if range_key == "EndDateRecurrence":
+        try:
+            series_end = _parse_recurrence_date(rrange.get("EndDate", ""))
+        except (ValueError, TypeError):
+            return []
+    elif range_key == "NumberedRecurrence":
+        try:
+            max_occurrences = int(rrange.get("NumberOfOccurrences", 0))
+        except (ValueError, TypeError):
+            return []
+        if max_occurrences <= 0:
+            return []
+
+    try:
+        interval = int(pattern.get("Interval", 1)) or 1
+    except (ValueError, TypeError):
+        interval = 1
+
+    occurrences: list[datetime] = []
+    current = series_start
+    count = 0
+
+    if pattern_key == "DailyRecurrence":
+        step = timedelta(days=interval)
+        while count < _MAX_RECURRENCE_ITERATIONS:
+            if series_end and current > series_end:
+                break
+            if max_occurrences is not None and count >= max_occurrences:
+                break
+            if current >= end_dt_exclusive:
+                break
+            if current >= start_dt:
+                occurrences.append(current)
+            current += step
+            count += 1
+
+    elif pattern_key == "WeeklyRecurrence":
+        days_str = pattern.get("DaysOfWeek", "") or ""
+        day_names = [d for d in days_str.split() if d in _WEEKDAY_NAMES]
+        if not day_names:
+            return []
+        target_weekdays = {_WEEKDAY_NAMES[d] for d in day_names}
+        week_start = current - timedelta(days=current.weekday())
+        while count < _MAX_RECURRENCE_ITERATIONS:
+            week_done = False
+            for offset in range(7):
+                candidate = week_start + timedelta(days=offset)
+                if candidate.weekday() not in target_weekdays:
+                    continue
+                if candidate < series_start:
+                    continue
+                if series_end and candidate > series_end:
+                    week_done = True
+                    break
+                if max_occurrences is not None and count >= max_occurrences:
+                    week_done = True
+                    break
+                if candidate >= end_dt_exclusive:
+                    week_done = True
+                    break
+                if candidate >= start_dt:
+                    occurrences.append(candidate)
+                count += 1
+            if week_done:
+                break
+            week_start += timedelta(weeks=interval)
+
+    elif pattern_key == "AbsoluteMonthlyRecurrence":
+        try:
+            day_of_month = int(pattern.get("DayOfMonth", current.day))
+        except (ValueError, TypeError):
+            day_of_month = current.day
+        month_cursor = current.replace(day=1)
+        while count < _MAX_RECURRENCE_ITERATIONS:
+            days_in_month = _cal.monthrange(month_cursor.year, month_cursor.month)[1]
+            candidate = month_cursor.replace(day=min(day_of_month, days_in_month))
+            if candidate >= series_start:
+                if series_end and candidate > series_end:
+                    break
+                if max_occurrences is not None and count >= max_occurrences:
+                    break
+                if candidate >= end_dt_exclusive:
+                    break
+                if candidate >= start_dt:
+                    occurrences.append(candidate)
+                count += 1
+            month_cursor = _add_months(month_cursor, interval)
+
+    elif pattern_key == "AbsoluteYearlyRecurrence":
+        try:
+            day_of_month = int(pattern.get("DayOfMonth", current.day))
+            month = int(pattern.get("Month", current.month))
+        except (ValueError, TypeError):
+            return []
+        year_cursor = current.year
+        while count < _MAX_RECURRENCE_ITERATIONS:
+            days_in_month = _cal.monthrange(year_cursor, month)[1]
+            try:
+                candidate = current.replace(
+                    year=year_cursor, month=month, day=min(day_of_month, days_in_month)
+                )
+            except ValueError:
+                break
+            if candidate >= series_start:
+                if series_end and candidate > series_end:
+                    break
+                if max_occurrences is not None and count >= max_occurrences:
+                    break
+                if candidate >= end_dt_exclusive:
+                    break
+                if candidate >= start_dt:
+                    occurrences.append(candidate)
+                count += 1
+            year_cursor += interval
+
+    elif pattern_key == "RelativeMonthlyRecurrence":
+        # "every N months, on the <First|...|Last> <weekday>".
+        weekday, ordinal = _relative_pattern_weekday(pattern)
+        if weekday is None:
+            return []
+        month_cursor = current.replace(day=1)
+        # Bounded by iterations rather than by `count`: a month with no matching
+        # occurrence advances the cursor without producing one, so counting
+        # occurrences alone would not bound the loop.
+        for _ in range(_MAX_RECURRENCE_ITERATIONS):
+            day = _nth_weekday_of_month(
+                month_cursor.year, month_cursor.month, weekday, ordinal
+            )
+            if day is not None:
+                candidate = month_cursor.replace(day=day)
+                if candidate >= series_start:
+                    if series_end and candidate > series_end:
+                        break
+                    if max_occurrences is not None and count >= max_occurrences:
+                        break
+                    if candidate >= end_dt_exclusive:
+                        break
+                    if candidate >= start_dt:
+                        occurrences.append(candidate)
+                    count += 1
+            month_cursor = _add_months(month_cursor, interval)
+
+    elif pattern_key == "RelativeYearlyRecurrence":
+        # "every N years, in <Month>, on the <First|...|Last> <weekday>".
+        weekday, ordinal = _relative_pattern_weekday(pattern)
+        if weekday is None:
+            return []
+        try:
+            month = int(pattern.get("Month", current.month))
+        except (ValueError, TypeError):
+            return []
+        if not 1 <= month <= 12:
+            return []
+        year_cursor = current.year
+        for _ in range(_MAX_RECURRENCE_ITERATIONS):
+            day = _nth_weekday_of_month(year_cursor, month, weekday, ordinal)
+            if day is not None:
+                candidate = current.replace(year=year_cursor, month=month, day=day)
+                if candidate >= series_start:
+                    if series_end and candidate > series_end:
+                        break
+                    if max_occurrences is not None and count >= max_occurrences:
+                        break
+                    if candidate >= end_dt_exclusive:
+                        break
+                    if candidate >= start_dt:
+                        occurrences.append(candidate)
+                    count += 1
+            year_cursor += interval
+
+    else:
+        # Unrecognized pattern variant -- degrade to no synthesized occurrences
+        # rather than guessing at its semantics.
+        return []
+
+    return occurrences
+
+
 @mcp.tool()
 def get_calendar_events(
     start_date: str,
     end_date: str,
     include_body: bool = True,
+    expand_recurrences: bool = False,
     ctx: Context = None,
 ) -> str:
     """Get calendar events within a date range.
@@ -328,14 +684,29 @@ def get_calendar_events(
         end_date: End date in YYYY-MM-DD format.
         include_body: If True, fetch full event details (organizer, attendees, body)
                       via GetItem for each event. Slower but more complete.
+        expand_recurrences: If True, additionally synthesize one entry per
+                      occurrence of each recurring series in the window (see
+                      the caveats below).
 
     Returns:
-        JSON array of event objects with subject, start, end, location, attendees, etc.
-        A recurring series appears once, as its master item (calendar_item_type
-        "RecurringMaster"), not expanded into one entry per occurrence -- this
-        OWA deployment's CalendarView does not perform occurrence expansion, and
-        GetUserAvailability (which would normally provide that expansion) returns
-        a permanent NotImplementedException on this backend.
+        JSON array of event objects with subject, start, end, location,
+        categories, attendees, etc.
+        By default a recurring series appears once, as its master item
+        (calendar_item_type "RecurringMaster"), not expanded into one entry per
+        occurrence -- this OWA deployment's CalendarView does not perform
+        occurrence expansion, and GetUserAvailability (which would normally
+        provide that expansion) returns a permanent NotImplementedException on
+        this backend.
+
+        With expand_recurrences=True, each series master's own entry is still
+        returned, plus one synthesized entry per computed occurrence, marked
+        `is_synthesized_occurrence: true`. Those synthesized entries are
+        computed client-side from the master's Recurrence pattern and have an
+        EMPTY item_id on purpose: they have no real distinct ItemId in Exchange,
+        and reusing the master's id would let a caller pass one to
+        assign_event_categories/cancel_meeting/etc. and silently mutate the
+        WHOLE series. To act on a series, use the master entry's item_id.
+        Relative patterns ("2nd Tuesday of the month") are not expanded.
     """
     client = _get_client(ctx)
 
@@ -386,8 +757,25 @@ def get_calendar_events(
         end_dt_exclusive = end_dt + timedelta(days=1)
         matching_items = _filter_items_by_date_range(all_items, start_dt, end_dt_exclusive)
 
+        # A RecurringMaster's own Start/End describe its FIRST occurrence, so an
+        # ongoing series that began before the requested window is dropped by the
+        # client-side filter above even though it has occurrences inside the
+        # window. When expanding, reconsider every RecurringMaster regardless of
+        # the window; each one's master row is then only emitted if the master
+        # itself overlaps the window or it actually yielded an occurrence.
+        in_window_ids = {id(i) for i in matching_items}
+        items_to_process = list(matching_items)
+        if expand_recurrences:
+            items_to_process += [
+                i
+                for i in all_items
+                if i.get("CalendarItemType", "") == "RecurringMaster"
+                and id(i) not in in_window_ids
+            ]
+
         events = []
-        for item in matching_items:
+        for item in items_to_process:
+            in_window = id(item) in in_window_ids
             item_id = item.get("ItemId", {}).get("Id", "")
 
             event = {
@@ -400,6 +788,8 @@ def get_calendar_events(
                 "is_meeting": item.get("IsMeeting", False),
                 "is_recurring": item.get("CalendarItemType", "") == "RecurringMaster",
                 "calendar_item_type": item.get("CalendarItemType", ""),
+                "categories": item.get("Categories", []) or [],
+                "is_synthesized_occurrence": False,
                 "organizer": "",
                 "my_response": item.get("MyResponseType", ""),
                 "item_id": item_id,
@@ -408,20 +798,94 @@ def get_calendar_events(
                 "attendees_optional": [],
             }
 
-            if include_body and item_id:
+            details = None
+            if (include_body or (expand_recurrences and event["is_recurring"])) and item_id:
                 details = _get_event_details(client, item_id)
+
+            if include_body and details:
                 event["organizer"] = details["organizer"]
                 event["location"] = details["location"] or event["location"]
                 event["body"] = details["body"]
                 event["attendees_required"] = details["attendees_required"]
                 event["attendees_optional"] = details["attendees_optional"]
 
-            events.append(event)
+            if in_window:
+                events.append(event)
+
+            # Synthesize per-occurrence entries for recurring series.
+            if expand_recurrences and event["is_recurring"] and details:
+                try:
+                    occ_starts = _expand_recurrence_occurrences(
+                        details.get("recurrence") or {}, start_dt, end_dt_exclusive
+                    )
+                except Exception:
+                    # A malformed/unexpected Recurrence payload must not take
+                    # down the whole listing -- skip expansion for this series.
+                    occ_starts = []
+
+                # An out-of-window master that does yield occurrences still gets
+                # its own row, so the caller has an actionable series item_id.
+                if occ_starts and not in_window:
+                    events.append(event)
+
+                duration = timedelta(0)
+                master_start = None
+                try:
+                    master_start = parse_iso_datetime(item.get("Start", ""))
+                    master_end = parse_iso_datetime(item.get("End", "") or item.get("Start", ""))
+                    duration = master_end - master_start
+                except (ValueError, TypeError):
+                    pass
+
+                for occ_start in occ_starts:
+                    # Recurrence ranges often carry a date-only StartDate, which
+                    # would put every occurrence at midnight -- take the
+                    # time-of-day from the series master instead.
+                    if master_start is not None:
+                        occ_start = occ_start.replace(
+                            hour=master_start.hour,
+                            minute=master_start.minute,
+                            second=master_start.second,
+                            microsecond=master_start.microsecond,
+                        )
+                    occurrence = dict(event)
+                    occurrence["start"] = occ_start.isoformat()
+                    occurrence["end"] = (occ_start + duration).isoformat()
+                    occurrence["is_synthesized_occurrence"] = True
+                    # No real distinct ItemId exists for a synthesized
+                    # occurrence; see this tool's docstring for why reusing the
+                    # master's id would be unsafe.
+                    occurrence["item_id"] = ""
+                    events.append(occurrence)
 
         events.sort(key=lambda e: e["start"])
         return json.dumps(events, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": f"Failed to get calendar events: {e}"})
+
+
+@mcp.tool()
+def get_calendar_event(item_id: str, ctx: Context = None) -> str:
+    """Get full details for a single calendar event by ItemId.
+
+    Args:
+        item_id: The Exchange ItemId of the calendar event (from get_calendar_events).
+
+    Returns:
+        JSON object with subject, start, end, location, body, organizer,
+        attendees, categories, calendar_item_type, and related fields.
+        For a RecurringMaster item this describes the series master only --
+        it has no per-occurrence start/end.
+    """
+    client = _get_client(ctx)
+    try:
+        details = _get_event_details(client, item_id)
+        details["item_id"] = item_id
+        return json.dumps(details, ensure_ascii=False)
+    except SessionExpiredError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        return json.dumps({"error": f"Failed to get calendar event: {e}"})
 
 
 # ------------------------------------------------------------------

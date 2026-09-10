@@ -24,13 +24,13 @@ Any variable above can also be placed in a gitignored `.env.local` next to `pypr
 
 ## Structure
 
-- `exchange_mcp/` — MCP server package (46 tools)
+- `exchange_mcp/` — MCP server package (48 tools)
   - `server.py` — FastMCP server with lifespan context; launches the browser on the persistent profile and, if that profile isn't signed in, opens a visible sign-in window (off the handshake path — see "Authentication" below)
   - `browser_session.py` — `BrowserSession`: one persistent Chromium context for the process's lifetime, reused by every OWA call
   - `owa_client.py` — OWA API client; delegates transport to `BrowserSession`, keeps the request/response/folder-resolution logic
   - `auth_errors.py` — Pure diagnosis of a *timed-out* interactive sign-in: reason codes, the AADSTS/page-text/URL hint tables, per-reason remediation text, and `AuthenticationRequiredError`. Imports nothing else from the package (no Playwright) so it stays unit-testable — see "Authentication" below.
   - `tools/` — Tool modules: email, calendar, categories, people, folders, availability, analytics, auth, copilot
-- `tests/unit/` — Pure-logic tests, no live mailbox / browser / `EXCHANGE_OWA_URL` needed (`python -m tests.unit.test_auth_errors`). Separate from `tests/smoke/`, which is live-mailbox end-to-end.
+- `tests/unit/` — Pure-logic tests, no live mailbox / browser / `EXCHANGE_OWA_URL` needed (`python -m tests.unit.test_auth_errors`, `python -m tests.unit.test_recurrence_expansion`). Separate from `tests/smoke/`, which is live-mailbox end-to-end.
 
 ## Running
 
@@ -51,6 +51,7 @@ exchange-mcp-server --transport http --port 8765 --show-browser
 
 # Pure-logic tests (no mailbox, no browser, no EXCHANGE_OWA_URL)
 python -m tests.unit.test_auth_errors
+python -m tests.unit.test_recurrence_expansion
 ```
 
 There is no credential setup step and no login CLI: the first start opens a browser
@@ -98,7 +99,7 @@ Deliberate design points, each of which has a wrong-looking-but-tempting alterna
 [PROJECT_STATUS.md](PROJECT_STATUS.md) tracks, per MCP tool: a permanent ID, automated-test coverage, and manual QA result (`Pending`/`OK`/`KO`). Keep it in sync as part of the same change, not as a follow-up:
 
 - **ID column and numbering rule**: every tool row's first column is a permanent 3-digit ID — digit 1 is the tool's module number, digits 2-3 are the tool's sequence number within that module (`e.g. 208` = module 2 (Calendar), 8th tool assigned in that module). Module numbers are fixed: 1 Email, 2 Calendar, 3 Categories, 4 Directory (`people.py`), 5 Folders, 6 Availability, 7 Analytics, 8 Auth, 9 Copilot — a brand-new module gets the next unused digit, never a reused or renumbered one. **An ID never changes once assigned**, even if the table is reordered or the tool is later removed — do not renumber existing rows to close a gap, and do not reuse a retired tool's ID for a different tool. Adding a tool to an existing module → give it the next unused 2-digit sequence number in that module (append at the end of that module's existing max, regardless of where the row is placed in the table). Removing a tool → delete its row; leave the gap in the sequence rather than shifting later IDs down.
-- Adding, removing, or renaming a tool → add/remove/update its row (and the module's tool count in its section header and in the "46 tools" totals here and in README.md).
+- Adding, removing, or renaming a tool → add/remove/update its row (and the module's tool count in its section header and in the "48 tools" totals here and in README.md).
 - Changing a tool's behavior (new params, different OWA action, altered response shape) → update its Description cell if it's no longer accurate, and reset its Manual QA status to `Pending` unless it's been re-verified.
 - Running or receiving the result of a manual test against a live OWA mailbox → update that tool's Manual QA / Status cell to `OK` or `KO` (with a one-line note for `KO`), don't leave it stale at `Pending`.
 - A tool becoming, or ceasing to be, a confirmed unfixable server-side failure (not merely `Pending`, and not a degraded-but-working case like `get_meeting_contacts`'s empty-result-plus-`warnings` behavior) → keep its Stability column cell (`Stable`/`Dev`) and `KNOWN_BUGGY_TOOLS` in `exchange_mcp/server.py` in sync with each other. `KNOWN_BUGGY_TOOLS` is what `--stable`/`EXCHANGE_MCP_STABLE` excludes from the MCP tool listing at startup.

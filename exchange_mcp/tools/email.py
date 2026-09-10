@@ -74,6 +74,7 @@ def _extract_conversation_summary(conv: dict) -> dict:
         "categories": conv.get("Categories", []),
         "importance": conv.get("Importance", "Normal"),
         "preview": conv.get("Preview", ""),
+        "flag_status": (conv.get("Flag") or {}).get("FlagStatus", "NotFlagged"),
     }
 
 
@@ -114,6 +115,7 @@ def _get_item_details(client: OWAClient, item_id: str) -> dict:
         "importance": "Normal",
         "attachments": [],
         "categories": [],
+        "flag_status": "NotFlagged",
     }
 
     for msg in client.extract_items(data):
@@ -137,6 +139,7 @@ def _get_item_details(client: OWAClient, item_id: str) -> dict:
             result["is_read"] = item.get("IsRead", False)
             result["has_attachments"] = item.get("HasAttachments", False)
             result["importance"] = item.get("Importance", "Normal")
+            result["flag_status"] = (item.get("Flag") or {}).get("FlagStatus", "NotFlagged")
 
             # Body
             body_val = item.get("Body", {}).get("Value", "")
@@ -220,6 +223,52 @@ def _get_item_details(client: OWAClient, item_id: str) -> dict:
 
             return result
 
+    return result
+
+
+def _try_get_item_details(client: OWAClient, item_id: str) -> tuple[dict | None, str | None]:
+    """`_get_item_details` that reports failure instead of raising.
+
+    Returns (details, None) or (None, error_note).
+
+    Some real messages can't be fetched at all: OWA's own GetItem throws
+    `System.Runtime.Serialization.SerializationException` (HTTP 500) on them —
+    observed on meeting-related items in a live mailbox, and not something this
+    client can work around. Any loop over several item_ids therefore has to be
+    able to skip one bad item, because letting it propagate takes down the whole
+    batch: a listing loses every other row, and a bulk write reports failure
+    while silently keeping the items it already changed.
+
+    SessionExpiredError is deliberately re-raised — that isn't a per-item
+    problem and the caller's retry/re-login path should see it.
+    """
+    try:
+        return _get_item_details(client, item_id), None
+    except SessionExpiredError:
+        raise
+    except Exception as e:
+        return None, str(e)
+
+
+def _bulk_result(action: str, updated: list[str], failed: list[dict], requested: int) -> dict:
+    """Summarise a per-item bulk write, naming what actually changed.
+
+    A batch that skipped an unfetchable item has genuinely applied part of its
+    change, so reporting a bare success (or a bare error) would misstate what
+    happened to the mailbox. `success` is False when nothing at all was applied.
+    """
+    result: dict = {
+        "success": bool(updated),
+        "message": f"{action} {len(updated)} of {requested} email(s).",
+        "updated_count": len(updated),
+    }
+    if failed:
+        result["failed_count"] = len(failed)
+        result["failed"] = failed
+        result["message"] += (
+            f" {len(failed)} skipped — their details could not be read "
+            f"(see 'failed')."
+        )
     return result
 
 
@@ -495,6 +544,10 @@ def get_emails(
         unread_only: If True, only return conversations with unread messages.
         ids_only: If True, return only conversation/item IDs and dates
             (compact, for bulk ops). Max limit raised to 500 in this mode.
+
+    Each result includes flag_status ("NotFlagged"/"Flagged"/"Complete").
+    At the default FindConversation shape this value is unverified against
+    this tenant -- pass include_body=True for a value confirmed via GetItem.
     """
     try:
         client = _get_client(ctx)
@@ -581,13 +634,20 @@ def get_emails(
             email = _extract_conversation_summary(conv)
 
             if include_body and email["item_id"]:
-                details = _get_item_details(client, email["item_id"])
-                email["from"] = details["from"]
-                email["from_name"] = details["from_name"]
-                email["to"] = details["to"]
-                email["cc"] = details["cc"]
-                email["body"] = details["body"]
-                email["has_links"] = details.get("has_links", False)
+                details, detail_error = _try_get_item_details(client, email["item_id"])
+                if details is None:
+                    # One unfetchable message must not cost the caller the whole
+                    # page (see _try_get_item_details) — degrade just this row.
+                    email["body"] = ""
+                    email["body_error"] = detail_error
+                else:
+                    email["from"] = details["from"]
+                    email["from_name"] = details["from_name"]
+                    email["to"] = details["to"]
+                    email["cc"] = details["cc"]
+                    email["body"] = details["body"]
+                    email["has_links"] = details.get("has_links", False)
+                    email["flag_status"] = details["flag_status"]
 
             emails.append(email)
 
@@ -725,7 +785,19 @@ def get_email(item_id: str, ctx: Context = None) -> str:
     except SessionExpiredError as e:
         return json.dumps({"error": str(e)})
     except Exception as e:
-        return json.dumps({"error": f"Failed to get email: {e}"})
+        error = {"error": f"Failed to get email: {e}"}
+        if "SerializationException" in str(e):
+            # Nothing to degrade to for a single item, but say plainly that this
+            # is the server refusing to serialise that message rather than a
+            # bad item_id or an expired session.
+            error["hint"] = (
+                "OWA itself cannot serialise this message (server-side "
+                "SerializationException); the item_id and session are fine. "
+                "Observed on some meeting-related items — no client-side "
+                "workaround. Use get_emails without include_body for its "
+                "summary fields."
+            )
+        return json.dumps(error)
 
 
 @mcp.tool()
@@ -1019,6 +1091,113 @@ def mark_email_read(
         return json.dumps({"error": str(e)})
     except Exception as e:
         return json.dumps({"error": f"Failed to update emails: {e}"})
+
+
+_VALID_FLAG_STATUSES = {"NotFlagged", "Flagged", "Complete"}
+
+def _build_flag_update(flag_status: str) -> dict:
+    """Build the SetItemField update that sets an item's follow-up flag.
+
+    The exact wire encoding here is load-bearing and was found by elimination
+    against a live mailbox (2026-09-10). Everything else this backend accepts
+    for other fields is rejected for the flag:
+
+      * `FieldURI: "message:Flag"` with either `Flag:#Exchange` or
+        `FlagType:#Exchange` -> "Invalid argument used to call method UpdateItem"
+      * `PidLidFlagStatus` (PSETID_Common 0x8530) as an ExtendedFieldURI, in
+        every spelling tried (`PathToExtendedFieldType`/`ExtendedPropertyUri`
+        x `DistinguishedPropertySetId`/`PropertySetId` GUID, plus a
+        `PropertyTag` for PidTagFollowupIcon) -> ErrorCode 500, or
+        "the combination of extended property attributes is not valid"
+
+    What works is the `item:`-namespaced field URI paired with the `FlagType`
+    complex type. Change either half and the call starts failing again.
+    """
+    return {
+        "__type": "SetItemField:#Exchange",
+        "Path": {"__type": "PropertyUri:#Exchange", "FieldURI": "item:Flag"},
+        "Item": {
+            "__type": "Message:#Exchange",
+            "Flag": {"__type": "FlagType:#Exchange", "FlagStatus": flag_status},
+        },
+    }
+
+
+@mcp.tool()
+def set_email_flag(
+    item_ids: list[str],
+    flag_status: str,
+    ctx: Context = None,
+) -> str:
+    """Set the follow-up flag on one or more emails.
+
+    Args:
+        item_ids: List of Exchange ItemIds to update.
+        flag_status: One of "NotFlagged", "Flagged", "Complete".
+
+    Verified live 2026-09-10: writing and reading back all three states
+    round-trips correctly. The wire encoding is fussy on this backend --
+    see _build_flag_update() for what was rejected and why.
+    """
+    if flag_status not in _VALID_FLAG_STATUSES:
+        return json.dumps(
+            {
+                "error": f"Invalid flag_status: {flag_status}. Must be one of "
+                f"{sorted(_VALID_FLAG_STATUSES)}."
+            }
+        )
+    try:
+        client = _get_client(ctx)
+
+        changes = []
+        for iid in item_ids:
+            change_key = _get_change_key(client, iid)
+            item_id_dict = {"__type": "ItemId:#Exchange", "Id": iid}
+            if change_key:
+                item_id_dict["ChangeKey"] = change_key
+            changes.append(
+                {
+                    "__type": "ItemChange:#Exchange",
+                    "ItemId": item_id_dict,
+                    "Updates": [_build_flag_update(flag_status)],
+                }
+            )
+
+        payload = {
+            "__type": "UpdateItemJsonRequest:#Exchange",
+            "Header": {
+                "__type": "JsonRequestHeaders:#Exchange",
+                "RequestServerVersion": "V2017_08_18",
+            },
+            "Body": {
+                "__type": "UpdateItemRequest:#Exchange",
+                "ItemChanges": changes,
+                "ConflictResolution": "AutoResolve",
+                "MessageDisposition": "SaveOnly",
+            },
+        }
+
+        data = client.request("UpdateItem", payload)
+
+        errors = []
+        for msg in client.extract_items(data):
+            if msg.get("ResponseClass") == "Error":
+                errors.append(msg.get("MessageText", "Unknown error"))
+
+        if errors:
+            return json.dumps({"error": "; ".join(errors)})
+
+        return json.dumps(
+            {
+                "success": True,
+                "message": f"Set flag_status={flag_status} on {len(item_ids)} email(s).",
+            }
+        )
+
+    except SessionExpiredError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        return json.dumps({"error": f"Failed to set email flag: {e}"})
 
 
 @mcp.tool()
@@ -1375,14 +1554,16 @@ def assign_email_categories(
     """
     try:
         client = _get_client(ctx)
+        updated, failed = [], []
         for iid in item_ids:
-            existing = _get_item_details(client, iid).get("categories", [])
-            merged = list(dict.fromkeys(existing + categories))
+            details, detail_error = _try_get_item_details(client, iid)
+            if details is None:
+                failed.append({"item_id": iid, "error": detail_error})
+                continue
+            merged = list(dict.fromkeys(details.get("categories", []) + categories))
             _set_email_categories(client, [iid], merged)
-        return json.dumps({
-            "success": True,
-            "message": f"Added categories to {len(item_ids)} email(s).",
-        })
+            updated.append(iid)
+        return json.dumps(_bulk_result("Added categories to", updated, failed, len(item_ids)))
     except SessionExpiredError as e:
         return json.dumps({"error": str(e)})
     except Exception as e:
@@ -1404,14 +1585,17 @@ def remove_email_categories(
     try:
         client = _get_client(ctx)
         lowered = {c.lower() for c in categories}
+        updated, failed = [], []
         for iid in item_ids:
-            existing = _get_item_details(client, iid).get("categories", [])
-            remaining = [c for c in existing if c.lower() not in lowered]
+            details, detail_error = _try_get_item_details(client, iid)
+            if details is None:
+                failed.append({"item_id": iid, "error": detail_error})
+                continue
+            remaining = [c for c in details.get("categories", [])
+                         if c.lower() not in lowered]
             _set_email_categories(client, [iid], remaining)
-        return json.dumps({
-            "success": True,
-            "message": f"Removed categories from {len(item_ids)} email(s).",
-        })
+            updated.append(iid)
+        return json.dumps(_bulk_result("Removed categories from", updated, failed, len(item_ids)))
     except SessionExpiredError as e:
         return json.dumps({"error": str(e)})
     except Exception as e:

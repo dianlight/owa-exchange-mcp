@@ -2,7 +2,7 @@
 
 # OWA Exchange MCP Server
 
-MCP (Model Context Protocol) server for any Microsoft Exchange / OWA (Outlook Web Access) deployment. Gives LLM agents access to email, calendar, directory search, folders, categories, availability, meeting analytics, and Copilot delegation via 46 tools.
+MCP (Model Context Protocol) server for any Microsoft Exchange / OWA (Outlook Web Access) deployment. Gives LLM agents access to email, calendar, directory search, folders, categories, availability, meeting analytics, and Copilot delegation via 48 tools.
 
 Works with any on-premise or hosted Exchange server that exposes OWA.
 
@@ -194,9 +194,9 @@ Note that this is *diagnosis only*. The login window never aborts early on an
 error message: you're sitting in front of it, so a mistyped password or an
 accidentally denied push is something you just retry there.
 
-## Tools (46)
+## Tools (48)
 
-### Email (14)
+### Email (15)
 | Tool | Description |
 |---|---|
 | `get_emails` | List emails from a folder with filtering |
@@ -208,16 +208,18 @@ accidentally denied push is something you just retry there.
 | `delete_email` | Delete an email |
 | `move_email` | Move email to another folder |
 | `mark_email_read` | Mark email as read/unread |
+| `set_email_flag` | Set the follow-up flag on one or more emails |
 | `download_attachments` | Download file attachments from an email |
 | `get_email_links` | Extract hyperlinks from an email body |
 | `assign_email_categories` | Tag emails with one or more categories |
 | `remove_email_categories` | Remove categories from emails |
 | `find_emails_by_category` | Find emails tagged with a given category |
 
-### Calendar (10)
+### Calendar (11)
 | Tool | Description |
 |---|---|
 | `get_calendar_events` | Get events in a date range |
+| `get_calendar_event` | Get full details for a single calendar event by ID |
 | `create_meeting` | Create a meeting with attendees |
 | `update_meeting` | Update an existing meeting |
 | `cancel_meeting` | Cancel a meeting and notify attendees |
