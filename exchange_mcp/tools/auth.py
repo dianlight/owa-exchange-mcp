@@ -1,12 +1,15 @@
 """Authentication tool for the Exchange MCP server.
 
-Provides a `login` tool that handles credential setup and 2FA login against
-the server's shared, persistent browser session (see browser_session.py).
+Provides a `login` tool that opens a visible browser window on the OWA sign-in
+page and waits for the user to complete it. There are no credentials anywhere in
+this server: authentication is either silent (the persistent browser profile is
+still signed in) or interactive, driven by the human in front of that window.
 
-The login flow is non-blocking for 2FA:
-1. First call starts browser login in the background and returns immediately
-   with instructions to approve 2FA on the mobile app.
-2. Second call checks the background task result.
+The flow is non-blocking, because a real sign-in takes minutes and an MCP call
+can't:
+1. The first call opens the window and returns immediately.
+2. The user signs in (address, password, 2FA) in that window.
+3. A second call picks up the result.
 """
 
 import asyncio
@@ -14,7 +17,8 @@ import json
 
 from mcp.server.fastmcp import Context
 
-from exchange_mcp.server import mcp, AppContext
+from exchange_mcp import auth_errors
+from exchange_mcp.server import mcp, AppContext, LOGIN_WINDOW_SECONDS
 from exchange_mcp.owa_client import OWAClient
 
 
@@ -71,47 +75,62 @@ def _session_is_valid(client: OWAClient) -> bool:
         return False
 
 
+def _failure_payload(result: dict) -> str:
+    """Render a failed sign-in, adding the reason's remediation text.
+
+    `reason` comes from the interactive login (see exchange_mcp.auth_errors);
+    `authorization_required` is the flag a client should branch on — it means the
+    mailbox is unreachable until someone finishes signing in.
+    """
+    reason = result.get("reason") or auth_errors.LOGIN_TIMEOUT
+    return json.dumps({
+        "success": False,
+        "error": result.get("error") or "Sign-in was not completed.",
+        "reason": reason,
+        "authorization_required": True,
+        "remediation": auth_errors.remediation(reason),
+    })
+
+
 @mcp.tool()
-async def login(
-    master_password: str,
-    username: str = "",
-    password: str = "",
-    ctx: Context = None,
-) -> str:
-    """Authenticate to Exchange OWA (handles credential setup and 2FA login).
+async def login(force: bool = False, ctx: Context = None) -> str:
+    """Sign in to Exchange OWA by opening a browser window for the user.
 
-    Call this tool when the session has expired or before first use. Login
-    runs on the MCP server's shared persistent browser session, with mobile
-    push 2FA approval.
+    Call this when a tool reports that authorization is required, or before first
+    use. The server holds no credentials: this opens a real, visible browser
+    window on the OWA sign-in page, and the *user* signs in there (address,
+    password, and any 2FA prompt). The resulting session is saved in the server's
+    persistent browser profile and reused from then on, across restarts.
 
-    **Two-call 2FA flow**: The first call starts the browser login in the
-    background and returns immediately asking you to tell the user to approve
-    2FA on their phone.  Call login again with the same master_password after
-    the user approves — the second call picks up the result.
+    **Two-call flow**: the first call opens the window and returns immediately —
+    tell the user to complete the sign-in in that window. Call `login` again
+    afterwards to pick up the result. If the session is already valid, the first
+    call says so without opening anything.
 
     Args:
-        master_password: Decrypts stored credentials, or encrypts new ones
-            if username/password are also provided.
-        username: Email address. Provide together with password for first-time
-            credential setup (replaces `login.py --setup`).
-        password: Account password. Required together with username for setup.
+        force: Open the sign-in window even if the current session looks valid
+            (e.g. to switch accounts). Normally leave this off.
 
     Returns:
-        JSON result with success status and any error details.
+        JSON. `{"success": true, ...}` once the session is live. `{"status":
+        "awaiting_user_login"}` while the window is open. On failure,
+        `"authorization_required": true` plus a `reason` and `remediation`
+        describing what the sign-in page was showing when the wait expired.
     """
     app_ctx = _get_app_ctx(ctx)
     client = app_ctx.client
 
     # ------------------------------------------------------------------
-    # If a background login task exists, check its status first
+    # If a sign-in window is already open, report on it first
     # ------------------------------------------------------------------
     if app_ctx.pending_login is not None:
         task = app_ctx.pending_login
 
         if not task.done():
             return json.dumps({
-                "status": "awaiting_2fa",
-                "message": "Still waiting for 2FA approval. Please approve the login in your authenticator app, then call login again.",
+                "status": "awaiting_user_login",
+                "message": "The browser window is still open and waiting. Ask the user to "
+                           "complete the OWA sign-in there (including 2FA), then call login again.",
             })
 
         # Task finished — harvest result and clear
@@ -119,49 +138,33 @@ async def login(
         try:
             result = task.result()
         except Exception as e:
-            return json.dumps({"success": False, "error": f"Background login failed: {e}"})
+            return json.dumps({"success": False, "error": f"Interactive login failed: {e}"})
 
         if result.get("success") and _session_is_valid(client):
-            return json.dumps({"success": True, "message": "Logged in and session verified."})
-        return json.dumps(result)
+            return json.dumps({
+                "success": True,
+                "message": "Signed in and session verified.",
+                "browser_shown": result.get("browser_shown", False),
+            })
+        return _failure_payload(result)
 
     # ------------------------------------------------------------------
-    # No pending task — normal login flow
+    # No window open — normal flow
     # ------------------------------------------------------------------
-
-    # 1. Check if already authenticated
-    if _session_is_valid(client):
+    if not force and _session_is_valid(client):
         return json.dumps({"success": True, "message": "Session is already active."})
 
-    # 2. Resolve credentials
-    from exchange_mcp.auth import encrypt_credentials, decrypt_credentials, CREDS_FILE, perform_login
-
-    if username and password:
-        # First-time setup: encrypt and save credentials
-        encrypt_credentials(username, password, master_password)
-    else:
-        # Decrypt existing credentials
-        if not CREDS_FILE.exists():
-            return json.dumps({
-                "success": False,
-                "error": "No stored credentials found. Provide username and password for first-time setup.",
-            })
-        username, password = decrypt_credentials(master_password)
-        if not username:
-            return json.dumps({
-                "success": False,
-                "error": "Invalid master password — could not decrypt credentials.",
-            })
-
-    # Store user email on the client for availability queries
-    client.user_email = username
-
-    # 3. Start browser login in background (non-blocking for 2FA)
+    # Started as a background task, not awaited: interactive_login() blocks for
+    # minutes waiting on a human, far longer than any MCP client will hold a
+    # request open. asyncio.to_thread keeps the server's own event loop free
+    # while that wait happens on a worker thread.
     app_ctx.pending_login = asyncio.create_task(
-        perform_login(client.browser, username, password)
+        asyncio.to_thread(client.browser.interactive_login, LOGIN_WINDOW_SECONDS)
     )
 
     return json.dumps({
-        "status": "awaiting_2fa",
-        "message": "Please approve the login in your 2FA authenticator app, then call login again with the same master_password.",
+        "status": "awaiting_user_login",
+        "message": "A browser window has been opened on the OWA sign-in page. Ask the user to "
+                   f"sign in there (including any 2FA prompt) within {LOGIN_WINDOW_SECONDS} "
+                   "seconds, then call login again to confirm.",
     })

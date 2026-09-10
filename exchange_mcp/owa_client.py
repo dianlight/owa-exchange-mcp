@@ -10,6 +10,10 @@ import re
 from datetime import datetime
 from urllib.parse import quote
 
+from exchange_mcp.auth_errors import (  # noqa: F401
+    INTERACTIVE_LOGIN_REQUIRED,
+    AuthenticationRequiredError,
+)
 from exchange_mcp.browser_session import (  # noqa: F401
     BearerModeRequiredError,
     BrowserSession,
@@ -51,9 +55,11 @@ class OWAClient:
     """Public API for OWA JSON calls, folder/name resolution, and attachment downloads.
 
     All requests go through a shared BrowserSession: each call opens its own
-    tab, performs the fetch, and closes it. Session expiry triggers one
-    automatic re-login attempt (silent if the persistent profile is still
-    signed in, or using cached credentials) before retrying the call once.
+    tab, performs the fetch, and closes it. Session expiry triggers one silent
+    re-auth attempt against the persistent profile before retrying the call
+    once; if the profile can't carry us either, it raises
+    AuthenticationRequiredError telling the caller to use the `login` tool --
+    there are no stored credentials to log in with. See _relogin_or_raise().
     """
 
     def __init__(self, browser_session: BrowserSession):
@@ -65,6 +71,33 @@ class OWAClient:
     def cookie_file(self):
         """Backward-compat alias: session state now lives in the browser profile dir, not a cookie file."""
         return self.browser.profile_dir
+
+    # ------------------------------------------------------------------
+    # Re-login on session expiry
+    # ------------------------------------------------------------------
+
+    def _relogin_or_raise(self) -> None:
+        """Silently re-acquire the session on a 401/440, or raise for a human.
+
+        The silent path is all this server has: it re-checks the persistent
+        profile, which can still carry us through on live OWA cookies, the "stay
+        signed in" cookie, or an SSO session the SPA can mint a fresh Bearer
+        token from. There is no stored password to replay.
+
+        When that fails, retrying is pointless, so this raises
+        AuthenticationRequiredError rather than letting the caller loop. It
+        deliberately does *not* pop up a sign-in window here: that would mean a
+        Chromium window appearing in the middle of some unrelated tool call.
+        Opening the window is the `login` tool's job, which the error text points
+        the caller at.
+        """
+        result = self.browser.ensure_logged_in()
+        if result.get("success"):
+            return
+        raise AuthenticationRequiredError(
+            result.get("error") or "The browser profile has no usable OWA session.",
+            result.get("reason") or INTERACTIVE_LOGIN_REQUIRED,
+        )
 
     # ------------------------------------------------------------------
     # Core request methods
@@ -81,7 +114,7 @@ class OWAClient:
                 return self._to_json(self.browser.post_json(action, payload, timeout=timeout))
             except SessionExpiredError:
                 if attempt == 0:
-                    self.browser.ensure_logged_in()
+                    self._relogin_or_raise()
                 else:
                     raise
 
@@ -99,7 +132,7 @@ class OWAClient:
                 return self._to_json(self.browser.post_header_payload(action, payload, timeout=timeout))
             except SessionExpiredError:
                 if attempt == 0:
-                    self.browser.ensure_logged_in()
+                    self._relogin_or_raise()
                 else:
                     raise
 
@@ -121,7 +154,7 @@ class OWAClient:
                 )
             except SessionExpiredError:
                 if attempt == 0:
-                    self.browser.ensure_logged_in()
+                    self._relogin_or_raise()
                 else:
                     raise
 
@@ -615,7 +648,7 @@ class OWAClient:
                 return self.browser.copilot_ask(prompt, nav_url=nav_url, timeout=timeout)
             except SessionExpiredError:
                 if attempt == 0:
-                    self.browser.ensure_logged_in()
+                    self._relogin_or_raise()
                 else:
                     raise
 

@@ -11,8 +11,8 @@ Exchange MCP is a Model Context Protocol server for any Microsoft Exchange / OWA
 The server requires one environment variable, plus optional ones for the browser session:
 
 - `EXCHANGE_OWA_URL` — Base URL of the OWA instance (e.g. `https://owa.example.com`)
-- `EXCHANGE_MASTER_PASSWORD` — (optional) If set, the server logs in automatically at startup using stored encrypted credentials, blocking through 2FA before it starts serving tools.
-- `EXCHANGE_BROWSER_PROFILE_DIR` — (optional) Path to the persistent Chromium profile directory. Defaults to `.browser-profile/` next to the package.
+- `EXCHANGE_BROWSER_PROFILE_DIR` — (optional) Path to the persistent Chromium profile directory. Default comes from `browser_session.default_profile_dir()`: `<repo>/.browser-profile` in a source checkout (detected by `pyproject.toml` next to the package), `~/owa-mcp/.browser-profile` for an installed package — site-packages is the wrong place, and often unwritable, for a browser profile.
+- `EXCHANGE_LOGIN_TIMEOUT` — (optional) Seconds the interactive sign-in window waits for the user before giving up. Default 300 (`LOGIN_WINDOW_SECONDS` in `server.py`).
 - `EXCHANGE_HEADLESS` — (optional) Set to `false`/`0` to run the browser with a visible window. Same effect as the `--show-browser` CLI flag (which takes precedence).
 - `EXCHANGE_MCP_TRANSPORT` — (optional) `stdio` (default) or `http`. Same effect as `--transport`.
 - `EXCHANGE_MCP_HOST` / `EXCHANGE_MCP_PORT` — (optional) Bind address for `--transport http`. Default `127.0.0.1:8765` — never bind non-loopback, the MCP endpoint has no auth of its own.
@@ -22,21 +22,19 @@ Any variable above can also be placed in a gitignored `.env.local` next to `pypr
 
 ## Structure
 
-- `login.py` — Browser-based login via 2FA, against the same persistent Chromium profile the server uses
 - `exchange_mcp/` — MCP server package (46 tools)
-  - `server.py` — FastMCP server with lifespan context; launches the browser and (if `EXCHANGE_MASTER_PASSWORD` is set) blocks on login before serving
+  - `server.py` — FastMCP server with lifespan context; launches the browser on the persistent profile and, if that profile isn't signed in, opens a visible sign-in window (off the handshake path — see "Authentication" below)
   - `browser_session.py` — `BrowserSession`: one persistent Chromium context for the process's lifetime, reused by every OWA call
   - `owa_client.py` — OWA API client; delegates transport to `BrowserSession`, keeps the request/response/folder-resolution logic
-  - `auth.py` — Login glue between the MCP tool and `BrowserSession`, plus credential encryption (reuses crypto from `login.py`). It's the *only* place inside the package that imports `login.py` — do the same anywhere else that needs those helpers (see note below), don't import `login` directly.
+  - `auth_errors.py` — Pure diagnosis of a *timed-out* interactive sign-in: reason codes, the AADSTS/page-text/URL hint tables, per-reason remediation text, and `AuthenticationRequiredError`. Imports nothing else from the package (no Playwright) so it stays unit-testable — see "Authentication" below.
   - `tools/` — Tool modules: email, calendar, categories, people, folders, availability, analytics, auth, copilot
+- `tests/unit/` — Pure-logic tests, no live mailbox / browser / `EXCHANGE_OWA_URL` needed (`python -m tests.unit.test_auth_errors`). Separate from `tests/smoke/`, which is live-mailbox end-to-end.
 
 ## Running
 
 ```bash
 export EXCHANGE_OWA_URL=https://owa.example.com
 
-python login.py --setup       # One-time credential setup
-python login.py               # Login (pre-warms the persistent browser profile)
 pip install -e .               # Install MCP server
 exchange-mcp-server            # Run MCP server (stdio transport, spawned per client session)
 exchange-mcp-server --show-browser  # Same, with a visible browser window
@@ -48,30 +46,44 @@ exchange-mcp-server --transport http --port 8765
 
 # Persistent local servet to use during smoke test
 exchange-mcp-server --transport http --port 8765 --show-browser
+
+# Pure-logic tests (no mailbox, no browser, no EXCHANGE_OWA_URL)
+python -m tests.unit.test_auth_errors
 ```
 
-Dependencies: `mcp`, `cryptography`, `playwright` (run `playwright install chromium` once). `mcp`'s `streamable-http` transport (`uvicorn`/`starlette`) is already a transitive dependency — no extra install needed for `--transport http`.
+There is no credential setup step and no login CLI: the first start opens a browser
+window and you sign in there. See "Authentication" below.
+
+Dependencies: `mcp`, `playwright` (run `playwright install chromium` once). `mcp`'s `streamable-http` transport (`uvicorn`/`starlette`) is already a transitive dependency — no extra install needed for `--transport http`.
 
 ## Architecture
 
 **Browser-per-call transport**: Every OWA call — not just login — goes through one persistent, real Chromium instance instead of a plain HTTP client, because OWA now requires signals (a fresh per-page CSRF canary, browser-like headers, a real TLS/JS fingerprint) that a hand-rolled `requests` session replaying exported cookies can't replicate. `BrowserSession` launches Chromium once via `launch_persistent_context` (on-disk profile, survives restarts and benefits from Microsoft's "stay signed in" cookie). Each tool call opens its own tab against that same context, performs its fetch, and closes the tab. A background thread with a dedicated asyncio loop hosts Playwright's async API; `OWAClient`/tool code call into it through plain synchronous methods.
 
-**Session-based workflow**: `login.py` (CLI), the `login` MCP tool, or `EXCHANGE_MASTER_PASSWORD` at startup authenticate via browser-based 2FA directly on the persistent profile — there's no cookie file or in-memory cookie hand-off anymore; the browser profile itself is the session. The server starts even without a valid session (tolerant); the `login` tool can authenticate within the MCP session afterward.
+**Authentication — profile-first, interactive, no credentials**: the persistent browser profile *is* the session. There is no credential store, no master password, and no login CLI: the server never types a password anywhere. Startup (`_startup` in `server.py`, a background task so the MCP handshake isn't blocked) does exactly this:
+
+1. Resolve the profile directory (`EXCHANGE_BROWSER_PROFILE_DIR`, else `default_profile_dir()`), reuse it if it exists, create it if not — `BrowserSession.profile_existed` is captured before anything creates it so the log can tell the two apart honestly.
+2. `BrowserSession.has_active_session()` — if the profile is still signed in (live OWA cookies, Microsoft's "stay signed in" cookie, or an SSO session the modern SPA can still mint a Bearer token from), serve immediately.
+3. Otherwise `BrowserSession.interactive_login()`: relaunch the context **visible** (`_async_relaunch(headless=False)`), park it on the OWA sign-in page, and poll until a session appears or `EXCHANGE_LOGIN_TIMEOUT` expires. The *user* signs in — address, password, 2FA — we only watch for the result.
+4. If nobody completes it, keep serving anyway. Tools report `authorization_required` and the `login` tool reopens the window on demand. A stdio server is routinely spawned while the user is away from the keyboard, so dying for that reason would be worse than waiting to be asked.
+
+Deliberate design points, each of which has a wrong-looking-but-tempting alternative:
+- **The interactive login never bails out early on a recognized error.** A human is sitting in front of that window: a mistyped password, an accidentally denied MFA push, or a redirect to a change-password page are all things they can simply carry on from. `auth_errors.classify_login_failure()` therefore runs *once, on timeout*, purely to explain what the page was showing when we gave up — it is diagnosis, not control flow.
+- **After a successful interactive login the window stays visible** for the rest of the process's life (`interactive_login` says so in its message). Relaunching back to headless would tear down the context seconds after the session landed in it; a window on screen is a far cheaper failure mode than a login that doesn't stick. Restart the server to get back to headless.
+- **`ensure_logged_in()` is silent-only and never opens a window.** It's what `OWAClient` calls on a 401, and a Chromium window appearing in the middle of an unrelated tool call would be hostile. When it fails, `OWAClient._relogin_or_raise()` raises `AuthenticationRequiredError` (not `SessionExpiredError` — that one means "retry after re-login", this one means "a human must sign in"), whose message points at the `login` tool. `check_session` and `login` surface it structurally as `"authorization_required": true` plus `reason` and `remediation`.
+- **`login` is a two-call tool** (`login()` → window opens, returns immediately → user signs in → `login()` again reports the result), because an interactive sign-in takes minutes and an MCP request can't be held open that long. `force=True` opens the window even when the session looks fine, for switching accounts.
+- Page scraping (`_async_detect_login_failure`) reads `AADSTS<code>` tokens from the whole HTML (precise enough to be safe there) but free text only from *visible* error containers (`VISIBLE_ERROR_SELECTORS`) — the Entra ID page ships hidden templates whose wording ("update your password", ...) is present on a perfectly healthy page. Add new signals to the tables in `auth_errors.py`, not to the scraping code, and cover them in `tests/unit/test_auth_errors.py`.
 
 **OWA JSON API pattern**:
 1. Open a new browser tab, read the current `X-OWA-CANARY` cookie from the persistent context
 2. `fetch()` the request from inside that tab (`page.evaluate`), capturing the real response via `page.expect_response` for status/headers/body
 3. POST JSON to `$EXCHANGE_OWA_URL/owa/service.svc?action=<ACTION>`
 4. Request bodies use EWS `__type` annotations (e.g. `"CalendarItem:#Exchange"`)
-5. HTTP 401/440 = session expired → `OWAClient` calls `BrowserSession.ensure_logged_in()` (silent if the profile is still signed in, or using cached credentials) and retries once
+5. HTTP 401/440 = session expired → `OWAClient._relogin_or_raise()` calls `BrowserSession.ensure_logged_in()` (silent re-auth against the profile only) and retries once, or raises `AuthenticationRequiredError` if the profile can't carry us either
 
 **RequestServerVersion**: `Exchange2013` for reads, `V2017_08_18` for writes.
 
-**Recovery**: if the browser process/context crashes, `BrowserSession` relaunches on the same profile directory and retries the call once. If the OWA session expires, `OWAClient` retries once after a re-login attempt.
-
-**Encryption**: PBKDF2-HMAC-SHA256 (480,000 iterations) + AES-256-Fernet for stored credentials (`.credentials.enc`/`.salt`). Sessions no longer go through this — they live in the browser profile directory instead of an encrypted cookie file.
-
-**Importing `login.py` from inside the package**: `login.py` lives at the repo root and isn't a packaged module (no `py-modules` entry in `pyproject.toml`), so `from login import ...` only resolves when the running process's own `sys.path` happens to include the repo root — true for `python login.py` or `python -m exchange_mcp.server` run from repo root, **false** for the installed `exchange-mcp-server` console-script entry point (its wrapper puts `Scripts/`/`bin/` on `sys.path[0]`, not the caller's cwd). `exchange_mcp/auth.py` works around this by inserting the repo root into `sys.path` before importing `login`; always import those helpers via `from exchange_mcp.auth import ...`, never `from login import ...` directly, or the import silently fails at runtime under the real entry point (caught by a broad `except` in `server.py`'s startup path, so it won't crash — it'll just skip auto-login and log `No module named 'login'`).
+**Recovery**: if the browser process/context crashes, `BrowserSession` relaunches on the same profile directory and retries the call once. If the OWA session expires, `OWAClient` retries once after a silent re-auth attempt — see "Authentication" above for what happens when that can't succeed.
 
 **Transport (`stdio` vs `http`)**: `main()` picks the transport via `--transport`/`EXCHANGE_MCP_TRANSPORT`. The lifespan that creates the `BrowserSession` runs exactly once per process either way — under `stdio` that process is spawned and killed per client session, so the warm browser/login is rebuilt every time; under `--transport http` the process is long-lived and the same `BrowserSession`/login is shared across every client connection that hits it, but it must be started manually — there is no autostart mechanism. Never bind `--host`/`EXCHANGE_MCP_HOST` off `127.0.0.1` — the MCP endpoint has no auth of its own, and FastMCP's `transport_security` (Host header validation) must stay enabled to block DNS-rebinding from other pages in the user's browser.
 

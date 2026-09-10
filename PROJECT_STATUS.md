@@ -19,8 +19,8 @@ untracked files):
 | `exchange_mcp/browser_session.py` | **New** — owns the persistent Chromium context, canary/bearer auth, retry-on-crash |
 | `exchange_mcp/owa_client.py` | Rewritten to delegate 100% of transport to `BrowserSession` |
 | `exchange_mcp/server.py` | Lifespan now launches/stops the browser instead of a plain HTTP session |
-| `exchange_mcp/auth.py` | Login glue rewritten against `BrowserSession` |
-| `login.py` | Rewritten for browser-based 2FA login |
+| `exchange_mcp/auth.py` | Login glue rewritten against `BrowserSession` — **deleted 2026-09-10**, see that update below |
+| `login.py` | Rewritten for browser-based 2FA login — **deleted 2026-09-10**, see that update below |
 | `exchange_mcp/tools/*.py` (all 7 modules) | Adjusted to the new client surface (no direct HTTP calls in any tool — see §3) |
 | `_diag_session_valid.py` | **New**, untracked — ad-hoc manual script to check `ensure_logged_in()` / session validity, not part of the package |
 
@@ -131,6 +131,10 @@ below for details: a `FaultMessage`-fallback bug in [availability.py](exchange_m
 meetings" result in both `get_meeting_stats` and `get_meeting_contacts`.
 
 **Update 2026-09-08 (continued) — `login` tested; one more architecture bug found and fixed.**
+*(The credential half of this is superseded by the 2026-09-10 update below — there is no
+master password or stored credential to decrypt anymore. The pending-task bug it found is
+still fixed, and the "move the profile aside and confirm the server comes up with no
+session" technique is still exactly how to test the interactive path.)*
 Verified via the full forced-relogin flow: moved `.browser-profile` aside (kept as a
 timestamped backup, not deleted), restarted the server without `EXCHANGE_MASTER_PASSWORD`
 so it came up with no session, confirmed via `check_session` that the session was genuinely
@@ -444,6 +448,58 @@ last as a regression check on the shared substrate transport): all now return re
 free/busy data instead of the `NotImplementedException` fault. `KNOWN_BUGGY_TOOLS` in
 [server.py](exchange_mcp/server.py) is now empty — `find_meeting_time` was its only entry.
 
+**Update 2026-09-10 — authentication rebuilt around the browser profile; credential
+storage and `login.py` removed.** The server used to hold credentials: `login.py --setup`
+encrypted a username/password with a master password, and `EXCHANGE_MASTER_PASSWORD`
+let the server decrypt them at startup and drive the Entra ID sign-in form itself. That
+whole mechanism is gone. Deleted: `login.py`, `exchange_mcp/auth.py`, the `cryptography`
+dependency, `EXCHANGE_MASTER_PASSWORD`, and the credential-submitting login flow
+(`BrowserSession._async_run_login_flow`). `.credentials.enc` / `.salt` are no longer read
+by anything and can be deleted.
+
+What replaces it, in [browser_session.py](exchange_mcp/browser_session.py) and
+[server.py](exchange_mcp/server.py) (full contract in CLAUDE.md's "Authentication"
+section):
+
+1. **Profile-first.** `default_profile_dir()` resolves to `<repo>/.browser-profile` in a
+   source checkout (detected by `pyproject.toml` next to the package) and
+   `~/owa-mcp/.browser-profile` for an installed package — writing a browser profile into
+   site-packages is wrong and often impossible. `EXCHANGE_BROWSER_PROFILE_DIR` still
+   overrides. Startup reuses the directory if it exists and creates it if not, reporting
+   which.
+2. **Silent if possible.** `has_active_session()` accepts live OWA cookies, Microsoft's
+   "stay signed in" cookie, or an SSO session the modern SPA can still mint a Bearer token
+   from. If any of those holds, the server serves without showing anything.
+3. **Interactive otherwise.** `interactive_login()` relaunches the context *visible*
+   (`_async_relaunch(headless=False)`), parks it on the OWA sign-in page, and polls until a
+   session appears or `EXCHANGE_LOGIN_TIMEOUT` (default 300s) expires. The user signs in;
+   nothing is typed for them, so any 2FA method the deployment uses works unchanged.
+4. **Never fatal.** If nobody completes the sign-in the server keeps serving; tools report
+   `authorization_required` + `reason` + `remediation`, and the `login` tool reopens the
+   window on demand. A stdio server is routinely spawned while the user is away, so exiting
+   for that reason would be worse than waiting to be asked.
+
+`auth_errors.py` survives with a narrower job: it no longer decides whether to keep
+retrying (there is no credential to retry) — it explains a *timed-out* sign-in, running
+once at the end, never mid-flow. Bailing out early would be wrong now: someone is sitting
+in front of that window and can retype a password or re-approve a push themselves.
+
+This supersedes an earlier same-day change that hardened the *credential* path (hard-stop
+on a fatal login with exit code 78, and a known-bad-credentials latch to avoid AD smart
+lockout). Both existed to make replaying a stored password safe; with no stored password
+left, both were removed rather than left as dead code. The `AuthenticationRequiredError` /
+`authorization_required` / `remediation` reporting it introduced is what remains, and one
+bug it found stays fixed: `login.py`'s credential helpers printed to **stdout**, which is
+the stdio transport's JSON-RPC stream when they ran inside the server.
+
+Verified live against a throwaway profile directory: "creating new" on first start,
+"reusing existing" on the second, an unauthenticated profile relaunching visible
+(`headless` observed flipping to `False`) and waiting, and the timeout path leaving the
+server up instead of exiting. [tests/unit/test_auth_errors.py](tests/unit/test_auth_errors.py)
+covers the reason tables, the false-positive guards, and both branches of
+`default_profile_dir()`. Not verified: an actual completed interactive sign-in (needs a
+human at a real OWA window) — `login` #801 is `Pending` on that.
+
 ## 2. How to read the table
 
 - **ID** — a permanent 3-digit identifier: digit 1 is the module number (fixed per
@@ -453,9 +509,9 @@ free/busy data instead of the `NotImplementedException` fault. `KNOWN_BUGGY_TOOL
   PROJECT_STATUS.md" section for the assignment rule. Module numbers: 1 Email, 2
   Calendar, 3 Categories, 4 Directory, 5 Folders, 6 Availability, 7 Analytics, 8 Auth,
   9 Copilot.
-- **Automated test** — this repo has **no test suite** (no `tests/` folder, no CI
-  config found). So this column is `None` for every row — it is a statement about the
-  repo, not about any individual tool.
+- **Automated test** — the test module(s) covering the row, or `None`. Coverage is
+  `tests/smoke/` (live-mailbox, end-to-end, one module per tool) plus `tests/unit/`
+  (pure logic, no mailbox). There is still no CI config — everything is run by hand.
 - **Manual QA / Status** — whether the tool has actually been exercised against a real
   OWA mailbox since the browser-session rewrite, and the observed result. I have not run
   any of these tools myself in this session (that would require a live `EXCHANGE_OWA_URL`,
@@ -531,7 +587,7 @@ free/busy data instead of the `NotImplementedException` fault. `KNOWN_BUGGY_TOOL
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 501 | `check_session` | Lightweight auth check (`FindFolder` on inbox) — reports mailbox name + unread count when the backend's response includes them (omitted on the modern OAuth/Bearer backend, which never returns `ParentFolder`) | `tests/smoke/tests/test_check_session.py` | OK (2026-09-07) | Stable |
+| 501 | `check_session` | Lightweight auth check (`FindFolder` on inbox) — reports mailbox name + unread count when the backend's response includes them (omitted on the modern OAuth/Bearer backend, which never returns `ParentFolder`). An unauthenticated profile now comes back as `authorization_required` + `reason` + `remediation` rather than a generic error string, pointing the caller at the `login` tool (see the 2026-09-10 update below) | `tests/smoke/tests/test_check_session.py` | OK (2026-09-07) for the authenticated/generic-error paths; the new `authorization_required` branch is `Pending` | Stable |
 | 502 | `get_folders` | List mail folders (shallow or recursive) with counts | `tests/smoke/tests/test_get_folders.py` | OK (2026-09-08) | Stable |
 | 503 | `create_folder` | Create a new mail folder | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) | Stable |
 | 504 | `rename_folder` | Rename an existing folder | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) | Stable |
@@ -557,7 +613,7 @@ free/busy data instead of the `NotImplementedException` fault. `KNOWN_BUGGY_TOOL
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 801 | `login` | Credential setup + two-call, non-blocking 2FA login against the shared browser session | `tests/smoke/tests/test_login.py` (idempotent "already active" path only — see note below) | OK (2026-09-08) | Stable |
+| 801 | `login` | Opens a **visible browser window** on the OWA sign-in page and waits for the user to sign in (two-call flow: first call opens the window, second reports the result). No credential arguments — `force` only. Failure responses carry `authorization_required` / `reason` / `remediation`. Completely rewritten 2026-09-10 (was: master-password + stored encrypted credentials + 2FA push wait) | `tests/smoke/tests/test_login.py` (idempotent "already active" path only — the interactive path needs a human at the window), `tests/unit/test_auth_errors.py` (reason tables, profile-dir resolution) | **Pending** — signature and behavior fully replaced 2026-09-10; the already-active short-circuit is unchanged in spirit but the interactive window path has not been driven end to end by a human yet | Stable |
 
 ### Copilot — [exchange_mcp/tools/copilot.py](exchange_mcp/tools/copilot.py) (5)
 
@@ -571,12 +627,13 @@ free/busy data instead of the `NotImplementedException` fault. `KNOWN_BUGGY_TOOL
 
 ## 4. Gaps worth closing
 
-- **Automated tests are live-mailbox smoke tests only, not unit tests.** `tests/smoke/`
+- **Automated tests are almost entirely live-mailbox smoke tests.** `tests/smoke/`
   (added 2026-09-07) exercises each MCP tool end-to-end against a real OWA mailbox, one
-  test module per tool. It does not cover pure logic in isolation — e.g.
+  test module per tool. `tests/unit/` (added 2026-09-10) is the only pure-logic coverage
+  so far — `test_auth_errors.py`, for the sign-in failure reason tables and
+  profile-directory resolution. Other cheap pure-logic targets remain uncovered: e.g.
   `_build_recipient_list` handling empty/whitespace addresses, or `folder_id_dict()`
-  picking the right `__type` for a distinguished vs. opaque folder ID — both would be
-  cheap to unit test without a live mailbox and remain a gap.
+  picking the right `__type` for a distinguished vs. opaque folder ID.
 - **No live/manual QA log.** There's no record (changelog, issue tracker, etc.) of which
   of the 46 tools have actually been run against a real OWA mailbox since the
   browser-session rewrite. This document's "Manual QA / Status" column is a template for

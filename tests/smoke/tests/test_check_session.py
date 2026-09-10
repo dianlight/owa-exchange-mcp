@@ -1,12 +1,12 @@
 """Smoke test: session/login.
 
 Verifies the shared browser profile is authenticated by calling check_session.
-Startup (server.py's _startup) may still be mid-login in the background if
-EXCHANGE_MASTER_PASSWORD is set -- that path is separate from the `login`
-MCP tool's own pending-task tracking, so this test deliberately does NOT
-call the `login` tool itself (calling it while a startup login is still
-in flight would race two logins against the same browser context). It
-just polls check_session, which is cheap and read-only.
+Startup (server.py's _startup) may still be waiting on an interactive sign-in
+window in the background -- that path is separate from the `login` MCP tool's own
+pending-task tracking, so this test deliberately does NOT call the `login` tool
+itself (calling it while a startup login is still in flight would race two logins
+against the same browser context). It just polls check_session, which is cheap
+and read-only.
 
 Repeatable: read-only, no mailbox state is created or changed.
 

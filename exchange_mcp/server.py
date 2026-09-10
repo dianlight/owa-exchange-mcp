@@ -26,6 +26,7 @@ warnings.filterwarnings("ignore", category=IncompleteFieldDefinitionWarning)
 
 from mcp.server.fastmcp import FastMCP
 
+from exchange_mcp import auth_errors
 from exchange_mcp.browser_session import BrowserSession
 from exchange_mcp.owa_client import OWAClient
 
@@ -67,8 +68,8 @@ def _load_env_file() -> None:
     """Populate os.environ from .env.local, without overriding vars already set.
 
     Lets an unattended autostart process (Windows Task Scheduler, no shell
-    `export` to inherit from) pick up EXCHANGE_OWA_URL / EXCHANGE_MASTER_PASSWORD
-    the same way an MCP client's stdio `env` block does today.
+    `export` to inherit from) pick up EXCHANGE_OWA_URL and friends the same way
+    an MCP client's stdio `env` block does today.
     """
     env_path = Path(__file__).parent.parent / ".env.local"
     if not env_path.exists():
@@ -83,46 +84,60 @@ def _load_env_file() -> None:
             os.environ[key] = value.strip()
 
 
+# How long the startup sign-in window stays open waiting for a human, and how
+# long the `login` tool's own window waits. Generous on purpose: a real sign-in
+# means typing an address, a password, and approving a push on a phone.
+LOGIN_WINDOW_SECONDS = int(os.environ.get("EXCHANGE_LOGIN_TIMEOUT", "300"))
+
+
 async def _startup(browser: BrowserSession, client: OWAClient) -> None:
-    """Launch the browser and, if configured, log in — off the MCP handshake path.
+    """Launch the browser on the persistent profile and make sure it's signed in.
 
     Runs as a background task instead of inline in app_lifespan(): a cold
-    Chromium launch plus an interactive 2FA wait can take well past the
-    MCP client's connect timeout, so the handshake must complete before
-    any of this finishes. Tool calls that hit the browser wait for it
-    lazily (BrowserSession ensures its own context is up on first real use).
+    Chromium launch plus a human-paced interactive sign-in takes well past any
+    MCP client's connect timeout, so the handshake must complete before any of
+    this finishes. Tool calls that hit the browser wait for it lazily
+    (BrowserSession ensures its own context is up on first real use).
+
+    The flow is profile-first, with no credentials anywhere:
+    1. Reuse the profile directory if it exists, create it if it doesn't.
+    2. If that profile is still signed in (live OWA cookies, "stay signed in",
+       or an SSO session the SPA can mint a token from) - done, serve.
+    3. Otherwise open a *visible* browser window on the OWA sign-in page and wait
+       for the user to complete it, 2FA included.
+    4. If nobody completes it, keep serving anyway: tools report
+       `authorization_required` and the `login` tool reopens the window on
+       demand. A stdio server is often spawned while the user is away, and dying
+       for that reason would be worse than waiting to be asked.
     """
     try:
+        print(f"[exchange-mcp] Browser profile: {browser.profile_dir} "
+              f"({'reusing existing' if browser.profile_existed else 'creating new'})",
+              file=sys.stderr, flush=True)
         print("[exchange-mcp] Launching browser...", file=sys.stderr, flush=True)
         await asyncio.to_thread(browser.start)
 
-        master_password = os.environ.get("EXCHANGE_MASTER_PASSWORD")
-        if not master_password:
-            print("[exchange-mcp] No EXCHANGE_MASTER_PASSWORD set; starting without a session. "
-                  "Use the `login` tool to authenticate.", file=sys.stderr, flush=True)
-            return
-
-        from exchange_mcp.auth import CREDS_FILE, decrypt_credentials
-
-        if not CREDS_FILE.exists():
-            print("[exchange-mcp] EXCHANGE_MASTER_PASSWORD set but no stored credentials found "
-                  "(run login.py --setup).", file=sys.stderr, flush=True)
-            return
-
-        username, password = decrypt_credentials(master_password)
-        if not username:
-            print("[exchange-mcp] EXCHANGE_MASTER_PASSWORD set but could not decrypt credentials.",
+        if await asyncio.to_thread(browser.has_active_session):
+            print("[exchange-mcp] Profile is already authenticated; ready to serve.",
                   file=sys.stderr, flush=True)
             return
 
-        client.user_email = username
-        print(f"[exchange-mcp] Logging in as {username} (waiting for 2FA if prompted)...", file=sys.stderr, flush=True)
-        result = await asyncio.to_thread(browser.ensure_logged_in, username, password)
+        print("[exchange-mcp] Profile is not authenticated - opening a browser window for "
+              f"sign-in (waiting up to {LOGIN_WINDOW_SECONDS}s). Please sign in to OWA in that "
+              "window, 2FA included.", file=sys.stderr, flush=True)
+        result = await asyncio.to_thread(browser.interactive_login, LOGIN_WINDOW_SECONDS)
+
         if result.get("success"):
-            print("[exchange-mcp] Login successful.", file=sys.stderr, flush=True)
-        else:
-            print(f"[exchange-mcp] Login failed: {result.get('error')}. "
-                  "The `login` tool remains available.", file=sys.stderr, flush=True)
+            print(f"[exchange-mcp] {result.get('message', 'Signed in successfully.')}",
+                  file=sys.stderr, flush=True)
+            return
+
+        reason = result.get("reason") or auth_errors.LOGIN_TIMEOUT
+        print(f"[exchange-mcp] Sign-in not completed ({reason}): {result.get('error')}",
+              file=sys.stderr, flush=True)
+        print(f"[exchange-mcp] {auth_errors.remediation(reason)}", file=sys.stderr, flush=True)
+        print("[exchange-mcp] The server keeps running; tools will report that authorization "
+              "is required until then.", file=sys.stderr, flush=True)
     except Exception as exc:
         print(f"[exchange-mcp] Background startup failed: {exc}. "
               "The `login` tool remains available.", file=sys.stderr, flush=True)

@@ -12,15 +12,14 @@ Works with any on-premise or hosted Exchange server that exposes OWA.
 # Copy and edit the MCP config with your OWA URL
 cp .mcp.json.example .mcp.json
 
-# One-time: set up encrypted credentials
-python3 login.py --setup
-
-# Login (opens headless browser, 2FA approval required)
-python3 login.py
-
 # Install the MCP server
 pip install -e .
 ```
+
+There is no credential setup step. The first time the server starts it opens a
+browser window on your OWA sign-in page — sign in there (2FA included) and the
+session is saved in a persistent browser profile and reused from then on, across
+restarts.
 
 ## Install
 
@@ -29,8 +28,7 @@ Two ways to run the server, depending on whether you want it spawned per session
 ### Option A: stdio (spawned per client session)
 
 The client starts and stops the process itself. Simple, but every new session
-pays a cold Chromium start (and an interactive 2FA wait, if configured).
-Replace `https://owa.example.com` with your OWA URL.
+pays a cold Chromium start. Replace `https://owa.example.com` with your OWA URL.
 
 **Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`),
 **Cursor** (`.cursor/mcp.json`), or **Claude Code** (`.mcp.json`):
@@ -82,8 +80,8 @@ the process must already be listening before a client tries to connect.
 | Variable | Required | Description |
 |---|---|---|
 | `EXCHANGE_OWA_URL` | Yes | Base URL of your OWA instance |
-| `EXCHANGE_MASTER_PASSWORD` | No | If set, the server logs in automatically at startup using stored encrypted credentials (waits through 2FA before serving) |
-| `EXCHANGE_BROWSER_PROFILE_DIR` | No | Path to the persistent browser profile directory (default: `.browser-profile/` next to the package) |
+| `EXCHANGE_BROWSER_PROFILE_DIR` | No | Path to the persistent browser profile directory (default: `~/owa-mcp/.browser-profile`, or `<repo>/.browser-profile` when running from a source checkout) |
+| `EXCHANGE_LOGIN_TIMEOUT` | No | Seconds the sign-in window waits for you before giving up (default `300`) |
 | `EXCHANGE_HEADLESS` | No | Set to `false`/`0` to run the browser with a visible window (same effect as `--show-browser`) |
 | `EXCHANGE_MCP_TRANSPORT` | No | `stdio` (default) or `http`. Same effect as `--transport`. |
 | `EXCHANGE_MCP_HOST` | No | Bind host for `--transport http` (default `127.0.0.1` — keep it on loopback, see [Security](#security)) |
@@ -119,40 +117,52 @@ debugging a stuck call.
 
 ## Login
 
-### Option A: Automatic at startup (recommended)
+The server holds **no credentials** — no stored password, no master password, no
+setup step, no login script. The persistent browser profile *is* the session.
 
-Set `EXCHANGE_MASTER_PASSWORD` in your MCP client config's `env` block. The
-server decrypts stored credentials and logs in before it starts serving
-tool calls (blocking through any 2FA approval, up to ~90 seconds). Run
-`python3 login.py --setup` once beforehand to store the encrypted
-credentials.
+### How it works
 
-### Option B: Via MCP tool
+1. On start, the server looks for its browser profile directory
+   (`EXCHANGE_BROWSER_PROFILE_DIR`, else `~/owa-mcp/.browser-profile`). It reuses
+   that profile if it exists and creates it if it doesn't.
+2. If the profile is still signed in — live OWA cookies, Microsoft's "stay signed
+   in" cookie, or an SSO session the web client can still use — the server just
+   serves. Nothing is shown, nothing is asked.
+3. If it isn't, the server **opens a visible browser window** on your OWA sign-in
+   page and waits (default 300s, `EXCHANGE_LOGIN_TIMEOUT`). You sign in there:
+   address, password, 2FA. Nothing is typed for you.
+4. That window stays visible for the rest of the server's lifetime after a
+   successful sign-in; restart the server to go back to headless.
 
-The `login` tool handles credential setup and authentication within the MCP session — no separate terminal needed.
+### If you're not at the keyboard
 
-First time (setup + login):
+The server keeps running. Tools return `"authorization_required": true` with a
+`reason` and a `remediation` string, and the `login` tool reopens the sign-in
+window whenever you're ready:
+
 ```
-login(master_password="...", username="user@example.com", password="...")
+login()          # opens the window, returns immediately
+                 # ... you sign in there ...
+login()          # confirms the session is live
+login(force=true)  # open the window even if the session looks fine (switch accounts)
 ```
 
-Subsequent logins (decrypts stored credentials):
-```
-login(master_password="...")
-```
+`login` is deliberately two-call: a real sign-in takes minutes, longer than an
+MCP client will hold a request open. `check_session` reports the same fields
+without opening anything.
 
-### Option C: Via CLI
+### When a sign-in doesn't complete
 
-```bash
-python3 login.py --setup   # First time: save encrypted credentials
-python3 login.py            # Login with 2FA
-```
+The sign-in page is read once, on timeout, to explain what happened —
+`exchange_mcp/auth_errors.py` recognizes Entra ID `AADSTS` codes plus on-prem
+ADFS/OWA wording, and maps them to a reason and a fix: expired or must-change
+password, locked or disabled account, unrecognized account, denied MFA prompt,
+MFA enrollment needed, conditional-access block. Anything unrecognized is
+reported honestly as a plain timeout rather than guessed at.
 
-All methods drive the same persistent browser profile: submit credentials,
-wait for 2FA approval (up to 90 seconds), and leave the session live in that
-profile for the MCP server to pick up. Credentials are encrypted at rest
-with AES-256 (PBKDF2 key derivation, 480k iterations); the browser profile
-itself holds the live session (cookies) the way a real browser would.
+Note that this is *diagnosis only*. The login window never aborts early on an
+error message: you're sitting in front of it, so a mistyped password or an
+accidentally denied push is something you just retry there.
 
 ## Tools (46)
 
@@ -246,12 +256,11 @@ for the current (unverified, pending a live discovery spike) status.
 ## Files
 
 ```
-login.py                  # Browser-based 2FA login (standalone CLI)
 exchange_mcp/
   server.py               # FastMCP server entry point
-  browser_session.py      # Persistent Chromium context shared by every OWA call
+  browser_session.py      # Persistent Chromium context + interactive sign-in
   owa_client.py           # OWA API client (delegates transport to BrowserSession)
-  auth.py                 # Async login logic (shared by MCP tool)
+  auth_errors.py          # Diagnosis of a timed-out sign-in (reasons + remediation)
   tools/
     email.py              # Email tools
     calendar.py           # Calendar tools
@@ -260,20 +269,22 @@ exchange_mcp/
     folders.py            # Folder management & session check
     availability.py       # Free time / meeting time
     analytics.py          # Meeting stats & contacts
-    auth.py               # Login tool
+    auth.py               # Login tool (opens the sign-in window)
     copilot.py            # Copilot chat-pane delegation (UI automation)
+tests/
+  unit/                   # Pure-logic tests (no mailbox, no browser)
+  smoke/                  # Live-mailbox end-to-end tests, one module per tool
 pyproject.toml            # Package config
 ```
 
 ## Warning
 
-Every Exchange / OWA deployment has its own authentication setup — some require 2FA (push notifications, TOTP, SMS), others use single-factor login or SSO. The login logic in this project (`login.py` and `exchange_mcp/auth.py`) is written for a specific 2FA flow (mobile push approval). If your OWA server uses a different 2FA method or no 2FA at all, you will need to modify or remove the login logic to match your environment.
+Every Exchange / OWA deployment has its own authentication setup — 2FA (push notifications, TOTP, SMS), single-factor, SSO, smartcards. Because the server no longer types anything into the sign-in page (you do, in a real browser window), whatever your deployment asks for should work as-is. What *is* deployment-specific is how the session is detected afterwards: `BrowserSession._async_has_active_session` looks for an `X-OWA-CANARY` cookie (classic OWA) or a Bearer token the modern Outlook web client can mint (see `auth_mode`). A deployment that signals its session some other way would need that check extended.
 
 ## Security
 
-- Credentials encrypted at rest with AES-256-Fernet (PBKDF2, 480,000 iterations)
-- Master password never stored
-- Credential files have `0600` permissions
+- **No credentials are stored anywhere** — no password file, no master password,
+  no keychain entry. The only secret at rest is the browser profile itself.
 - The browser profile directory holds the live session the same way a
   logged-in browser normally would; treat it like a browser profile
   (don't share it, exclude it from backups you'd share)
@@ -286,6 +297,5 @@ Every Exchange / OWA deployment has its own authentication setup — some requir
   Any local process that can reach the port has the same mailbox access a
   spawned stdio process had before — this is a longer-lived process, not a
   wider trust boundary, but it's worth being deliberate about.
-- `.env.local` holds `EXCHANGE_MASTER_PASSWORD` in plaintext on disk — same
-  trade-off as passing it via a client's `env` block today. It's gitignored;
-  don't check it in or share it.
+- `.env.local` holds only non-secret configuration now (OWA URL, port, profile
+  path). It's still gitignored.

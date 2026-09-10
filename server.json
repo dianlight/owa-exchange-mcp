@@ -7,12 +7,12 @@
     "url": "https://github.com/dianlight/owa-exchange-mcp",
     "source": "github"
   },
-  "version": "2.0.0-beta.0",
+  "version": "2.0.0b1",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "exchange-mcp-server",
-      "version": "2.0.0-beta.0",
+      "version": "2.0.0b1",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
@@ -25,12 +25,12 @@
         },
         {
           "name": "EXCHANGE_BROWSER_PROFILE_DIR",
-          "description": "Path to the persistent browser profile directory (default: .browser-profile)",
+          "description": "Path to the persistent browser profile directory (default: ~/owa-mcp/.browser-profile)",
           "required": false
         },
         {
-          "name": "EXCHANGE_MASTER_PASSWORD",
-          "description": "Master password to auto-login at startup using stored encrypted credentials",
+          "name": "EXCHANGE_LOGIN_TIMEOUT",
+          "description": "Seconds the interactive sign-in window waits for the user (default: 300)",
           "required": false
         },
         {

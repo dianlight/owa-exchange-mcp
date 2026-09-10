@@ -25,11 +25,49 @@ import time
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
+from exchange_mcp.auth_errors import (  # noqa: F401  (re-exported for callers)
+    INTERACTIVE_LOGIN_REQUIRED,
+    LOGIN_TIMEOUT,
+    TRANSIENT,
+    VISIBLE_ERROR_SELECTORS,
+    AuthenticationRequiredError,
+    classify_login_failure,
+)
+
+# Where the persistent Chromium profile lives when EXCHANGE_BROWSER_PROFILE_DIR
+# isn't set. An installed package must not write into site-packages, so it uses
+# a stable per-user location; a source checkout keeps its profile in the repo so
+# a developer's signed-in session and their working tree stay together.
+_INSTALLED_PROFILE_DIR = Path.home() / "owa-mcp" / ".browser-profile"
+
+
+def default_profile_dir() -> Path:
+    """Resolve the default profile directory for this deployment.
+
+    A source checkout is detected by pyproject.toml sitting next to the package
+    directory - true for `python -m exchange_mcp.server` from the repo, false for
+    the installed `exchange-mcp-server` console script (whose package lives in
+    site-packages, where writing a browser profile would be wrong and often
+    unwritable).
+    """
+    package_parent = Path(__file__).resolve().parent.parent
+    if (package_parent / "pyproject.toml").exists():
+        return package_parent / ".browser-profile"
+    return _INSTALLED_PROFILE_DIR
+
+
 _CRASH_HINTS = (
     "target closed",
     "browser has been closed",
     "connection closed",
     "has been closed",
+    # The context/anchor page is briefly None while _async_relaunch swaps
+    # headless mode, so a tool call landing in that window sees an
+    # AttributeError on None rather than a Playwright error. That used to only
+    # happen after a genuine crash; since the interactive login relaunches
+    # visible as a matter of course, it's now a routine (if narrow) race, and
+    # _run_with_recovery's relaunch-and-retry-once is exactly the right handling.
+    "'nonetype' object has no attribute",
 )
 
 # Copilot has no documented API - text hints scraped from its own chat pane
@@ -90,10 +128,18 @@ class BrowserSession:
     def __init__(self, owa_url: str, headless: bool = True, profile_dir: str | Path | None = None):
         self.owa_url = owa_url.rstrip("/")
         self.owa_host = urlparse(self.owa_url).netloc
+
+        # `headless` is the *preference*, not necessarily the current state: an
+        # interactive login has to be visible, so it relaunches the context with
+        # headless=False (see interactive_login). self.headless always reflects
+        # how the live context was actually launched.
+        self.headless_preference = headless
         self.headless = headless
-        self.profile_dir = Path(profile_dir) if profile_dir else (
-            Path(__file__).parent.parent / ".browser-profile"
-        )
+
+        self.profile_dir = Path(profile_dir).expanduser() if profile_dir else default_profile_dir()
+        # Recorded before anything creates it, so startup can honestly report
+        # "reusing an existing profile" vs. "created a new one".
+        self.profile_existed = self.profile_dir.exists()
 
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="owa-browser")
@@ -104,9 +150,7 @@ class BrowserSession:
         self._anchor_page = None
         self._context_closed = True  # forces a launch on first use
         self._launch_lock: asyncio.Lock | None = None  # created lazily, on the browser loop
-
-        self._cached_username: str | None = None
-        self._cached_password: str | None = None
+        self._login_lock: asyncio.Lock | None = None  # created lazily, on the browser loop
 
         # "Modern Outlook" (e.g. outlook.cloud.microsoft) auth: some tenants
         # have migrated to a backend that ignores the classic X-OWA-CANARY
@@ -203,17 +247,28 @@ class BrowserSession:
             try:
                 await self._anchor_page.goto(f"{self.owa_url}/owa/", wait_until="commit", timeout=30000)
             except Exception:
-                pass  # ensure_logged_in() will retry navigation as needed
+                pass  # _async_warm_anchor() re-navigates as needed
 
     def _on_context_closed(self) -> None:
         self._context_closed = True
 
-    async def _async_shutdown(self) -> None:
+    async def _async_shutdown_context(self) -> None:
+        """Close just the browser context, keeping the Playwright driver alive.
+
+        Used by _async_relaunch to switch headless mode on the same profile -
+        closing the context flushes cookies to disk, so the session survives.
+        """
         if self._context is not None:
             try:
                 await self._context.close()
             except Exception:
                 pass
+        self._context = None
+        self._anchor_page = None
+        self._context_closed = True
+
+    async def _async_shutdown(self) -> None:
+        await self._async_shutdown_context()
         if self._playwright is not None:
             try:
                 await self._playwright.stop()
@@ -238,106 +293,196 @@ class BrowserSession:
         checking whether the SPA can still mint a live Bearer token on its
         own, which fails (times out) if a login page is actually showing.
         """
+        await self._async_ensure_context()
         if await self._async_is_session_valid():
             return True
         return await self._async_capture_bearer_context()
 
-    async def _async_ensure_logged_in(self, username: str | None, password: str | None) -> dict:
+    async def _async_warm_anchor(self) -> None:
+        """Navigate the anchor page to /owa/ so a session check can be trusted.
+
+        Shared by every session check and by the interactive login, because the
+        touch itself is load-bearing on the modern Outlook backend - see
+        _async_ensure_logged_in's docstring for why.
+        """
         await self._async_ensure_context()
-        page = self._anchor_page
         try:
-            await page.goto(f"{self.owa_url}/owa/", wait_until="networkidle", timeout=30000)
+            await self._anchor_page.goto(f"{self.owa_url}/owa/", wait_until="networkidle", timeout=30000)
         except Exception:
-            pass
+            pass  # the caller retries navigation as needed
 
-        # On the modern Outlook backend, the *first* top-level navigation to
-        # /owa/ on a freshly-launched page reliably lands on an interactive
-        # login/account-selection redirect even with a perfectly valid SSO
-        # session - it's only a *second* touch of the page (the reload()
-        # inside _async_capture_bearer_context, below) that lets the SPA
-        # silently reacquire a token. So the goto above is required warm-up,
-        # not something to skip even when we suspect we're already logged in.
+    async def _async_probe_active_session(self) -> bool:
+        await self._async_warm_anchor()
+        return await self._async_has_active_session()
+
+    async def _async_ensure_logged_in(self) -> dict:
+        """Silent re-auth only: confirm (or silently re-acquire) a session.
+
+        There is no password to submit anywhere in this server, so this can only
+        ever succeed on signals the profile already carries - live OWA cookies,
+        Microsoft's "stay signed in" cookie, or an SSO session the SPA can still
+        mint a Bearer token from. When it fails, the only way forward is an
+        interactive sign-in (interactive_login), which a human has to drive.
+
+        The warm-up navigation matters and isn't skippable: on the modern Outlook
+        backend the *first* top-level navigation to /owa/ on a freshly-launched
+        page lands on an interactive login/account-selection redirect even with a
+        perfectly valid SSO session - only a *second* touch of the page (the
+        reload() inside _async_capture_bearer_context) lets the SPA silently
+        reacquire a token.
+        """
+        await self._async_warm_anchor()
         if await self._async_has_active_session():
-            return {"success": True, "message": "Session already active."}
+            return {"success": True, "message": "Session active."}
+        return {
+            "success": False,
+            "error": "The browser profile has no usable OWA session.",
+            "reason": INTERACTIVE_LOGIN_REQUIRED,
+        }
 
-        username = username or self._cached_username
-        password = password or self._cached_password
-        if not username or not password:
+    async def _async_detect_login_failure(self, page) -> tuple[str, str] | None:
+        """Read the sign-in page's error surface and classify it (see auth_errors).
+
+        Runs only after an interactive login has already timed out, purely to
+        explain why. Text is collected from the page's rendered error containers
+        rather than the whole document: the AAD sign-in page ships hidden
+        templates whose wording ("update your password", ...) is present even on
+        a perfectly healthy page.
+        """
+        fragments: list[str] = []
+        for selector in VISIBLE_ERROR_SELECTORS:
+            try:
+                locator = page.locator(selector)
+                for i in range(min(await locator.count(), 3)):
+                    node = locator.nth(i)
+                    if not await node.is_visible(timeout=500):
+                        continue
+                    text = (await node.inner_text(timeout=500) or "").strip()
+                    if text and text not in fragments:
+                        fragments.append(text)
+            except Exception:
+                continue
+
+        try:
+            html = await page.content()
+        except Exception:
+            html = ""
+        try:
+            url = page.url
+        except Exception:
+            url = ""
+
+        return classify_login_failure(page_text=" ".join(fragments), page_url=url, page_html=html)
+
+    async def _async_relaunch(self, headless: bool) -> None:
+        """Close the context and launch it again on the same profile, changing headless mode.
+
+        The profile directory is what carries the session, so closing and
+        relaunching keeps whatever we were signed into - context.close() flushes
+        cookies to disk on the way out.
+        """
+        await self._async_shutdown_context()
+        # Chromium releases the profile's singleton lock as its process exits,
+        # which trails context.close() slightly. Relaunching into that gap fails
+        # with a lock error that looks like an unrelated crash (PROJECT_STATUS.md
+        # §4), so give it a moment.
+        await asyncio.sleep(1)
+        self.headless = headless
+        await self._async_ensure_context()
+
+    async def _async_interactive_login(self, timeout: float, poll_seconds: float) -> dict:
+        """Open a visible sign-in window and wait for the user to complete it.
+
+        This is the only login path left: the server has no credentials to type,
+        so a human (or their SSO/2FA devices) does the actual signing in. We just
+        make the window visible, park it on the OWA sign-in page, and poll until a
+        session materializes.
+
+        Deliberately does *not* bail out early on a recognized error. Someone is
+        sitting in front of this window: a mistyped password, an accidentally
+        denied MFA push, or a redirect to a change-password page are all things
+        they can just carry on from. Aborting on the first error text would cut
+        them off mid-sign-in. Classification happens once, on timeout, only to
+        explain what the page was showing when we gave up.
+        """
+        if self._login_lock is None:
+            self._login_lock = asyncio.Lock()
+
+        async with self._login_lock:
+            # Another caller may have finished a login while we waited on the lock.
+            if await self._async_probe_active_session():
+                return {"success": True, "message": "Session active.", "browser_shown": False}
+
+            if self.headless:
+                await self._async_relaunch(headless=False)
+
+            page = self._anchor_page
+            try:
+                await page.bring_to_front()
+            except Exception:
+                pass
+            await self._async_warm_anchor()
+
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                await asyncio.sleep(poll_seconds)
+                try:
+                    if await self._async_has_active_session():
+                        # Left visible on purpose: relaunching headless here would
+                        # mean tearing down the context seconds after the session
+                        # landed in it, and a window on screen is a much cheaper
+                        # failure mode than a login that doesn't stick. Restart the
+                        # server to get back to headless.
+                        return {
+                            "success": True,
+                            "message": "Signed in successfully. The browser window stays visible "
+                                       "for the rest of this server's lifetime; restart the server "
+                                       "to return to headless.",
+                            "browser_shown": True,
+                        }
+                except Exception:
+                    continue  # mid-navigation; try again on the next tick
+
+            failure = await self._async_detect_login_failure(page)
+            if failure:
+                reason, message = failure
+                return {"success": False, "error": message, "reason": reason, "browser_shown": True}
             return {
                 "success": False,
-                "error": "No active session and no credentials available to log in.",
+                "error": f"Sign-in was not completed within {int(timeout)} seconds.",
+                "reason": LOGIN_TIMEOUT,
+                "browser_shown": True,
             }
 
-        result = await self._async_run_login_flow(page, username, password)
-        if result.get("success"):
-            self._cached_username = username
-            self._cached_password = password
-        return result
+    def ensure_logged_in(self, timeout: float = 120) -> dict:
+        """Confirm or silently re-acquire a session. Never opens a window, never raises.
 
-    async def _async_run_login_flow(self, page, username: str, password: str) -> dict:
-        """Same interactive flow already debugged in login.py, run on the anchor tab."""
-        try:
-            await page.fill('input[name="loginfmt"]', username)
-            try:
-                await page.click("#idSIButton9", timeout=5000)
-            except Exception:
-                await page.press('input[name="loginfmt"]', "Enter")
-            await page.wait_for_load_state("networkidle")
+        Returns {"success": True, ...} or {"success": False, "error", "reason"}.
+        Callers that need a session and can't get one this way should surface
+        AuthenticationRequiredError (see OWAClient._relogin_or_raise) rather than
+        popping up a browser window inside an unrelated tool call.
+        """
+        return self._run_with_recovery(self._async_ensure_logged_in, timeout=timeout)
 
-            await page.wait_for_selector('input[name="passwd"]', state="visible", timeout=15000)
-            await page.fill('input[name="passwd"]', password)
-            try:
-                await page.click("#idSIButton9", timeout=5000)
-            except Exception:
-                await page.press('input[name="passwd"]', "Enter")
-            await page.wait_for_load_state("networkidle")
+    def interactive_login(self, timeout: float = 300, poll_seconds: float = 2) -> dict:
+        """Show a browser window and wait up to `timeout` seconds for a sign-in.
 
-            kmsi_handled = False
-            for _ in range(90):  # wait up to 90s for mobile MFA approval
-                await asyncio.sleep(1)
-                try:
-                    url = page.url
-
-                    if urlparse(url).netloc == self.owa_host and "ofam" not in url and "adfs" not in url:
-                        try:
-                            await page.wait_for_load_state("networkidle", timeout=15000)
-                        except Exception:
-                            pass
-                        for _ in range(15):
-                            if await self._async_is_session_valid():
-                                break
-                            await asyncio.sleep(1)
-                        return {"success": True, "message": "Login successful."}
-
-                    if not kmsi_handled:
-                        try:
-                            if (
-                                await page.locator('input[name="passwd"]').count() == 0
-                                and await page.locator("#idSIButton9").is_visible(timeout=1000)
-                            ):
-                                await page.click("#idSIButton9", timeout=5000)
-                                kmsi_handled = True
-                                await page.wait_for_load_state("networkidle", timeout=15000)
-                        except Exception:
-                            pass
-                except Exception as e:
-                    err = str(e).lower()
-                    if any(k in err for k in ("navigation", "destroyed", "target closed")):
-                        try:
-                            await page.wait_for_load_state("load", timeout=15000)
-                            if urlparse(page.url).netloc == self.owa_host and "ofam" not in page.url:
-                                return {"success": True, "message": "Login successful."}
-                        except Exception:
-                            pass
-
-            return {"success": False, "error": "2FA approval not received within 90 seconds."}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-
-    def ensure_logged_in(self, username: str | None = None, password: str | None = None, timeout: float = 120) -> dict:
+        Blocking: call it from a worker thread (asyncio.to_thread) or a background
+        task, never inline in an MCP request handler - `timeout` is minutes, not
+        milliseconds. The extra 30s on the internal deadline lets the coroutine's
+        own timeout report a proper reason instead of dying on _run()'s wait.
+        """
         return self._run_with_recovery(
-            lambda: self._async_ensure_logged_in(username, password), timeout=timeout
+            lambda: self._async_interactive_login(timeout, poll_seconds), timeout=timeout + 30
         )
+
+    def has_active_session(self, timeout: float = 120) -> bool:
+        """True if the persistent profile is still signed in, in either auth mode.
+
+        The startup check: "can we reuse this profile as-is, or does someone have
+        to sign in?"
+        """
+        return self._run_with_recovery(self._async_probe_active_session, timeout=timeout)
 
     # ------------------------------------------------------------------
     # JSON requests

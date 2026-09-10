@@ -8,7 +8,7 @@ import json
 from mcp.server.fastmcp import Context
 
 from exchange_mcp.server import mcp, AppContext
-from exchange_mcp.owa_client import OWAClient
+from exchange_mcp.owa_client import AuthenticationRequiredError, OWAClient
 
 
 _HEADER_TZ = {
@@ -78,6 +78,18 @@ def check_session(ctx: Context = None) -> str:
 
     try:
         data = client.request("FindFolder", payload)
+    except AuthenticationRequiredError as e:
+        # The stored authorization itself is dead (password changed/expired,
+        # account locked, MFA denied) - report that explicitly instead of as a
+        # generic failure, so the caller knows a retry can't help.
+        return json.dumps({
+            "authenticated": False,
+            "error": str(e),
+            "reason": e.reason,
+            "authorization_required": True,
+            "remediation": e.remediation,
+            "cookie_file": str(client.cookie_file),
+        })
     except Exception as e:
         return json.dumps({
             "authenticated": False,
