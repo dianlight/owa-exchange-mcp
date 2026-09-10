@@ -577,14 +577,14 @@ throwaway venv and resolving `default_profile_dir()` from outside the repo →
   `--stable` CLI flag / `EXCHANGE_MCP_STABLE` env var excludes from the MCP tool listing at
   startup — keep the two in sync (see CLAUDE.md's "Maintaining PROJECT_STATUS.md" section).
 
-## 3. Tool inventory (46 tools across 9 modules)
+## 3. Tool inventory (48 tools across 9 modules)
 
-### Email — [exchange_mcp/tools/email.py](exchange_mcp/tools/email.py) (14)
+### Email — [exchange_mcp/tools/email.py](exchange_mcp/tools/email.py) (15)
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 101 | `get_emails` | List emails from a folder, grouped by conversation/thread, with unread/pagination filters | `tests/smoke/tests/test_get_emails.py` | OK (2026-09-07) | Stable |
-| 102 | `get_email` | Get a single email's full body, recipients, and attachments | `tests/smoke/tests/test_get_email_detail.py` | OK (2026-09-07) | Stable |
+| 101 | `get_emails` | List emails from a folder, grouped by conversation/thread, with unread/pagination filters; each row includes `flag_status`, and `body_error` when `include_body=True` could not fetch that row | `tests/smoke/tests/test_get_emails.py`, `tests/smoke/tests/test_email_flag.py`, `tests/smoke/tests/test_unfetchable_item_resilience.py` | OK (2026-09-10) — `flag_status` on every row; `include_body=True` now degrades individual unfetchable rows instead of failing the whole page (verified 10 rows / 8 bodies / 2 degraded) | Stable |
+| 102 | `get_email` | Get a single email's full body, recipients, attachments, and `flag_status` (follow-up flag) | `tests/smoke/tests/test_get_email_detail.py`, `tests/smoke/tests/test_email_flag.py` | OK (2026-09-10) — `flag_status` verified round-tripping all three states. Fails for the handful of messages OWA cannot serialise (nothing to degrade to for a single item); now returns an explanatory `hint`, see §4. `test_get_email_detail` is flaky when it happens to pick one. | Stable |
 | 103 | `send_email` | Send a new email (to/cc/bcc, HTML or plain text) | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
 | 104 | `reply_email` | Reply (or reply-all) to an email | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
 | 105 | `forward_email` | Forward an email to new recipients | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
@@ -593,16 +593,17 @@ throwaway venv and resolving `default_profile_dir()` from outside the repo →
 | 108 | `delete_email` | Delete (soft or permanent) one or more emails | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
 | 109 | `download_attachments` | Download all file attachments from an email to disk | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
 | 110 | `get_email_links` | Extract hyperlinks from an email's HTML body | `tests/smoke/tests/test_get_email_detail.py` | OK (2026-09-07) | Stable |
-| 111 | `assign_email_categories` | Add one or more categories to emails, keeping any already present | `tests/smoke/tests/test_email_category_tagging.py` | OK (2026-09-08) | Stable |
-| 112 | `remove_email_categories` | Remove one or more categories from emails, keeping any others present | `tests/smoke/tests/test_email_category_tagging.py` | OK (2026-09-08) | Stable |
+| 111 | `assign_email_categories` | Add one or more categories to emails, keeping any already present; reports `updated_count`/`failed_count`/`failed` and skips items whose details can't be read | `tests/smoke/tests/test_email_category_tagging.py` | OK (2026-09-10) — per-item resilience verified (`tests/smoke/tests/test_unfetchable_item_resilience.py`) | Stable |
+| 112 | `remove_email_categories` | Remove one or more categories from emails, keeping any others present; reports `updated_count`/`failed_count`/`failed` and skips items whose details can't be read | `tests/smoke/tests/test_email_category_tagging.py` | OK (2026-09-10) — per-item resilience verified (`tests/smoke/tests/test_unfetchable_item_resilience.py`) | Stable |
 | 113 | `find_emails_by_category` | Find email conversations tagged with a given category | `tests/smoke/tests/test_email_category_tagging.py` | OK (2026-09-08) | Stable |
 | 114 | `search_emails` | Full-text search for emails, scoped to one folder or the whole mailbox. Tries EWS `FindItem`/`QueryString` (AQS syntax: `subject:`, `from:`, `body:`, `received:`, etc.) first, then transparently falls back to a client-side scan (reduced keyword subset: bare terms, `subject:`, `from:`, `category:`, `isread:`, `hasattachment:`) — this tenant's content index never returns AQS results, and `FindItem`'s `Traversal:"Deep"` is unsupported outright, so `search_all_folders` enumerates folders via `FindFolder`/`Deep` (like `get_folders`) and searches each one `Shallow` | `tests/smoke/tests/test_search_emails.py` | OK (2026-09-09) — single-folder AQS-empty + fallback, and `search_all_folders=True` across folders, both verified live; fixed `folder_id` always returning empty (`FindItem`'s `AdditionalProperties` needs the namespaced `item:ParentFolderId` FieldURI, not bare `ParentFolderId`) — re-verified non-empty `folder_id` live via the fallback path | Stable |
+| 115 | `set_email_flag` | Set the follow-up flag (`NotFlagged`/`Flagged`/`Complete`) on one or more emails, via `UpdateItem`/`SetItemField` on `item:Flag` | `tests/smoke/tests/test_email_flag.py` | OK (2026-09-10) — all three states written and read back successfully. The wire encoding is fussy: only `FieldURI: "item:Flag"` paired with `__type: "FlagType:#Exchange"` is accepted; `message:Flag` (either `__type`) returns "Invalid argument used to call method UpdateItem", and PidLidFlagStatus 0x8530 as an ExtendedFieldURI is rejected in every spelling tried. Invalid `flag_status` rejected client-side. | Stable |
 
-### Calendar — [exchange_mcp/tools/calendar.py](exchange_mcp/tools/calendar.py) (10)
+### Calendar — [exchange_mcp/tools/calendar.py](exchange_mcp/tools/calendar.py) (11)
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 201 | `get_calendar_events` | List events in a date range (a recurring series appears once, as its master item, not expanded per occurrence) | `tests/smoke/tests/test_get_calendar_events.py` | OK (2026-09-08, re-verified) — see "Update 2026-09-08 (continued) — get_calendar_events returned empty results" below | Stable |
+| 201 | `get_calendar_events` | List events in a date range, including each event's `categories`. By default a recurring series appears once, as its master item; `expand_recurrences=True` additionally synthesizes one entry per occurrence client-side (marked `is_synthesized_occurrence`, empty `item_id` — see §4) | `tests/smoke/tests/test_get_calendar_events.py`, `tests/smoke/tests/test_calendar_event_detail.py`, `tests/smoke/tests/test_recurrence_expansion.py`, `tests/unit/test_recurrence_expansion.py` | OK (2026-09-10) — `categories` verified round-tripping a real tag; `expand_recurrences` verified live (46 synthesized occurrences over 14 days, all in-window, all `item_id`-less, no duplicated masters, correct time-of-day) and all 127 recurring series in this mailbox expand, relative patterns included | Stable |
 | 202 | `create_meeting` | Create a meeting with attendees, location, reminder, sensitivity | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
 | 203 | `update_meeting` | Update a meeting (implemented as cancel + recreate — OWA JSON API has no reliable `UpdateItem` for calendar items) | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
 | 204 | `cancel_meeting` | Cancel a meeting and notify attendees (soft-delete only — moves to Deleted Items, no permanent-delete option) | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
@@ -612,6 +613,7 @@ throwaway venv and resolving `default_profile_dir()` from outside the repo →
 | 208 | `assign_event_categories` | Add one or more categories to events, keeping any already present | `tests/smoke/tests/test_calendar_category_tagging.py` | OK (2026-09-08) — fixed by switching `_set_event_categories` to the bespoke `UpdateCalendarEvent` action captured from OWA's own web client; see "Update 2026-09-08 (continued) — fixed the category write-path" below. | Stable |
 | 209 | `remove_event_categories` | Remove one or more categories from events, keeping any others present | `tests/smoke/tests/test_calendar_category_tagging.py` | OK (2026-09-08) — same fix as `assign_event_categories` above (shares `_set_event_categories`). | Stable |
 | 210 | `find_events_by_category` | Find events tagged with a given category within a date range | `tests/smoke/tests/test_calendar_category_tagging.py` | OK (2026-09-08, re-verified) — pure `FindItem`+`CalendarView` read, unaffected by the write-path bug above; its date-range filtering had the same silent no-op bug as `get_calendar_events` (see below) and is now fixed by the same client-side filter. | Stable |
+| 211 | `get_calendar_event` | Get full details for a single calendar event by ItemId (subject, start/end, location, body, organizer, attendees, categories, change_key, recurrence) | `tests/smoke/tests/test_calendar_event_detail.py` | OK (2026-09-10) — verified against a disposable tagged event: subject/start/end/categories/change_key all returned, assigned category round-tripped, bogus item_id rejected cleanly | Stable |
 
 ### Categories — [exchange_mcp/tools/categories.py](exchange_mcp/tools/categories.py) (4)
 
@@ -672,15 +674,65 @@ throwaway venv and resolving `default_profile_dir()` from outside the repo →
 
 ## 4. Gaps worth closing
 
+- **`expand_recurrences`: all recurrence patterns in this mailbox now expand; the
+  remaining limit is cost.** The `Recurrence` schema is confirmed (2026-09-10, across all 127
+  series here) and documented in `_expand_recurrence_occurrences`: this backend nests the
+  variant in a `__type` field under fixed `RecurrencePattern`/`RecurrenceRange` keys rather
+  than using it as the key the way plain-EWS JSON does, and range dates are
+  date-plus-offset with no time (`"2026-07-22+02:00"`), so the master's own `Start` supplies
+  the time-of-day. Relative patterns ("2nd Wednesday of the month") were initially skipped
+  and are **now implemented** — daily / weekly / absolute-monthly / absolute-yearly /
+  relative-monthly / relative-yearly, i.e. **127 of 127 series expandable** (was 123).
+  EWS's pseudo-days (`Day`/`Weekday`/`WeekendDay` in `DaysOfWeek`) are still not expanded:
+  none occur here and each means something other than a plain weekday, so they degrade to
+  no occurrences rather than inventing dates. Covered by
+  `tests/unit/test_recurrence_expansion.py` (pure logic, exact dates, real payloads) and
+  `tests/smoke/tests/test_recurrence_expansion.py` (live).
+  **Still open — cost:** expansion is O(recurring masters in the whole folder), not
+  O(events in the window), because a master's `Start` describes only its first occurrence
+  so every master must be fetched to know whether it lands in the window: one `GetItem`
+  each, ~20-30s for ~100 masters. Also note synthesized occurrences deliberately carry an
+  **empty `item_id`** and cannot be passed to any mutating tool; act on the series via the
+  master row.
+- **The follow-up-flag write encoding is load-bearing and non-obvious.** Solved by
+  elimination against a live mailbox 2026-09-10. Only `SetItemField` with
+  `Path.FieldURI = "item:Flag"` **and** `Item.Flag.__type = "FlagType:#Exchange"` is
+  accepted. Rejected: `message:Flag` with either `Flag:#Exchange` or `FlagType:#Exchange`
+  ("Invalid argument used to call method UpdateItem"); and `PidLidFlagStatus`
+  (PSETID_Common 0x8530) as an ExtendedFieldURI in every spelling tried
+  (`PathToExtendedFieldType`/`ExtendedPropertyUri` x `DistinguishedPropertySetId`/literal
+  `PropertySetId` GUID, plus a `PropertyTag` for PidTagFollowupIcon) — those return
+  ErrorCode 500 or "the combination of extended property attributes is not valid". No
+  extended-property write of any kind has ever succeeded against this backend, so treat
+  `ExtendedFieldURI` as unavailable here rather than as a fallback.
+  `tests/smoke/tests/test_email_flag.py` guards the working encoding.
+- **Some messages cannot be fetched at all (server-side), now contained.** At least two
+  messages in this Inbox make OWA's own `GetItem` throw
+  `System.Runtime.Serialization.SerializationException` (HTTP 500) — both meeting-related
+  items, and pre-existing/unrelated to any change here (ruled out as a `set_email_flag`
+  side effect: one was already failing before any flag write succeeded, a message with
+  three *successful* flag writes still reads fine, and one with only *failed* writes also
+  still reads fine). There is no client-side fix for the fault itself. **Fixed 2026-09-10** is the
+  collateral damage: `_try_get_item_details` now lets any per-item loop skip one bad item,
+  so `get_emails(include_body=True)` returns the rest of the page with `body_error` set on
+  just the affected rows (verified: `limit=10` returns 10 rows, 8 with bodies, 2 degraded),
+  and `assign_email_categories`/`remove_email_categories` report
+  `updated_count`/`failed_count`/`failed` instead of aborting mid-batch while keeping
+  earlier writes. `get_email` on such an item still fails — there is nothing to degrade to
+  for a single item — but now returns a `hint` saying the server, not the item_id or the
+  session, is at fault. Guarded by `tests/smoke/tests/test_unfetchable_item_resilience.py`.
+  Still open upstream: nothing this client can do about the serialization fault itself.
 - **Automated tests are almost entirely live-mailbox smoke tests.** `tests/smoke/`
-  (added 2026-09-07) exercises each MCP tool end-to-end against a real OWA mailbox, one
-  test module per tool. `tests/unit/` (added 2026-09-10) is the only pure-logic coverage
-  so far — `test_auth_errors.py`, for the sign-in failure reason tables and
-  profile-directory resolution. Other cheap pure-logic targets remain uncovered: e.g.
+  exercises each MCP tool end-to-end against a real mailbox, one module per tool, so it
+  cannot run in CI and cannot cover pure logic in isolation. `tests/unit/` is the
+  exception and now holds two suites: `test_auth_errors` (sign-in failure diagnosis and
+  profile-directory resolution) and `test_recurrence_expansion` (occurrence arithmetic for
+  every pattern/range variant, exact dates, real captured payloads, malformed-payload
+  degradation). Other cheap pure-logic targets remain uncovered: e.g.
   `_build_recipient_list` handling empty/whitespace addresses, or `folder_id_dict()`
   picking the right `__type` for a distinguished vs. opaque folder ID.
 - **No live/manual QA log.** There's no record (changelog, issue tracker, etc.) of which
-  of the 46 tools have actually been run against a real OWA mailbox since the
+  of the 48 tools have actually been run against a real OWA mailbox since the
   browser-session rewrite. This document's "Manual QA / Status" column is a template for
   that log — fill it in as you verify each tool.
 - **Copilot module (#901-905) needs a live discovery spike.** Every DOM selector,
