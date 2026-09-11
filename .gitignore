@@ -12,6 +12,10 @@ session-cookies.txt
 .browser-profile*/
 .mcpregistry_*
 
+# Capability-discovery captures (real mailbox metadata: endpoints, field names,
+# UI labels from a live session — see exchange_mcp/discovery_session.py)
+.discovery-sessions/
+
 # Python
 __pycache__/
 *.pyc

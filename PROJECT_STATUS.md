@@ -603,6 +603,64 @@ Both tests are self-cleaning (every task is `permanent`-deleted, including on fa
 The one leftover from the first, failed run was found and purged: the mailbox's Tasks and
 Deleted Items folders hold no `task-smoke-*` items.
 
+**Update 2026-09-11 (continued) — new Discovery module (module 11, 6 tools) plus an
+interactive skill: find the OWA surface this server *doesn't* implement.** Every gap closed
+so far was found the same way — someone noticed a feature in OWA's own UI, opened
+`--show-browser`, watched the network tab, and reverse-engineered the call (the category
+write-path #208/#209, `GetSchedule` #602, Substrate search #401 all came from exactly that).
+`exchange_mcp/tools/discovery.py` turns that manual loop into a repeatable one:
+`start_discovery_session` opens a **separate** Chromium on a **throwaway profile**, the user
+signs in and exercises whatever they want to explore, closing the window ends the recording,
+and `classify_discovery_session` sorts every captured endpoint into *unknown API* / *known
+API with parameters we never send* / *already covered* — then proposes tools, modules, and
+permanent IDs. The `owa-capability-discovery` skill
+([.claude/skills/](.claude/skills/owa-capability-discovery/SKILL.md)) drives the whole flow
+interactively, including the implementation checklist afterwards.
+
+Four design points, each with a tempting wrong alternative:
+
+- **A second browser, not the shared `BrowserSession`.** That singleton owns the signed-in
+  profile every tool's transport rides on; driving it interactively would navigate the anchor
+  page out from under in-flight calls, and recording on it would fill the capture with this
+  server's *own* traffic — precisely the traffic that's supposed to count as
+  already-implemented. The recorder copies the loop-on-a-background-thread pattern instead of
+  reusing the instance.
+- **The implemented baseline is read out of this repo with `ast`, never hardcoded.** A
+  hand-maintained list of "actions we support" goes stale the first time someone adds a tool,
+  and a stale baseline reports last week's work as an undiscovered gap — the most expensive
+  way this feature could fail. `capability_inventory.py` scans the call sites
+  (`client.request("FindItem", …)`), resolves module-level constants (`_ACTION` in
+  categories.py), and credits module-level tables (`_FIELD` in tasks.py) to every action in
+  the file. That last rule was found by test: without it `UpdateItem` had *zero* known
+  FieldURIs, so every one OWA sends would have been reported as new.
+- **Redaction is a correctness requirement, not hygiene.** A fresh profile means the capture
+  always runs through a live sign-in, so requests to sign-in hosts are dropped before
+  anything is written, only an allowlist of headers is recorded (never `Authorization` /
+  `Cookie` / `X-OWA-CANARY`), the injected page script records no input values, and response
+  bodies are stored as a *content-free* field/type skeleton unless raw bodies are explicitly
+  requested. `tests/unit/test_capability_classify.py` asserts all four directly.
+- **Classification reads the capture files, not the live recorder**, so a session survives a
+  server restart and can be re-classified after implementing a proposal — the endpoint should
+  move from `unknown_api` to `known_api_covered`, which is a free check that what was built
+  matches what OWA actually sent.
+
+Verdicts are deliberately biased toward **under**-reporting (a missed finding costs one more
+capture; a fabricated one costs a developer an afternoon), and the domain knowledge lives in
+two keyword tables in `capability_classify.py` — the same "correct the table, not the code"
+arrangement as [auth_errors.py](exchange_mcp/auth_errors.py).
+
+**Verified end-to-end 2026-09-11** against a local stand-in server (a throwaway page firing
+two synthetic OWA actions): both transports captured and correctly distinguished — including
+the `X-OWA-UrlPostData` header-payload variant, which a `post_data`-only recorder would have
+logged as a parameterless call — UI click and navigation captured and attributed to the calls
+they triggered, telemetry filtered, no bearer token anywhere in the capture, and the report
+proposing a new `inbox_rules` module with correctly allocated IDs. One real bug found and
+fixed that way: the temporary Chromium profile leaked, because cleanup runs on a daemon
+thread that process exit kills outright. Now retried while Chromium releases its lock, with
+the outcome recorded in the manifest, plus a sweep of abandoned `owa-discovery-*` profiles at
+the start of each session. The live-mailbox path (a real sign-in, a real OWA exploration) has
+not been driven by a human yet, so all six rows are `Pending`.
+
 ## 2. How to read the table
 
 - **ID** — a permanent identifier, `<module number><2-digit sequence within that module>`:
@@ -610,7 +668,7 @@ Deleted Items folders hold no `task-smoke-*` items.
   never changes or gets reused, even if the table is reordered or tools are added/removed
   elsewhere — see CLAUDE.md's "Maintaining PROJECT_STATUS.md" section for the assignment
   rule. Module numbers: 1 Email, 2 Calendar, 3 Categories, 4 Directory, 5 Folders,
-  6 Availability, 7 Analytics, 8 Auth, 9 Copilot, 10 Tasks. Tasks (added 2026-09-11) is
+  6 Availability, 7 Analytics, 8 Auth, 9 Copilot, 10 Tasks, 11 Discovery. Tasks (added 2026-09-11) is
   where the ID width grew: every single digit was already spoken for, and reusing or
   renumbering a module digit is forbidden, so the module part gained a digit instead.
 - **Automated test** — the test module(s) covering the row, or `None`. Coverage is
@@ -636,7 +694,7 @@ Deleted Items folders hold no `task-smoke-*` items.
   `--stable` CLI flag / `EXCHANGE_MCP_STABLE` env var excludes from the MCP tool listing at
   startup — keep the two in sync (see CLAUDE.md's "Maintaining PROJECT_STATUS.md" section).
 
-## 3. Tool inventory (54 tools across 10 modules)
+## 3. Tool inventory (60 tools across 11 modules)
 
 ### Email — [exchange_mcp/tools/email.py](exchange_mcp/tools/email.py) (15)
 
@@ -759,6 +817,37 @@ visible to these tools — use `set_email_flag` (#115).
 | 1004 | `update_task` | Partial update — only the arguments passed are written; `clear_due_date`/`clear_start_date`/`clear_reminder` erase a field (`DeleteItemField`), and `status`+`percent_complete` together is rejected client-side (Exchange resolves the two against each other by whichever it processes last) | `tests/smoke/tests/test_task_lifecycle.py` | OK (2026-09-11) — subject + due date + `Status` + `clear_reminder` written in one request and verified by re-read, i.e. every `_FIELD` spelling exercised there is confirmed accepted (`item:Subject`, `item:ReminderIsSet`, `task:DueDate`, `task:Status`) | Stable |
 | 1005 | `complete_task` | Mark tasks complete / reopen them, writing `Status` only; returns per-item results including the *new* ItemId Exchange mints when a recurring occurrence is completed | `tests/smoke/tests/test_task_lifecycle.py` | OK (2026-09-11) — `Status=Completed` verified on the item (`is_complete`, `complete_date` = today, `percent_complete` 100 set by the server from `Status` alone) and through both listing filters. The recurring-task ID-split path is untested (no recurring task to hand) | Stable |
 | 1006 | `delete_task` | Delete tasks (soft to Deleted Items, or `permanent` HardDelete), `AffectedTaskOccurrences: AllOccurrences` | `tests/smoke/tests/test_task_lifecycle.py`, `tests/smoke/tests/test_task_folder_targeting.py` | OK (2026-09-11) — verified by absence from the folder listing. A deleted task's **ItemId stays resolvable**, so `get_task` keeps returning the item afterwards with a bumped ChangeKey; the first test run failed on exactly that wrong post-condition before the tool was cleared | Stable |
+
+### Discovery — [exchange_mcp/tools/discovery.py](exchange_mcp/tools/discovery.py) (6)
+
+Module number **11**. The only module here that doesn't read or write a mailbox: these tools
+exist to find out **what OWA can do that this server can't yet**, and to turn that into
+implementation proposals. Meant to be driven by the `owa-capability-discovery` skill
+([.claude/skills/owa-capability-discovery/SKILL.md](.claude/skills/owa-capability-discovery/SKILL.md)),
+which handles the interactive part (scope, waiting, presenting, implementing).
+
+The work is split across three non-tool modules so each half stays testable on its own:
+[discovery_session.py](exchange_mcp/discovery_session.py) captures (its own Chromium, its own
+throwaway profile, visible, user-driven — never the shared `BrowserSession`),
+[capability_inventory.py](exchange_mcp/capability_inventory.py) builds the implemented baseline
+by `ast`-scanning this repo's own call sites so it can't go stale, and
+[capability_classify.py](exchange_mcp/capability_classify.py) produces the verdicts and
+proposals as pure logic. See the 2026-09-11 update above for the design points and the
+redaction rules (sign-in hosts dropped, no `Authorization`/`Cookie`/canary recorded, no input
+values, response bodies stored as a content-free field/type skeleton by default).
+
+`start_discovery_session` is start-and-poll like `login` (#801) for the same reason: a
+recording spans a human sign-in plus however long the user browses, which no MCP client will
+hold a request open for.
+
+| ID | Tool | Description | Automated test | Manual QA / Status | Stability |
+|---|---|---|---|---|---|
+| 1101 | `start_discovery_session` | Open a fresh, independent Chromium on a brand-new temporary profile and record every API call and UI action until the user closes the window. Requires a `scope`; returns immediately. Refuses to start a second concurrent recording | `tests/unit/test_capability_classify.py` (redaction rules, temp-profile cleanup) | **Pending** — new module; the Playwright wiring is verified end-to-end against a local stand-in server (2026-09-11, see the update above), but no human has driven a real OWA sign-in + exploration through it yet | Stable |
+| 1102 | `get_discovery_status` | Poll a recording: `state` (`recording`/`finished`/`stopped`) plus live counters (`api_calls`, `ui_actions`, `navigations`, noise filtered, sign-in traffic dropped). Falls back to reading the manifest from disk for sessions recorded before a server restart | None | **Pending** — new module | Stable |
+| 1103 | `stop_discovery_session` | End a recording now, closing its window. Normally unnecessary — the user closing the window is what ends a recording | None | **Pending** — new module | Stable |
+| 1104 | `classify_discovery_session` | Classify a capture against the implemented baseline: per endpoint `unknown_api` / `known_api_new_parameters` / `known_api_covered`, grouped into capability classes, with proposals for new modules, new tools and tool changes carrying permanent IDs allocated per §2's numbering rule. Writes `report.json` + `report.md`; re-runnable with a different `scope`, and re-runnable after implementing a proposal as a coverage check | `tests/unit/test_capability_classify.py` (verdicts in both directions, proposals, ID allocation, Markdown rendering) | **Pending** — new module; classification itself is unit-tested against fixtures and one synthetic live capture | Stable |
+| 1105 | `list_discovery_sessions` | List capture directories newest-first, including sessions from previous server runs (classification works off the files), with their scope, counters and whether a report exists | None | **Pending** — new module | Stable |
+| 1106 | `get_discovery_detail` | Return the real captured requests for one endpoint — full request payload with its `__type` annotations, whether it rode in `X-OWA-UrlPostData`, and the response field/type skeleton. What you call to actually implement against a proposal | None | **Pending** — new module | Stable |
 
 ## 4. Gaps worth closing
 
