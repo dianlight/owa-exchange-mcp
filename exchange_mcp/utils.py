@@ -131,3 +131,73 @@ def format_attendee(name: str, email: str) -> str:
     if name and email and not email.startswith("/O="):
         return f"{name} <{email}>"
     return name or email or ""
+
+
+# ------------------------------------------------------------------
+# Per-item failure classification
+# ------------------------------------------------------------------
+#
+# Tools that act on a list of item_ids report each failure with a stable
+# `error_code` alongside the raw server text, so a caller can branch on the
+# *kind* of failure instead of substring-matching an HTTP 500 message. That
+# distinction is what lets a client skill decide between "retry", "re-list the
+# folder", and "fall back to another connector" -- pattern-matching a .NET
+# exception name is not a contract anyone should be forced to rely on.
+#
+# Like auth_errors.py's tables, the domain knowledge lives here in one
+# correctable place rather than being spread across the tool modules.
+
+ITEM_NOT_SERIALIZABLE = "item_not_serializable"
+ITEM_NOT_FOUND = "item_not_found"
+ITEM_ACCESS_DENIED = "item_access_denied"
+ITEM_READ_FAILED = "item_read_failed"
+
+# Matched case-insensitively against the whole error string (which normally
+# carries both the x-owa-error header's .NET exception name and a body snippet).
+_ITEM_ERROR_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (ITEM_NOT_SERIALIZABLE, ("serializationexception",)),
+    (ITEM_NOT_FOUND, ("erroritemnotfound", "the specified object was not found")),
+    (ITEM_ACCESS_DENIED, ("erroraccessdenied", "access is denied")),
+)
+
+_ITEM_ERROR_REMEDIATION = {
+    ITEM_NOT_SERIALIZABLE: (
+        "OWA's own serialiser faults while writing the response when the full "
+        "property set is requested for this item -- observed on "
+        "MeetingRequestMessage items. The item_id, the session and every write "
+        "path are fine: a narrow GetItem shape (IdOnly plus named properties) "
+        "reads the same item successfully. Request only the fields you need."
+    ),
+    ITEM_NOT_FOUND: (
+        "No item exists at that ItemId any more -- it was moved or deleted. "
+        "Re-list the folder to get current ids."
+    ),
+    ITEM_ACCESS_DENIED: (
+        "The signed-in mailbox is not permitted to read this item."
+    ),
+    ITEM_READ_FAILED: "",
+}
+
+
+def classify_item_error(message: str) -> str:
+    """Map a raw per-item failure message to a stable error code.
+
+    Returns ITEM_READ_FAILED for anything unrecognised rather than guessing:
+    an honest generic code is more useful to a caller than a wrong specific
+    one, and callers are told to treat unknown codes as opaque.
+    """
+    lowered = (message or "").lower()
+    for code, hints in _ITEM_ERROR_HINTS:
+        if any(hint in lowered for hint in hints):
+            return code
+    return ITEM_READ_FAILED
+
+
+def item_error(item_id: str, message: str) -> dict:
+    """Build the per-item failure dict used in bulk-tool `failed` lists."""
+    code = classify_item_error(message)
+    failure = {"item_id": item_id, "error": message, "error_code": code}
+    remediation = _ITEM_ERROR_REMEDIATION.get(code)
+    if remediation:
+        failure["hint"] = remediation
+    return failure

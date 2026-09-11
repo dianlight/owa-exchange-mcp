@@ -12,7 +12,13 @@ from mcp.server.fastmcp import Context
 
 from exchange_mcp.server import mcp, AppContext
 from exchange_mcp.owa_client import OWAClient, SessionExpiredError
-from exchange_mcp.utils import html_to_text, extract_links_from_html
+from exchange_mcp.utils import (
+    ITEM_NOT_SERIALIZABLE,
+    classify_item_error,
+    extract_links_from_html,
+    html_to_text,
+    item_error,
+)
 
 
 def _get_client(ctx: Context) -> OWAClient:
@@ -231,13 +237,19 @@ def _try_get_item_details(client: OWAClient, item_id: str) -> tuple[dict | None,
 
     Returns (details, None) or (None, error_note).
 
-    Some real messages can't be fetched at all: OWA's own GetItem throws
-    `System.Runtime.Serialization.SerializationException` (HTTP 500) on them —
-    observed on meeting-related items in a live mailbox, and not something this
-    client can work around. Any loop over several item_ids therefore has to be
-    able to skip one bad item, because letting it propagate takes down the whole
-    batch: a listing loses every other row, and a bulk write reports failure
-    while silently keeping the items it already changed.
+    Some real messages can't be fetched *at this shape*: with
+    `BaseShape: "AllProperties"` OWA's own GetItem throws
+    `System.Runtime.Serialization.SerializationException` (HTTP 500) — observed
+    on MeetingRequestMessage items in a live mailbox, and a fault in the
+    server's own response serialisation, so no request-side change fixes it.
+    Any loop over several item_ids therefore has to be able to skip one bad
+    item, because letting it propagate takes down the whole batch: a listing
+    loses every other row.
+
+    What this does *not* mean is that such an item is unreachable. A narrower
+    read of the same item succeeds — see `_get_item_categories`, which is why
+    the category tools no longer go through here at all. Anything that needs
+    only a few named fields should ask for those fields instead of degrading.
 
     SessionExpiredError is deliberately re-raised — that isn't a per-item
     problem and the caller's retry/re-login path should see it.
@@ -250,12 +262,70 @@ def _try_get_item_details(client: OWAClient, item_id: str) -> tuple[dict | None,
         return None, str(e)
 
 
+def _get_item_categories(client: OWAClient, item_id: str) -> list[str]:
+    """Read *only* the Categories of one item, via the narrowest GetItem shape.
+
+    The category write tools need the current Categories to merge against, and
+    reading them with `_get_item_details`' `BaseShape: "AllProperties"` is what
+    made them unusable on meeting invites: OWA's own serialiser faults (HTTP 500
+    `System.Runtime.Serialization.SerializationException`) partway through
+    writing the response for a `MeetingRequestMessageType` item when the full
+    property set is requested. Confirmed live 2026-09-11 — the truncated 500
+    body breaks off inside the item's own `__type` marker, i.e. the server
+    failed while *serialising its answer*, not while parsing our request.
+
+    An `IdOnly` + named-`Categories` shape reads the same item without faulting
+    (the same narrow shape `get_email_links` already relies on), so this is not
+    a workaround for a broken item — it is simply not asking for the property
+    that OWA can't render. Also strictly cheaper: a bulk tag operation no longer
+    drags a full body, recipient list and attachment set over the wire per item.
+
+    Returns [] for an item with no categories; raises for a real read failure so
+    the caller can report it per-item instead of silently writing over unknown
+    state.
+    """
+    payload = {
+        "__type": "GetItemJsonRequest:#Exchange",
+        "Header": {
+            "__type": "JsonRequestHeaders:#Exchange",
+            "RequestServerVersion": "Exchange2013",
+        },
+        "Body": {
+            "__type": "GetItemRequest:#Exchange",
+            "ItemShape": {
+                "__type": "ItemResponseShape:#Exchange",
+                "BaseShape": "IdOnly",
+                "AdditionalProperties": [
+                    {"__type": "PropertyUri:#Exchange", "FieldURI": "Categories"},
+                ],
+            },
+            "ItemIds": [{"__type": "ItemId:#Exchange", "Id": item_id}],
+        },
+    }
+
+    data = client.request("GetItem", payload)
+    for msg in client.extract_items(data):
+        if msg.get("ResponseClass") == "Error":
+            raise RuntimeError(msg.get("MessageText", "GetItem failed."))
+        for item in msg.get("Items", []):
+            return list(item.get("Categories") or [])
+
+    # One ItemId in must produce one item (or an error message) out. Anything
+    # else means we'd be merging against categories we never actually read.
+    raise RuntimeError("GetItem returned no item for this ItemId.")
+
+
 def _bulk_result(action: str, updated: list[str], failed: list[dict], requested: int) -> dict:
     """Summarise a per-item bulk write, naming what actually changed.
 
     A batch that skipped an unfetchable item has genuinely applied part of its
     change, so reporting a bare success (or a bare error) would misstate what
     happened to the mailbox. `success` is False when nothing at all was applied.
+
+    Every entry in `failed` carries a stable `error_code` (see
+    `utils.classify_item_error`); the distinct codes are also lifted to
+    `failed_codes` so a caller can branch on the batch outcome without walking
+    the list.
     """
     result: dict = {
         "success": bool(updated),
@@ -263,11 +333,14 @@ def _bulk_result(action: str, updated: list[str], failed: list[dict], requested:
         "updated_count": len(updated),
     }
     if failed:
+        codes = list(dict.fromkeys(f.get("error_code", "") for f in failed if f.get("error_code")))
         result["failed_count"] = len(failed)
         result["failed"] = failed
+        if codes:
+            result["failed_codes"] = codes
         result["message"] += (
-            f" {len(failed)} skipped — their details could not be read "
-            f"(see 'failed')."
+            f" {len(failed)} skipped (see 'failed' for a per-item "
+            f"'error_code')."
         )
     return result
 
@@ -785,17 +858,27 @@ def get_email(item_id: str, ctx: Context = None) -> str:
     except SessionExpiredError as e:
         return json.dumps({"error": str(e)})
     except Exception as e:
-        error = {"error": f"Failed to get email: {e}"}
-        if "SerializationException" in str(e):
-            # Nothing to degrade to for a single item, but say plainly that this
-            # is the server refusing to serialise that message rather than a
-            # bad item_id or an expired session.
+        # Say plainly which kind of failure this is, and give it a stable code:
+        # a caller must not have to decide "retry vs. re-list vs. give up" by
+        # substring-matching a .NET exception name out of an HTTP 500 body.
+        code = classify_item_error(str(e))
+        error = {"error": f"Failed to get email: {e}", "error_code": code}
+        if code == ITEM_NOT_SERIALIZABLE:
+            # The item is fine and so is the session: OWA faults while
+            # *serialising its own response* to a full-property read. Narrower
+            # reads of the same item still work, so point at them rather than
+            # calling this unfixable (confirmed live 2026-09-11 on a
+            # MeetingRequestMessage: AllProperties 500s, get_email_links'
+            # IdOnly + named-property shape returns the item intact).
             error["hint"] = (
-                "OWA itself cannot serialise this message (server-side "
-                "SerializationException); the item_id and session are fine. "
-                "Observed on some meeting-related items — no client-side "
-                "workaround. Use get_emails without include_body for its "
-                "summary fields."
+                "OWA faults while serialising its response to a full-property "
+                "read of this item (server-side SerializationException); the "
+                "item_id and session are fine, and writes to it work. Seen on "
+                "MeetingRequestMessage items. Narrow reads of the same item do "
+                "succeed: use get_emails (without include_body) for summary "
+                "fields, get_email_links for subject + links, and the category "
+                "tools, set_email_flag, mark_email_read and move_email all "
+                "work on it normally."
             )
         return json.dumps(error)
 
@@ -1548,20 +1631,36 @@ def assign_email_categories(
     list (see the category_* tools). Assigning a brand-new name does not
     register it in the master list or give it a color.
 
+    Works on mail-class items generally, not just plain Message items: verified
+    live 2026-09-11 on a MeetingRequestMessage (a meeting invite in the Inbox),
+    which previously failed. Nothing here is item-class-specific, so the
+    neighbouring classes (MeetingResponseMessage, MeetingCancellation) take the
+    same path - they just haven't each been exercised individually. For an item
+    on the *calendar* rather than in a mail folder, use assign_event_categories
+    instead: that one needs OWA's bespoke UpdateCalendarEvent action.
+
     Args:
         item_ids: List of Exchange ItemIds to tag.
         categories: Category names to add.
+
+    Per-item failures never abort the batch: each is reported in `failed` with a
+    stable `error_code` (`item_not_serializable`, `item_not_found`,
+    `item_access_denied`, or `item_read_failed` for anything unrecognised), so
+    callers can branch on the code instead of matching an HTTP 500 message.
     """
     try:
         client = _get_client(ctx)
         updated, failed = [], []
         for iid in item_ids:
-            details, detail_error = _try_get_item_details(client, iid)
-            if details is None:
-                failed.append({"item_id": iid, "error": detail_error})
+            try:
+                existing = _get_item_categories(client, iid)
+                merged = list(dict.fromkeys(existing + categories))
+                _set_email_categories(client, [iid], merged)
+            except SessionExpiredError:
+                raise
+            except Exception as e:
+                failed.append(item_error(iid, str(e)))
                 continue
-            merged = list(dict.fromkeys(details.get("categories", []) + categories))
-            _set_email_categories(client, [iid], merged)
             updated.append(iid)
         return json.dumps(_bulk_result("Added categories to", updated, failed, len(item_ids)))
     except SessionExpiredError as e:
@@ -1578,22 +1677,31 @@ def remove_email_categories(
 ) -> str:
     """Remove one or more categories from emails, keeping any others present.
 
+    Works on mail-class items generally, meeting invites included - see
+    assign_email_categories for the details and for the calendar-side
+    equivalent.
+
     Args:
         item_ids: List of Exchange ItemIds to untag.
         categories: Category names to remove (case-insensitive match).
+
+    Per-item failures never abort the batch: each is reported in `failed` with a
+    stable `error_code` - see assign_email_categories.
     """
     try:
         client = _get_client(ctx)
         lowered = {c.lower() for c in categories}
         updated, failed = [], []
         for iid in item_ids:
-            details, detail_error = _try_get_item_details(client, iid)
-            if details is None:
-                failed.append({"item_id": iid, "error": detail_error})
+            try:
+                remaining = [c for c in _get_item_categories(client, iid)
+                             if c.lower() not in lowered]
+                _set_email_categories(client, [iid], remaining)
+            except SessionExpiredError:
+                raise
+            except Exception as e:
+                failed.append(item_error(iid, str(e)))
                 continue
-            remaining = [c for c in details.get("categories", [])
-                         if c.lower() not in lowered]
-            _set_email_categories(client, [iid], remaining)
             updated.append(iid)
         return json.dumps(_bulk_result("Removed categories from", updated, failed, len(item_ids)))
     except SessionExpiredError as e:

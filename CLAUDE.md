@@ -34,7 +34,7 @@ Any variable above can also be placed in a gitignored `.env.local` next to `pypr
   - `capability_inventory.py` — What this server already implements, derived by `ast`-scanning `tools/*.py` and `owa_client.py` for transport call sites, plus PROJECT_STATUS.md for the ID-numbering state. No Playwright, unit-testable.
   - `capability_classify.py` — Verdicts and implementation proposals for a recorded capture. Pure logic; the domain knowledge lives in two keyword tables, correctable in one place like `auth_errors.py`'s.
   - `tools/` — Tool modules: email, calendar, categories, people, folders, availability, analytics, auth, copilot, tasks, discovery
-- `tests/unit/` — Pure-logic tests, no live mailbox / browser / `EXCHANGE_OWA_URL` needed (`python -m tests.unit.test_auth_errors`, `python -m tests.unit.test_recurrence_expansion`, `python -m tests.unit.test_capability_classify`). Separate from `tests/smoke/`, which is live-mailbox end-to-end.
+- `tests/unit/` — Pure-logic tests, no live mailbox / browser / `EXCHANGE_OWA_URL` needed (`python -m tests.unit.test_auth_errors`, `python -m tests.unit.test_recurrence_expansion`, `python -m tests.unit.test_capability_classify`, `python -m tests.unit.test_item_errors`). Separate from `tests/smoke/`, which is live-mailbox end-to-end.
 - `.claude/skills/owa-capability-discovery/` — Interactive skill driving the discovery tools: scope → record → classify → propose → implement. Its `references/implementation-checklist.md` is the "turn a proposal into a tool" procedure.
 
 ## Running
@@ -58,6 +58,7 @@ exchange-mcp-server --transport http --port 8765 --show-browser
 python -m tests.unit.test_auth_errors
 python -m tests.unit.test_recurrence_expansion
 python -m tests.unit.test_capability_classify
+python -m tests.unit.test_item_errors
 
 # Live-mailbox smoke tests: one module per tool group, run individually.
 # The harness starts its own server on 127.0.0.1:8765 if nothing is listening
@@ -99,6 +100,9 @@ Deliberate design points, each of which has a wrong-looking-but-tempting alterna
 3. POST JSON to `$EXCHANGE_OWA_URL/owa/service.svc?action=<ACTION>`
 4. Request bodies use EWS `__type` annotations (e.g. `"CalendarItem:#Exchange"`)
 5. HTTP 401/440 = session expired → `OWAClient._relogin_or_raise()` calls `BrowserSession.ensure_logged_in()` (silent re-auth against the profile only) and retries once, or raises `AuthenticationRequiredError` if the profile can't carry us either
+6. **Ask for the fields you need, not `AllProperties`.** A read shape is not free: on this backend `BaseShape: "AllProperties"` makes OWA's own serialiser throw `SerializationException` (HTTP 500) on `MeetingRequestMessage` items, *mid-response* — the 500 body is truncated valid JSON, so no request-side change fixes that shape. The same items read fine at `IdOnly` + named `PropertyUri` entries (`_get_item_categories` in email.py, `get_email_links`). Treat an `AllProperties` 500 as "this shape is too wide", not "this item is unreachable" — writes to such items work normally. Note the opposite trap in tasks.py: there a single bad `FieldURI` in `AdditionalProperties` fails the whole request, so narrow shapes want *known-good* spellings, not guessed ones.
+
+**Per-item error codes**: tools taking a list of `item_ids` never abort the batch on one bad item, and report each failure with a stable `error_code` from `utils.classify_item_error()` (`item_not_serializable` / `item_not_found` / `item_access_denied` / `item_read_failed`), lifted to `failed_codes` on the batch summary. That exists because client skills were reduced to substring-matching an HTTP 500 message to decide whether to fall back to another connector. Add new signals to the tables in `utils.py`, not to the tool modules, and cover them in `tests/unit/test_item_errors.py` — an unrecognised failure must stay `item_read_failed` rather than be guessed into a specific code.
 
 **RequestServerVersion**: `Exchange2013` for reads, `V2017_08_18` for writes.
 

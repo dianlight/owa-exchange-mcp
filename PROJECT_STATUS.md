@@ -717,6 +717,63 @@ launched server with its own profile directory** (`.browser-profile-dev`, port 8
 2026-09-11) — same two error strings, same split between the email and event paths. So this
 is a property of the selectors, not of one browser profile's state.
 
+**Update 2026-09-11 (continued) — category writes on meeting invites: fixed, and the
+"unserialisable item" diagnosis corrected.** Reported live: `assign_email_categories`
+returned an HTTP 500 `SerializationException` for a Teams meeting invite in the Inbox (a
+`MeetingRequestMessage`, not a plain `Message`) while succeeding on ordinary mail, forcing
+the caller (the inbox-organizer skill) to detect it by *substring-matching the 500 message*
+and fall back to the Outlook-COM connector, cross-referencing the item by subject+sender+
+date because COM and OWA ids aren't 1:1.
+
+The reported suspicion — a `Message`-shaped `UpdateItem` payload that Exchange rejects for a
+meeting item, needing an `ItemClass` branch or a detour via `AssociatedCalendarItemId` — is
+**not** what was happening. Established against a live mailbox:
+
+1. The write path was never broken. `set_email_flag` uses the *same* `UpdateItem` /
+   `SetItemField` / `Item.__type = "Message:#Exchange"` shape as `_set_email_categories`, and
+   it applied cleanly to the very item that failed. `Message:#Exchange` is fine for a
+   `MeetingRequestMessageType`; no branching on `ItemClass` is needed anywhere.
+2. The failure was the tools' **pre-read** of the current categories (needed to merge rather
+   than overwrite), which went through `_get_item_details` and its
+   `BaseShape: "AllProperties"`.
+3. That read faults in the *response* path, not the request path: the 500 body is truncated
+   but well-formed JSON that breaks off inside the item's own `__type` marker
+   (`…"Items":[{"__type":"MeetingRequestMessageT`). OWA had already begun answering and died
+   mid-serialisation, so nothing about the request shape was at fault.
+4. And the item is perfectly readable at a narrower shape — `get_email_links`
+   (`IdOnly` + named `Subject`/`Body`) returns it intact. The fault lives in the
+   `AllProperties` property set, not in the item.
+
+Fix: a new `_get_item_categories()` in [email.py](exchange_mcp/tools/email.py) reads *only*
+`Categories`, via `IdOnly` + a named `PropertyUri`, and both category tools use it instead
+of the full-item read. Also strictly cheaper — a bulk tag no longer drags a body, recipient
+list and attachment set over the wire per item. The per-item write is now wrapped too, so a
+failing `UpdateItem` can no longer abort the rest of the batch (it previously could).
+
+Second half of the report — "give callers a code, not an HTTP 500 to grep" — is addressed
+with a stable `error_code` on every per-item failure (`item_not_serializable`,
+`item_not_found`, `item_access_denied`, `item_read_failed` for anything unrecognised), plus
+`failed_codes` on the batch summary and the same code on `get_email`'s error payload. The
+classifier and its remediation table are pure logic in
+[utils.py](exchange_mcp/utils.py) — one correctable place, like `auth_errors.py`'s tables —
+covered by the new `tests/unit/test_item_errors.py` (no mailbox needed), which specifically
+pins down that an *unrecognised* failure must stay generic rather than be guessed into a
+specific code.
+
+Verified live 2026-09-11 on an independently launched server (`.browser-profile-dev`, port
+8767, production instance untouched): `tests/smoke/tests/test_meeting_request_categories.py`
+tags a real `MeetingRequestMessage`, reads the category back server-side, removes it again
+and leaves the item's pre-existing categories exactly as found — all four checks OK.
+`test_email_category_tagging.py` (ordinary mail, including keep-one-remove-the-other) and
+`test_unfetchable_item_resilience.py` still pass.
+
+`test_unfetchable_item_resilience.py` had to be **corrected**, not just extended: it asserted
+that the category tools *skip* these items, which was the 2026-09-10 belief this change
+disproves. It now performs no writes at all and guards what remains true of that path —
+per-row listing degradation and `get_email`'s typed error — while the read/write round-trip
+(and the mutation it implies) belongs to the new dedicated test. The §4 bullet claiming
+"there is no client-side fix" is corrected there too.
+
 ## 2. How to read the table
 
 - **ID** — a permanent identifier, `<module number><2-digit sequence within that module>`:
@@ -761,7 +818,7 @@ is a property of the selectors, not of one browser profile's state.
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
 | 101 | `get_emails` | List emails from a folder, grouped by conversation/thread, with unread/pagination filters; each row includes `flag_status`, and `body_error` when `include_body=True` could not fetch that row | `tests/smoke/tests/test_get_emails.py`, `tests/smoke/tests/test_email_flag.py`, `tests/smoke/tests/test_unfetchable_item_resilience.py` | OK (2026-09-10) — `flag_status` on every row; `include_body=True` now degrades individual unfetchable rows instead of failing the whole page (verified 10 rows / 8 bodies / 2 degraded) | Stable |
-| 102 | `get_email` | Get a single email's full body, recipients, attachments, and `flag_status` (follow-up flag) | `tests/smoke/tests/test_get_email_detail.py`, `tests/smoke/tests/test_email_flag.py` | OK (2026-09-10) — `flag_status` verified round-tripping all three states. Fails for the handful of messages OWA cannot serialise (nothing to degrade to for a single item); now returns an explanatory `hint`, see §4. `test_get_email_detail` is flaky when it happens to pick one. | Stable |
+| 102 | `get_email` | Get a single email's full body, recipients, attachments, and `flag_status` (follow-up flag) | `tests/smoke/tests/test_get_email_detail.py`, `tests/smoke/tests/test_email_flag.py`, `tests/smoke/tests/test_unfetchable_item_resilience.py`, `tests/unit/test_item_errors.py` | OK (2026-09-11) — `flag_status` verified round-tripping all three states. Still fails on the messages OWA cannot serialise at full property shape (this tool asks for all of them by design); now returns `error_code: "item_not_serializable"` plus a `hint` naming the narrow reads that *do* work on the same item, see §4. `test_get_email_detail` is flaky when it happens to pick one. | Stable |
 | 103 | `send_email` | Send a new email (to/cc/bcc, HTML or plain text) | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
 | 104 | `reply_email` | Reply (or reply-all) to an email | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
 | 105 | `forward_email` | Forward an email to new recipients | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
@@ -770,8 +827,8 @@ is a property of the selectors, not of one browser profile's state.
 | 108 | `delete_email` | Delete (soft or permanent) one or more emails | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
 | 109 | `download_attachments` | Download all file attachments from an email to disk | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
 | 110 | `get_email_links` | Extract hyperlinks from an email's HTML body | `tests/smoke/tests/test_get_email_detail.py` | OK (2026-09-07) | Stable |
-| 111 | `assign_email_categories` | Add one or more categories to emails, keeping any already present; reports `updated_count`/`failed_count`/`failed` and skips items whose details can't be read | `tests/smoke/tests/test_email_category_tagging.py` | OK (2026-09-10) — per-item resilience verified (`tests/smoke/tests/test_unfetchable_item_resilience.py`) | Stable |
-| 112 | `remove_email_categories` | Remove one or more categories from emails, keeping any others present; reports `updated_count`/`failed_count`/`failed` and skips items whose details can't be read | `tests/smoke/tests/test_email_category_tagging.py` | OK (2026-09-10) — per-item resilience verified (`tests/smoke/tests/test_unfetchable_item_resilience.py`) | Stable |
+| 111 | `assign_email_categories` | Add one or more categories to emails (any mail-class item, meeting invites/responses included), keeping any already present; reports `updated_count`/`failed_count`/`failed`/`failed_codes`, each failure carrying a stable `error_code` | `tests/smoke/tests/test_email_category_tagging.py`, `tests/smoke/tests/test_meeting_request_categories.py`, `tests/unit/test_item_errors.py` | OK (2026-09-11) — re-verified after the meeting-invite fix: tags a real `MeetingRequestMessage` and reads it back server-side; ordinary mail unaffected. See "Update 2026-09-11 (continued) — category writes on meeting invites" below | Stable |
+| 112 | `remove_email_categories` | Remove one or more categories from emails (any mail-class item, meeting invites/responses included), keeping any others present; reports `updated_count`/`failed_count`/`failed`/`failed_codes`, each failure carrying a stable `error_code` | `tests/smoke/tests/test_email_category_tagging.py`, `tests/smoke/tests/test_meeting_request_categories.py`, `tests/unit/test_item_errors.py` | OK (2026-09-11) — same fix as `assign_email_categories` above (shares `_get_item_categories`); untag verified on both a meeting invite and ordinary mail | Stable |
 | 113 | `find_emails_by_category` | Find email conversations tagged with a given category | `tests/smoke/tests/test_email_category_tagging.py` | OK (2026-09-08) | Stable |
 | 114 | `search_emails` | Full-text search for emails, scoped to one folder or the whole mailbox. Tries EWS `FindItem`/`QueryString` (AQS syntax: `subject:`, `from:`, `body:`, `received:`, etc.) first, then transparently falls back to a client-side scan (reduced keyword subset: bare terms, `subject:`, `from:`, `category:`, `isread:`, `hasattachment:`) — this tenant's content index never returns AQS results, and `FindItem`'s `Traversal:"Deep"` is unsupported outright, so `search_all_folders` enumerates folders via `FindFolder`/`Deep` (like `get_folders`) and searches each one `Shallow` | `tests/smoke/tests/test_search_emails.py` | OK (2026-09-09) — single-folder AQS-empty + fallback, and `search_all_folders=True` across folders, both verified live; fixed `folder_id` always returning empty (`FindItem`'s `AdditionalProperties` needs the namespaced `item:ParentFolderId` FieldURI, not bare `ParentFolderId`) — re-verified non-empty `folder_id` live via the fallback path | Stable |
 | 115 | `set_email_flag` | Set the follow-up flag (`NotFlagged`/`Flagged`/`Complete`) on one or more emails, via `UpdateItem`/`SetItemField` on `item:Flag` | `tests/smoke/tests/test_email_flag.py` | OK (2026-09-10) — all three states written and read back successfully. The wire encoding is fussy: only `FieldURI: "item:Flag"` paired with `__type: "FlagType:#Exchange"` is accepted; `message:Flag` (either `__type`) returns "Invalid argument used to call method UpdateItem", and PidLidFlagStatus 0x8530 as an ExtendedFieldURI is rejected in every spelling tried. Invalid `flag_status` rejected client-side. | Stable |
@@ -943,29 +1000,44 @@ hold a request open for.
   extended-property write of any kind has ever succeeded against this backend, so treat
   `ExtendedFieldURI` as unavailable here rather than as a fallback.
   `tests/smoke/tests/test_email_flag.py` guards the working encoding.
-- **Some messages cannot be fetched at all (server-side), now contained.** At least two
-  messages in this Inbox make OWA's own `GetItem` throw
-  `System.Runtime.Serialization.SerializationException` (HTTP 500) — both meeting-related
-  items, and pre-existing/unrelated to any change here (ruled out as a `set_email_flag`
-  side effect: one was already failing before any flag write succeeded, a message with
-  three *successful* flag writes still reads fine, and one with only *failed* writes also
-  still reads fine). There is no client-side fix for the fault itself. **Fixed 2026-09-10** is the
-  collateral damage: `_try_get_item_details` now lets any per-item loop skip one bad item,
-  so `get_emails(include_body=True)` returns the rest of the page with `body_error` set on
-  just the affected rows (verified: `limit=10` returns 10 rows, 8 with bodies, 2 degraded),
-  and `assign_email_categories`/`remove_email_categories` report
-  `updated_count`/`failed_count`/`failed` instead of aborting mid-batch while keeping
-  earlier writes. `get_email` on such an item still fails — there is nothing to degrade to
-  for a single item — but now returns a `hint` saying the server, not the item_id or the
-  session, is at fault. Guarded by `tests/smoke/tests/test_unfetchable_item_resilience.py`.
-  Still open upstream: nothing this client can do about the serialization fault itself.
+- **Some messages cannot be fetched at the *full* property shape (server-side) — but they
+  are not unreachable.** Several messages in this Inbox make OWA's own `GetItem` throw
+  `System.Runtime.Serialization.SerializationException` (HTTP 500) when
+  `BaseShape: "AllProperties"` is requested — all `MeetingRequestMessage` items, and
+  pre-existing/unrelated to any change here (ruled out as a `set_email_flag` side effect:
+  one was already failing before any flag write succeeded, a message with three
+  *successful* flag writes still reads fine, and one with only *failed* writes also still
+  reads fine). Nothing on the request side fixes that shape: the 500 body is *truncated
+  valid JSON* that breaks off inside the item's own `__type` marker, i.e. OWA faulted while
+  serialising its own response.
+  **Fixed 2026-09-10** was the collateral damage: `_try_get_item_details` lets any per-item
+  loop skip one bad item, so `get_emails(include_body=True)` returns the rest of the page
+  with `body_error` set on just the affected rows (verified: `limit=10` returns 10 rows,
+  8 with bodies, 2 degraded).
+  **Corrected 2026-09-11**: the conclusion recorded here — "there is no client-side fix" —
+  was too broad, and reading it as "these items are untouchable" is what left the category
+  tools skipping them. A *narrow* `GetItem` (`IdOnly` plus named properties) reads the same
+  item perfectly (`get_email_links` already did, on an item `get_email` 500s on), and every
+  write path works on it too (`set_email_flag` verified live against one). So the fault is
+  in the `AllProperties` property set, not in the item. Ask for the fields you need. The
+  category tools now do exactly that — see the 2026-09-11 update in §1. Only `get_email`
+  still fails, because asking for everything is that tool's whole purpose; it now returns
+  `error_code: "item_not_serializable"` and a `hint` naming the reads and writes that do
+  work. Guarded by `tests/smoke/tests/test_unfetchable_item_resilience.py`,
+  `tests/smoke/tests/test_meeting_request_categories.py` and
+  `tests/unit/test_item_errors.py`.
+  Still open: *which* property in the `AllProperties` set OWA can't render is unidentified
+  (a one-property-at-a-time bisect on a known-bad item would settle it, and would tell us
+  whether `get_email` can degrade to a near-complete narrow shape instead of failing).
 - **Automated tests are almost entirely live-mailbox smoke tests.** `tests/smoke/`
   exercises each MCP tool end-to-end against a real mailbox, one module per tool, so it
   cannot run in CI and cannot cover pure logic in isolation. `tests/unit/` is the
-  exception and now holds two suites: `test_auth_errors` (sign-in failure diagnosis and
-  profile-directory resolution) and `test_recurrence_expansion` (occurrence arithmetic for
+  exception and now holds four suites: `test_auth_errors` (sign-in failure diagnosis and
+  profile-directory resolution), `test_recurrence_expansion` (occurrence arithmetic for
   every pattern/range variant, exact dates, real captured payloads, malformed-payload
-  degradation). Other cheap pure-logic targets remain uncovered: e.g.
+  degradation), `test_capability_classify` (discovery verdicts and redaction) and
+  `test_item_errors` (per-item failure codes and the payload shape bulk tools return).
+  Other cheap pure-logic targets remain uncovered: e.g.
   `_build_recipient_list` handling empty/whitespace addresses, or `folder_id_dict()`
   picking the right `__type` for a distinguished vs. opaque folder ID.
 - **No live/manual QA log.** There's no record (changelog, issue tracker, etc.) of which
