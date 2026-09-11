@@ -37,6 +37,11 @@ DISTINGUISHED_FOLDERS = {
     "исходящие": "outbox",
     "calendar": "calendar",
     "календарь": "calendar",
+    # The Tasks folder is what the modern web UI shows as Microsoft To Do, and
+    # each To Do list is a child folder of it — so this entry is what lets
+    # _resolve_folder_path() walk "tasks/<list name>" (see tools/tasks.py).
+    "tasks": "tasks",
+    "задачи": "tasks",
 }
 
 # Full set of Exchange distinguished folder IDs, used to tell apart a

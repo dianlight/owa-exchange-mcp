@@ -2,7 +2,7 @@
 
 # OWA Exchange MCP Server
 
-MCP (Model Context Protocol) server for any Microsoft Exchange / OWA (Outlook Web Access) deployment. Gives LLM agents access to email, calendar, directory search, folders, categories, availability, meeting analytics, and Copilot delegation via 48 tools.
+MCP (Model Context Protocol) server for any Microsoft Exchange / OWA (Outlook Web Access) deployment. Gives LLM agents access to email, calendar, tasks (Microsoft To Do), directory search, folders, categories, availability, meeting analytics, and Copilot delegation via 60 tools, plus a capability-discovery module for mapping the OWA surface this server doesn't cover yet.
 
 Works with any on-premise or hosted Exchange server that exposes OWA.
 
@@ -87,6 +87,7 @@ the process must already be listening before a client tries to connect.
 | `EXCHANGE_MCP_HOST` | No | Bind host for `--transport http` (default `127.0.0.1` — keep it on loopback, see [Security](#security)) |
 | `EXCHANGE_MCP_PORT` | No | Bind port for `--transport http` (default `8765`) |
 | `EXCHANGE_MCP_STABLE` | No | Set to `true`/`1`/`yes` to exclude known-buggy tools from the MCP tool listing (same effect as `--stable`) |
+| `EXCHANGE_DISCOVERY_DIR` | No | Where capability-discovery captures are written (default: `<repo>/.discovery-sessions` in a source checkout, `~/owa-mcp/discovery-sessions` otherwise) |
 
 Any of these can also live in a gitignored `.env.local` file next to
 `pyproject.toml` (copy `.env.local.example`) — the server loads it at startup
@@ -125,7 +126,7 @@ setup step, no login script. The persistent browser profile *is* the session.
 Every line goes to stderr:
 
 ```
-[exchange-mcp] exchange-mcp-server 2.0.0b2
+[exchange-mcp] exchange-mcp-server 2.0.0b3
 [exchange-mcp] OWA URL:     https://owa.example.com
 [exchange-mcp] Profile dir: /home/you/owa-mcp/.browser-profile
 [exchange-mcp]   source:    default for an installed package
@@ -194,7 +195,7 @@ Note that this is *diagnosis only*. The login window never aborts early on an
 error message: you're sitting in front of it, so a mistyped password or an
 accidentally denied push is something you just retry there.
 
-## Tools (48)
+## Tools (60)
 
 ### Email (15)
 | Tool | Description |
@@ -229,6 +230,24 @@ accidentally denied push is something you just retry there.
 | `assign_event_categories` | Tag calendar events with one or more categories |
 | `remove_event_categories` | Remove categories from calendar events |
 | `find_events_by_category` | Find calendar events tagged with a given category |
+
+### Tasks (6)
+
+Exchange `Task` items — the same items **Microsoft To Do** shows in Outlook on the web.
+Every tool takes a `task_folder`, which is the To Do list to work in: `tasks` (the
+default) for the mailbox's default list, a list name, a `tasks/<list>` path, or a folder
+ID from `get_folders(parent_folder_id="tasks")`. Managing the *lists* themselves is the
+folder tools' job, not these. To Do's "Flagged Email" list isn't made of tasks — use
+`set_email_flag` for that.
+
+| Tool | Description |
+|---|---|
+| `get_tasks` | List tasks in a To Do list, due-date first, open-only by default |
+| `get_task` | Get one task's full detail, including its note body |
+| `create_task` | Create a task with due/start dates, note, categories and reminder |
+| `update_task` | Update only the fields you pass; can also clear dates/reminder |
+| `complete_task` | Mark tasks complete, or reopen them |
+| `delete_task` | Delete tasks (soft to Deleted Items, or permanent) |
 
 ### Categories (4)
 | Tool | Description |
@@ -285,6 +304,34 @@ and drive Copilot's chat pane via Playwright UI automation, since Copilot has
 no documented API — see `exchange_mcp/tools/copilot.py` and PROJECT_STATUS.md
 for the current (unverified, pending a live discovery spike) status.
 
+### Discovery (6)
+| Tool | Description |
+|---|---|
+| `start_discovery_session` | Open a fresh, independent browser on a throwaway profile and record everything the user does in OWA |
+| `get_discovery_status` | Poll a recording — state plus live capture counters |
+| `stop_discovery_session` | End a recording now (normally the user just closes the window) |
+| `classify_discovery_session` | Classify captured endpoints as unknown API / known API with unused parameters / already covered, and propose tools, modules and IDs |
+| `list_discovery_sessions` | List recorded captures, including ones from previous server runs |
+| `get_discovery_detail` | Get the real captured request payload for one endpoint, to implement against |
+
+These tools don't read or write a mailbox — they exist to find out **what OWA
+can do that this server can't yet**. A discovery session opens its own Chromium
+on a brand-new temporary profile (so **you sign in inside that window**, and
+nothing done there can affect the server's own profile), records every API call
+and UI action until you close the window, then compares what it saw against
+what this codebase actually implements — a baseline read directly out of the
+source, so it can't go stale.
+
+Sign-in traffic is dropped from the capture entirely, no token, cookie or
+canary is ever written to disk, no input values are recorded, and response
+bodies are stored as a content-free field/type skeleton unless you ask for raw
+bodies. Captures land in `.discovery-sessions/` (gitignored — they still hold
+real mailbox metadata like folder names and field names).
+
+The `owa-capability-discovery` skill in `.claude/skills/` drives the whole flow
+interactively: declare a scope, record, review the proposals, and optionally
+implement them.
+
 ## Files
 
 ```
@@ -296,6 +343,7 @@ exchange_mcp/
   tools/
     email.py              # Email tools
     calendar.py           # Calendar tools
+    tasks.py              # Task / Microsoft To Do CRUD
     categories.py         # Master category list CRUD
     people.py             # Directory search
     folders.py            # Folder management & session check
@@ -303,6 +351,12 @@ exchange_mcp/
     analytics.py          # Meeting stats & contacts
     auth.py               # Login tool (opens the sign-in window)
     copilot.py            # Copilot chat-pane delegation (UI automation)
+    discovery.py          # Capability discovery: record a session, classify its API surface
+  discovery_session.py    # Recorder: separate Chromium, throwaway profile, user-driven
+  capability_inventory.py # What's already implemented (AST scan of this package)
+  capability_classify.py  # Verdicts + implementation proposals for a capture
+.claude/skills/
+  owa-capability-discovery/  # Interactive discovery skill (scope -> record -> propose)
 tests/
   unit/                   # Pure-logic tests (no mailbox, no browser)
   smoke/                  # Live-mailbox end-to-end tests, one module per tool

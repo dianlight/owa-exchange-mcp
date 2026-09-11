@@ -7,12 +7,12 @@
     "url": "https://github.com/dianlight/owa-exchange-mcp",
     "source": "github"
   },
-  "version": "2.0.0b2",
+  "version": "2.0.0b4",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "exchange-mcp-server",
-      "version": "2.0.0b2",
+      "version": "2.0.0b4",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
@@ -36,6 +36,11 @@
         {
           "name": "EXCHANGE_HEADLESS",
           "description": "Set to false/0 to run the browser with a visible window (for debugging)",
+          "required": false
+        },
+        {
+          "name": "EXCHANGE_DISCOVERY_DIR",
+          "description": "Where capability-discovery captures are written (default: ~/owa-mcp/discovery-sessions)",
           "required": false
         }
       ]

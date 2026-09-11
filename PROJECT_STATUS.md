@@ -545,6 +545,121 @@ version; and the installed-package branch was confirmed by installing that wheel
 throwaway venv and resolving `default_profile_dir()` from outside the repo →
 `~/owa-mcp/.browser-profile`.
 
+**Update 2026-09-11 — new Task module (Microsoft To Do), 6 tools, all `OK` against a live
+mailbox.** `exchange_mcp/tools/tasks.py` adds full CRUD over `Task` items — the item class
+behind Microsoft To Do's lists (`outlook.cloud.microsoft/host/<app-guid>/ToDoId`) — as module
+**10**, the first 4-digit ID block (#1001-1006, see §2). It's built on the plain EWS item
+actions like the rest of the codebase, and it applies three lessons from earlier tool modules
+up front rather than after the first live failure:
+
+- Reads use `BaseShape: "AllProperties"` with **no** `AdditionalProperties`, because a single
+  mis-spelled `FieldURI` fails the entire request on this backend (#114/#115). Bodies, which
+  `FindItem` never returns, cost one extra `GetItem` per row — and degrade per row
+  (`body_error`) rather than failing the page, per the §4 unfetchable-item note.
+- Writes have to name fields, so every `FieldURI` spelling lives in one `_FIELD` dict, and
+  `update_task` returns `attempted_fields` on failure — an "Invalid argument used to call
+  method UpdateItem" is otherwise a dead end with no indication of *which* field it means.
+- `DueDate`/`StartDate` are written as UTC midnight (`…T00:00:00.000Z`), which is how Exchange
+  stores task dates; writing local-midnight wall-clock instead is the classic off-by-one-day
+  task-date bug. Reads go out on `Exchange2013` with no `TimeZoneContext`, so the date part
+  round-trips in the frame it was written in — `test_task_lifecycle.py` asserts that exact
+  round-trip rather than merely that *a* date came back.
+
+Also touched: `DISTINGUISHED_FOLDERS` in [owa_client.py](exchange_mcp/owa_client.py) gained
+`tasks` (+ Russian alias), which is what lets `_resolve_folder_path()` walk `tasks/<list name>`
+— a To Do list is a child of the Tasks root, not of `msgfolderroot` where `get_folder_id()`'s
+bare-name lookup searches.
+
+**Live run, same day** (isolated profile + port 8765, so the always-on 8766 instance and its
+shared `.browser-profile` were untouched): all three guesses above held — every `FieldURI`
+spelling was accepted, the UTC-midnight date round-trip is exact, and the reminder was stored
+and read back. Five of six tools passed on the first attempt. Four things the run taught, each
+now fixed or documented in code:
+
+1. **A deleted task's ItemId stays resolvable.** `get_task` still returns the item after both a
+   soft *and* a `permanent` delete, with a bumped ChangeKey — the backend resolves the ID to the
+   item in its new location instead of failing. `delete_task` was working; the *test's*
+   post-condition ("get_task now fails") was wrong, and was the sole failure of the first run.
+   Deletion is now verified by absence from the folder listing, the same way `empty_folder`'s
+   test does it.
+2. **`PercentComplete` comes back as a string** (`"100"`), so `_to_public` coerces it — a caller
+   comparing `== 100` would otherwise never match. (Also confirms the server derives
+   `PercentComplete`/`CompleteDate` from a `Status`-only write, as the EWS reference says.)
+3. **Pointing `task_folder` at a mail folder yielded pseudo-tasks.** `FindItem` there returns
+   messages, which the mapper turned into subject-only "tasks" with no status or dates.
+   `get_tasks` now filters on each item's own `__type` and reports `skipped_non_task_items`;
+   verified against `deleteditems` (500 scanned, 499 skipped, the 1 genuine task found).
+4. **A bare distinguished ID (`deleteditems`, `msgfolderroot`) didn't resolve**, because
+   `get_folder_id()` maps user-facing *names* ("deleted"), not the IDs themselves. Now accepted
+   as a last resort — after every name lookup misses, so a technical ID can't shadow a To Do
+   list that shares its name.
+
+Reminders carry the codebase-wide hardcoded-timezone quirk into user-visible territory: written
+in `Russian Standard Time` (UTC+3) and read back in UTC, so an 09:30 reminder reads as `06:30`
+and fires at 09:30 Moscow time — right for a UTC+3 mailbox, three hours early elsewhere. Logged
+in §4; it's a codebase-wide fix, not a Task-module one.
+
+Both tests are self-cleaning (every task is `permanent`-deleted, including on failure paths).
+The one leftover from the first, failed run was found and purged: the mailbox's Tasks and
+Deleted Items folders hold no `task-smoke-*` items.
+
+**Update 2026-09-11 (continued) — new Discovery module (module 11, 6 tools) plus an
+interactive skill: find the OWA surface this server *doesn't* implement.** Every gap closed
+so far was found the same way — someone noticed a feature in OWA's own UI, opened
+`--show-browser`, watched the network tab, and reverse-engineered the call (the category
+write-path #208/#209, `GetSchedule` #602, Substrate search #401 all came from exactly that).
+`exchange_mcp/tools/discovery.py` turns that manual loop into a repeatable one:
+`start_discovery_session` opens a **separate** Chromium on a **throwaway profile**, the user
+signs in and exercises whatever they want to explore, closing the window ends the recording,
+and `classify_discovery_session` sorts every captured endpoint into *unknown API* / *known
+API with parameters we never send* / *already covered* — then proposes tools, modules, and
+permanent IDs. The `owa-capability-discovery` skill
+([.claude/skills/](.claude/skills/owa-capability-discovery/SKILL.md)) drives the whole flow
+interactively, including the implementation checklist afterwards.
+
+Four design points, each with a tempting wrong alternative:
+
+- **A second browser, not the shared `BrowserSession`.** That singleton owns the signed-in
+  profile every tool's transport rides on; driving it interactively would navigate the anchor
+  page out from under in-flight calls, and recording on it would fill the capture with this
+  server's *own* traffic — precisely the traffic that's supposed to count as
+  already-implemented. The recorder copies the loop-on-a-background-thread pattern instead of
+  reusing the instance.
+- **The implemented baseline is read out of this repo with `ast`, never hardcoded.** A
+  hand-maintained list of "actions we support" goes stale the first time someone adds a tool,
+  and a stale baseline reports last week's work as an undiscovered gap — the most expensive
+  way this feature could fail. `capability_inventory.py` scans the call sites
+  (`client.request("FindItem", …)`), resolves module-level constants (`_ACTION` in
+  categories.py), and credits module-level tables (`_FIELD` in tasks.py) to every action in
+  the file. That last rule was found by test: without it `UpdateItem` had *zero* known
+  FieldURIs, so every one OWA sends would have been reported as new.
+- **Redaction is a correctness requirement, not hygiene.** A fresh profile means the capture
+  always runs through a live sign-in, so requests to sign-in hosts are dropped before
+  anything is written, only an allowlist of headers is recorded (never `Authorization` /
+  `Cookie` / `X-OWA-CANARY`), the injected page script records no input values, and response
+  bodies are stored as a *content-free* field/type skeleton unless raw bodies are explicitly
+  requested. `tests/unit/test_capability_classify.py` asserts all four directly.
+- **Classification reads the capture files, not the live recorder**, so a session survives a
+  server restart and can be re-classified after implementing a proposal — the endpoint should
+  move from `unknown_api` to `known_api_covered`, which is a free check that what was built
+  matches what OWA actually sent.
+
+Verdicts are deliberately biased toward **under**-reporting (a missed finding costs one more
+capture; a fabricated one costs a developer an afternoon), and the domain knowledge lives in
+two keyword tables in `capability_classify.py` — the same "correct the table, not the code"
+arrangement as [auth_errors.py](exchange_mcp/auth_errors.py).
+
+**Verified end-to-end 2026-09-11** against a local stand-in server (a throwaway page firing
+two synthetic OWA actions): both transports captured and correctly distinguished — including
+the `X-OWA-UrlPostData` header-payload variant, which a `post_data`-only recorder would have
+logged as a parameterless call — UI click and navigation captured and attributed to the calls
+they triggered, telemetry filtered, no bearer token anywhere in the capture, and the report
+proposing a new `inbox_rules` module with correctly allocated IDs. One real bug found and
+fixed that way: the temporary Chromium profile leaked, because cleanup runs on a daemon
+thread that process exit kills outright. Now retried while Chromium releases its lock, with
+the outcome recorded in the manifest, plus a sweep of abandoned `owa-discovery-*` profiles at
+the start of each session. The live-mailbox path (a real sign-in, a real OWA exploration) has
+not been driven by a human yet, so all six rows are `Pending`.
 **Update 2026-09-11 — Copilot smoke test written and run: all five tools KO,
 and the discovery spike is now precisely scoped.** Added
 [tests/smoke/tests/test_copilot.py](tests/smoke/tests/test_copilot.py), closing the last
@@ -604,13 +719,14 @@ is a property of the selectors, not of one browser profile's state.
 
 ## 2. How to read the table
 
-- **ID** — a permanent 3-digit identifier: digit 1 is the module number (fixed per
-  module, see the module list below), digits 2-3 are the tool's sequence number within
-  that module. Once assigned, a tool's ID never changes or gets reused, even if the
-  table is reordered or tools are added/removed elsewhere — see CLAUDE.md's "Maintaining
-  PROJECT_STATUS.md" section for the assignment rule. Module numbers: 1 Email, 2
-  Calendar, 3 Categories, 4 Directory, 5 Folders, 6 Availability, 7 Analytics, 8 Auth,
-  9 Copilot.
+- **ID** — a permanent identifier, `<module number><2-digit sequence within that module>`:
+  3 digits for the single-digit modules, 4 for module 10 onward. Once assigned, a tool's ID
+  never changes or gets reused, even if the table is reordered or tools are added/removed
+  elsewhere — see CLAUDE.md's "Maintaining PROJECT_STATUS.md" section for the assignment
+  rule. Module numbers: 1 Email, 2 Calendar, 3 Categories, 4 Directory, 5 Folders,
+  6 Availability, 7 Analytics, 8 Auth, 9 Copilot, 10 Tasks, 11 Discovery. Tasks (added 2026-09-11) is
+  where the ID width grew: every single digit was already spoken for, and reusing or
+  renumbering a module digit is forbidden, so the module part gained a digit instead.
 - **Automated test** — the test module(s) covering the row, or `None`. Coverage is
   `tests/smoke/` (live-mailbox, end-to-end, one module per tool) plus `tests/unit/`
   (pure logic, no mailbox). There is still no CI config — everything is run by hand.
@@ -638,7 +754,7 @@ is a property of the selectors, not of one browser profile's state.
   `--stable` CLI flag / `EXCHANGE_MCP_STABLE` env var excludes from the MCP tool listing at
   startup — keep the two in sync (see CLAUDE.md's "Maintaining PROJECT_STATUS.md" section).
 
-## 3. Tool inventory (48 tools across 9 modules)
+## 3. Tool inventory (60 tools across 11 modules)
 
 ### Email — [exchange_mcp/tools/email.py](exchange_mcp/tools/email.py) (15)
 
@@ -733,6 +849,66 @@ is a property of the selectors, not of one browser profile's state.
 | 904 | `coach_draft` | Ask Copilot's compose coaching for feedback on a draft reply's tone/clarity | `tests/smoke/tests/test_copilot.py` | **KO (2026-09-11)** — same pane-locator timeout as #901; likewise, whether "Coaching" lives inside an in-progress compose window instead of the chat pane remains unverified | Dev |
 | 905 | `meeting_prep` | Ask Copilot to prepare a briefing for an upcoming meeting (context, documents, action items) | `tests/smoke/tests/test_copilot.py` | **KO (2026-09-11)** — different failure from the email tools: `Could not find a Copilot launch button on the current page`, i.e. after the guessed calendar deep link (`<origin>/calendar/item/<id>`) the page had no Copilot-named button at all. Because a failed navigation is swallowed by design, that also implicates the event deep-link shape | Dev |
 
+### Tasks — [exchange_mcp/tools/tasks.py](exchange_mcp/tools/tasks.py) (6)
+
+Module number **10**, so these are the first **4-digit** IDs in this table: digits 1-9 were
+already taken (Email…Copilot) and the numbering rule forbids reusing or renumbering a module
+digit, so the module part simply grew a digit rather than colliding with an existing one. The
+per-module sequence numbering (`10` + `01`, `10` + `02`, …) is unchanged.
+
+`Task` is Exchange's own name for the item class (`Task:#Exchange`, `IPM.Task`) in the `tasks`
+distinguished folder; the modern web UI surfaces the same items as **Microsoft To Do**
+(`outlook.cloud.microsoft/host/<app-guid>/ToDoId`), with each To Do *list* being a child folder
+of that root. These tools therefore use the plain EWS item actions (`FindItem`/`GetItem`/
+`CreateItem`/`UpdateItem`/`DeleteItem`) rather than To Do's private REST surface — that path
+exists on both the classic canary-cookie and modern bearer backends and needs no new transport.
+There is deliberately **no task-list (folder) CRUD here**: a To Do list is an ordinary folder, so
+`get_folders(parent_folder_id="tasks")` enumerates them and the `*_folder` tools already
+create/rename/delete them (caveat: `create_folder` hardcodes `FolderClass: "IPF.Note"`, so it
+makes a *mail* folder — creating a genuine To Do list still needs Outlook/To Do itself, see §4).
+To Do's "Flagged Email" list is a view over flagged messages, not `Task` items, so it isn't
+visible to these tools — use `set_email_flag` (#115).
+
+| ID | Tool | Description | Automated test | Manual QA / Status | Stability |
+|---|---|---|---|---|---|
+| 1001 | `get_tasks` | List tasks from a To Do list / task folder, due-date ascending with undated last; filters completed client-side (`include_completed`), skips non-`Task` items (a mail folder would otherwise yield subject-only pseudo-tasks — reported as `skipped_non_task_items`), optional per-task body with per-item `body_error` degradation, reports `scanned` so "no matches" is distinguishable from the 500-item scan ceiling | `tests/smoke/tests/test_task_lifecycle.py`, `tests/smoke/tests/test_task_folder_targeting.py` | OK (2026-09-11) — 14 tasks listed from the default list, completed-filter verified both ways; non-task filter verified by pointing it at `deleteditems` (500 scanned, 499 skipped, the 1 real task found). `task_folder` name/path resolution is **not** covered — its test skips itself, see §4 | Stable |
+| 1002 | `get_task` | Get one task's full detail (status, dates, reminder, importance, categories, owner, body, change_key) | `tests/smoke/tests/test_task_lifecycle.py` | OK (2026-09-11) — subject, UTC-midnight due date, status, body, categories, importance and reminder all verified round-tripping. `PercentComplete` arrives as a *string* (`"100"`) from this backend and is coerced to int | Stable |
+| 1003 | `create_task` | Create a task with due/start dates, note body, status, importance, categories and reminder, in any To Do list | `tests/smoke/tests/test_task_lifecycle.py`, `tests/smoke/tests/test_task_folder_targeting.py` | OK (2026-09-11) — created in the default list with every optional field set; only the default-list path is covered (see #1001) | Stable |
+| 1004 | `update_task` | Partial update — only the arguments passed are written; `clear_due_date`/`clear_start_date`/`clear_reminder` erase a field (`DeleteItemField`), and `status`+`percent_complete` together is rejected client-side (Exchange resolves the two against each other by whichever it processes last) | `tests/smoke/tests/test_task_lifecycle.py` | OK (2026-09-11) — subject + due date + `Status` + `clear_reminder` written in one request and verified by re-read, i.e. every `_FIELD` spelling exercised there is confirmed accepted (`item:Subject`, `item:ReminderIsSet`, `task:DueDate`, `task:Status`) | Stable |
+| 1005 | `complete_task` | Mark tasks complete / reopen them, writing `Status` only; returns per-item results including the *new* ItemId Exchange mints when a recurring occurrence is completed | `tests/smoke/tests/test_task_lifecycle.py` | OK (2026-09-11) — `Status=Completed` verified on the item (`is_complete`, `complete_date` = today, `percent_complete` 100 set by the server from `Status` alone) and through both listing filters. The recurring-task ID-split path is untested (no recurring task to hand) | Stable |
+| 1006 | `delete_task` | Delete tasks (soft to Deleted Items, or `permanent` HardDelete), `AffectedTaskOccurrences: AllOccurrences` | `tests/smoke/tests/test_task_lifecycle.py`, `tests/smoke/tests/test_task_folder_targeting.py` | OK (2026-09-11) — verified by absence from the folder listing. A deleted task's **ItemId stays resolvable**, so `get_task` keeps returning the item afterwards with a bumped ChangeKey; the first test run failed on exactly that wrong post-condition before the tool was cleared | Stable |
+
+### Discovery — [exchange_mcp/tools/discovery.py](exchange_mcp/tools/discovery.py) (6)
+
+Module number **11**. The only module here that doesn't read or write a mailbox: these tools
+exist to find out **what OWA can do that this server can't yet**, and to turn that into
+implementation proposals. Meant to be driven by the `owa-capability-discovery` skill
+([.claude/skills/owa-capability-discovery/SKILL.md](.claude/skills/owa-capability-discovery/SKILL.md)),
+which handles the interactive part (scope, waiting, presenting, implementing).
+
+The work is split across three non-tool modules so each half stays testable on its own:
+[discovery_session.py](exchange_mcp/discovery_session.py) captures (its own Chromium, its own
+throwaway profile, visible, user-driven — never the shared `BrowserSession`),
+[capability_inventory.py](exchange_mcp/capability_inventory.py) builds the implemented baseline
+by `ast`-scanning this repo's own call sites so it can't go stale, and
+[capability_classify.py](exchange_mcp/capability_classify.py) produces the verdicts and
+proposals as pure logic. See the 2026-09-11 update above for the design points and the
+redaction rules (sign-in hosts dropped, no `Authorization`/`Cookie`/canary recorded, no input
+values, response bodies stored as a content-free field/type skeleton by default).
+
+`start_discovery_session` is start-and-poll like `login` (#801) for the same reason: a
+recording spans a human sign-in plus however long the user browses, which no MCP client will
+hold a request open for.
+
+| ID | Tool | Description | Automated test | Manual QA / Status | Stability |
+|---|---|---|---|---|---|
+| 1101 | `start_discovery_session` | Open a fresh, independent Chromium on a brand-new temporary profile and record every API call and UI action until the user closes the window. Requires a `scope`; returns immediately. Refuses to start a second concurrent recording | `tests/unit/test_capability_classify.py` (redaction rules, temp-profile cleanup) | **Pending** — new module; the Playwright wiring is verified end-to-end against a local stand-in server (2026-09-11, see the update above), but no human has driven a real OWA sign-in + exploration through it yet | Stable |
+| 1102 | `get_discovery_status` | Poll a recording: `state` (`recording`/`finished`/`stopped`) plus live counters (`api_calls`, `ui_actions`, `navigations`, noise filtered, sign-in traffic dropped). Falls back to reading the manifest from disk for sessions recorded before a server restart | None | **Pending** — new module | Stable |
+| 1103 | `stop_discovery_session` | End a recording now, closing its window. Normally unnecessary — the user closing the window is what ends a recording | None | **Pending** — new module | Stable |
+| 1104 | `classify_discovery_session` | Classify a capture against the implemented baseline: per endpoint `unknown_api` / `known_api_new_parameters` / `known_api_covered`, grouped into capability classes, with proposals for new modules, new tools and tool changes carrying permanent IDs allocated per §2's numbering rule. Writes `report.json` + `report.md`; re-runnable with a different `scope`, and re-runnable after implementing a proposal as a coverage check | `tests/unit/test_capability_classify.py` (verdicts in both directions, proposals, ID allocation, Markdown rendering) | **Pending** — new module; classification itself is unit-tested against fixtures and one synthetic live capture | Stable |
+| 1105 | `list_discovery_sessions` | List capture directories newest-first, including sessions from previous server runs (classification works off the files), with their scope, counters and whether a report exists | None | **Pending** — new module | Stable |
+| 1106 | `get_discovery_detail` | Return the real captured requests for one endpoint — full request payload with its `__type` annotations, whether it rode in `X-OWA-UrlPostData`, and the response field/type skeleton. What you call to actually implement against a proposal | None | **Pending** — new module | Stable |
+
 ## 4. Gaps worth closing
 
 - **`expand_recurrences`: all recurrence patterns in this mailbox now expand; the
@@ -793,7 +969,7 @@ is a property of the selectors, not of one browser profile's state.
   `_build_recipient_list` handling empty/whitespace addresses, or `folder_id_dict()`
   picking the right `__type` for a distinguished vs. opaque folder ID.
 - **No live/manual QA log.** There's no record (changelog, issue tracker, etc.) of which
-  of the 48 tools have actually been run against a real OWA mailbox since the
+  of the 54 tools have actually been run against a real OWA mailbox since the
   browser-session rewrite. This document's "Manual QA / Status" column is a template for
   that log — fill it in as you verify each tool.
 - **Copilot module (#901-905) needs a live discovery spike — now confirmed necessary, and
@@ -825,6 +1001,33 @@ is a property of the selectors, not of one browser profile's state.
   structural risk on every multi-session run, not an edge case. The lifespan fix removes most of
   that exposure (one browser per process now, not per session), but the underlying gap — no
   stuck-lock detection/recovery — is still open and worth hardening later.
+- **Reminder times are written in a hardcoded timezone, and for tasks that's now
+  user-visible.** Every write in this codebase sends `TimeZoneContext` =
+  `Russian Standard Time` (UTC+3) — inherited from the original scripts, and harmless while
+  it only affected calendar reads. `create_task`/`update_task`'s `reminder` inherits it, so a
+  reminder asked for at 09:30 is stored as 09:30 Moscow and read back as `06:30` UTC
+  (confirmed live 2026-09-11): correct for a UTC+3 mailbox, three hours early anywhere else.
+  The real fix is resolving the mailbox's own timezone once (OWA exposes it in its session
+  config) and threading it through every `TimeZoneContext`/`CalendarView` — a codebase-wide
+  change touching calendar, availability and tasks, hence logged here rather than patched
+  locally. Documented in `tasks.py`'s module docstring and both tool docstrings meanwhile.
+- **`task_folder` name/path resolution is written but untested, because no To Do list exists
+  to test it against.** `create_folder` (#503) hardcodes `FolderClass: "IPF.Note"`, so it
+  makes a *mail* folder; a genuine To Do list needs `IPF.Task`(`.Todo`) under the `tasks` root.
+  So `test_task_folder_targeting.py` — which covers the bare-name, `tasks/<list>`-path and
+  raw-folder-ID spellings plus the negative "child-list task must not appear in the default
+  list" case — **skips itself** on this mailbox (verified 2026-09-11: it does skip, cleanly,
+  and reports why). Only the default-list path and the distinguished-ID fallback (probed
+  against `deleteditems`) are actually exercised today. Closing this is a one-argument change
+  to `create_folder` (expose `folder_class`), after which the test covers itself; until then,
+  creating a list by hand in To Do and re-running the test is the cheap workaround.
+- **The recurring-task paths in the Task module are untested.** `complete_task`/`update_task`
+  document and propagate the ID split Exchange performs when an occurrence of a recurring task
+  is completed (a new one-off item is minted and the original ID rolls forward to the next
+  occurrence), and `delete_task` sends `AffectedTaskOccurrences: AllOccurrences`. None of it
+  has met a real recurring task — the smoke test builds a single, non-recurring one, and
+  `create_task` deliberately exposes no `recurrence` argument, so the module can't create one
+  to test with either.
 - **Cosmetic message bug in `respond_to_meeting`.** Its success message is built as
   `f"Meeting {response.lower()}ed"` ([calendar.py:1106](exchange_mcp/tools/calendar.py:1106)),
   which reads fine for "Accept"/"Decline" ("accepted"/"declined") but produces
