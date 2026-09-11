@@ -20,6 +20,7 @@ Run standalone:
     python -m tests.unit.test_capability_classify
 """
 
+import inspect
 import os
 import shutil
 import sys
@@ -27,6 +28,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from exchange_mcp import capability_classify as cc
 from exchange_mcp import discovery_session as ds
 from exchange_mcp.capability_classify import (
     KNOWN_API_COVERED,
@@ -387,6 +389,55 @@ def test_markdown_report() -> None:
 # ----------------------------------------------------------------------
 
 
+def test_structural_keys_are_not_findings() -> None:
+    """Body-rendering and shape-grammar keys must not read as discoveries.
+
+    Live capture 20260911-112708-e917 scored `known_api_covered: 0` on 150
+    endpoints because a real OWA read sends HTML-sanitisation options and
+    restriction grammar we deliberately never send, so every known action came
+    back as "new parameters". The two checks below pin both sides of that line:
+    the grammar is dropped, but `Restriction` - which signals that OWA filters
+    a read we don't - stays reportable.
+    """
+    print("Structural keys are not findings")
+
+    records = _records() + [
+        {"type": "request", "action": "GetItem", "method": "POST", "status": 200,
+         "url": "https://owa/owa/service.svc?action=GetItem", "path": "/owa/service.svc",
+         "body": {"Body": {"ItemShape": {
+             "BaseShape": "IdOnly",
+             # rendering options + extended-property grammar: all noise
+             "FilterHtmlContent": True, "InlineImageUrlTemplate": "x",
+             "CssScopeClassName": "y", "MaximumBodySize": 100,
+             "PropertySetId": "guid", "PropertyName": "p", "PropertyType": "String",
+             # ...and one key that genuinely names a capability
+             "MaximumRecipientsToReturn": 10,
+         }}}, "at": "t5"},
+    ]
+    report = classify(records, _synthetic_inventory(), scope="")
+    by_endpoint = {f["endpoint"]: f for f in report["findings"]}
+
+    new_keys = by_endpoint["GetItem"]["new_parameters"]
+    for noise in ("FilterHtmlContent", "InlineImageUrlTemplate", "CssScopeClassName",
+                  "MaximumBodySize", "PropertySetId", "PropertyName", "PropertyType"):
+        check(f"{noise} is not reported as a new parameter",
+              noise not in new_keys, str(new_keys))
+    check("a genuine capability key survives the filter",
+          "MaximumRecipientsToReturn" in new_keys, str(new_keys))
+
+    # The other side of the line, so the table can't grow back over it.
+    check("Restriction stays reportable",
+          "Restriction" in by_endpoint["FindItem"]["new_parameters"],
+          str(by_endpoint["FindItem"]["new_parameters"]))
+    for container in ("Restriction", "SortOrder", "AdditionalProperties", "TimeZoneContext"):
+        check(f"{container} is not listed as structural",
+              container.lower() not in cc._STRUCTURAL_REQUEST_KEYS)
+
+    check("a fully-exercised action can still reach known_api_covered",
+          report["counts"]["known_api_covered"] >= 1,
+          str(report["counts"]))
+
+
 def test_capture_redaction() -> None:
     print("Capture redaction")
     for host in ("login.microsoftonline.com", "login.live.com", "contoso.b2clogin.com",
@@ -403,6 +454,17 @@ def test_capture_redaction() -> None:
           set(ds._API_RESOURCE_TYPES) == {"fetch", "xhr"}, str(ds._API_RESOURCE_TYPES))
     check("the injected page script never reads input values",
           ".value" not in ds._INIT_SCRIPT)
+
+    # WebSocket frames on a Copilot socket *are* mailbox content (the prompt
+    # and the generated answer), so they follow the same opt-in as HTTP bodies:
+    # by default only direction and size reach disk.
+    ws_source = inspect.getsource(ds.DiscoveryRecorder._on_websocket)
+    check("websocket frame payloads are gated on capture_response_bodies",
+          "self.capture_response_bodies" in ws_source)
+    check("websocket sign-in traffic is dropped like HTTP sign-in traffic",
+          "_is_login_host" in ws_source)
+    check("websocket frame size is recorded unconditionally",
+          '"size"' in ws_source)
 
 
 def test_profile_cleanup() -> None:
@@ -450,6 +512,7 @@ def main() -> bool:
         test_classification_proposals,
         test_no_scope_means_everything_in_scope,
         test_markdown_report,
+        test_structural_keys_are_not_findings,
         test_capture_redaction,
         test_profile_cleanup,
     ):

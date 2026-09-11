@@ -122,6 +122,21 @@ _NOISE_PATH_HINTS = (
     "/serviceworker",
     "browser.pipe",
     "/rp/",
+    # Instrumentation and client-config endpoints that survived the filters
+    # above in capture 20260911-112708-e917 and dominated its report: the top
+    # "discovery" was /pacman/api/clientevents with 52 calls, and a whole
+    # fabricated module was proposed off /config/v1/Fluid (an ECS feature-flag
+    # fetch). None of these move mailbox data - they are the single loudest
+    # source of false findings in a Copilot-heavy session, where the side
+    # panel logs a client event per interaction.
+    "/pacman/",
+    "/clientevents",
+    "/api/v1/events",
+    "/userconfig",
+    "/uxversion",
+    "/config/v1/",
+    "events.data.microsoft.com",
+    "titles.prod.mos.microsoft.com",
 )
 
 # Only these resource types can be an API call. Everything else (scripts,
@@ -305,6 +320,8 @@ class DiscoveryRecorder:
             "noise_filtered": 0,
             "login_traffic_dropped": 0,
             "request_failures": 0,
+            "websockets": 0,
+            "websocket_frames": 0,
         }
 
         self._lock = threading.Lock()
@@ -405,6 +422,61 @@ class DiscoveryRecorder:
 
     def _on_page(self, page) -> None:
         page.on("framenavigated", self._on_frame_navigated)
+        page.on("websocket", self._on_websocket)
+
+    # ------------------------------------------------------------------
+    # Capture: WebSockets
+    # ------------------------------------------------------------------
+    #
+    # Added because capture 20260911-112708-e917 could not answer the question
+    # it was run for. Copilot's chat pane produced answers while *no* HTTP
+    # request in the capture carried either the prompt or the response, and the
+    # recorder hooked only `response`/`requestfailed` - so a WebSocket-based
+    # backend was invisible rather than ruled out. "No HTTP endpoint" and "no
+    # endpoint" are very different findings, and the second one is what a
+    # reader takes away from a silent report.
+    #
+    # Redaction, following the same rule as response bodies: a WS frame on a
+    # chat socket *is* mailbox content (the prompt, the generated answer). By
+    # default only the socket's existence, direction and payload sizes are
+    # recorded - enough to prove a channel exists and see how much flows each
+    # way. Frame payloads are written only when the session was started with
+    # `capture_response_bodies=True`, the same explicit opt-in that governs
+    # HTTP bodies.
+
+    def _on_websocket(self, ws) -> None:
+        try:
+            url = str(getattr(ws, "url", "") or "")
+            host = urlparse(url).netloc.lower()
+            if _is_login_host(host):
+                return
+
+            self._write(self._network_file, {
+                "type": "websocket", "at": _now(), "event": "open", "url": url,
+                "ui_hint": self._last_ui_label,
+            })
+            with self._lock:
+                self.counters["websockets"] += 1
+
+            def on_frame(payload, direction):
+                try:
+                    size = len(payload) if payload is not None else 0
+                    record = {
+                        "type": "websocket_frame", "at": _now(), "url": url,
+                        "direction": direction, "size": size,
+                    }
+                    if self.capture_response_bodies:
+                        record["payload"] = payload if isinstance(payload, str) else "<binary>"
+                    self._write(self._network_file, record)
+                    with self._lock:
+                        self.counters["websocket_frames"] += 1
+                except Exception:
+                    pass
+
+            ws.on("framesent", lambda p: on_frame(p, "sent"))
+            ws.on("framereceived", lambda p: on_frame(p, "received"))
+        except Exception:
+            pass
 
     def stop(self, timeout: float = 60) -> dict:
         """Close the window and finalize, for ending a session without closing it by hand.

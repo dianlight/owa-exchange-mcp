@@ -166,10 +166,16 @@ def get_discovery_status(session_id: str | None = None, ctx: Context = None) -> 
 
     Returns:
         JSON with `state` (`recording` / `finished` / `stopped`), live capture
-        counters (`api_calls`, `ui_actions`, `navigations`, plus how much was
-        filtered as noise or dropped as sign-in traffic), and the capture
-        directory. `state: "finished"` means the user closed the window and
-        the capture is ready to classify.
+        counters (`api_calls`, `ui_actions`, `navigations`, `websockets`,
+        `websocket_frames`, plus how much was filtered as noise or dropped as
+        sign-in traffic), and the capture directory. `state: "finished"` means
+        the user closed the window and the capture is ready to classify.
+
+        `api_calls` stuck at 0 while `recording` almost always means the
+        sign-in hasn't been completed. A non-zero `websockets` on a feature
+        with no interesting `api_calls` is the other useful signal: it means
+        the feature talks over a socket, so its payloads are only recorded if
+        the session was started with `capture_response_bodies=True`.
     """
     try:
         recorder = ds.get_recorder(session_id)

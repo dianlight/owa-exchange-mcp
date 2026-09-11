@@ -3,11 +3,20 @@
 Delegates work to Microsoft Copilot's chat pane inside the modern Outlook
 web client, via BrowserSession's Copilot UI-automation helpers - unlike
 every other tool module here, this drives Copilot's actual DOM instead of
-a documented JSON action, because Copilot has no such action. Only usable
-when the session is in "bearer" auth mode (BrowserSession.auth_mode); every
-tool here fails with a clear error instead of a confusing one on classic
-OWA tenants. See PROJECT_STATUS.md's Copilot module notes for the
-discovery-spike caveats behind the selectors in browser_session.py.
+a documented JSON action, because Copilot has no such action. Discovery
+capture 20260911-112708-e917 confirmed that directly: no HTTP request in a
+full recorded Copilot session carried either the prompt or the generated
+answer, so the UI automation is the design, not a temporary shim.
+
+Only usable when the session is in "bearer" auth mode
+(BrowserSession.auth_mode); every tool here fails with a clear error
+instead of a confusing one on classic OWA tenants.
+
+The pane is a **cross-origin iframe**, which is what made every tool here
+fail its first live run - see the comment block above
+BrowserSession._async_copilot_frame, and PROJECT_STATUS.md's Copilot notes
+for what that capture did and didn't settle. These tools are still marked
+KO pending a re-run of tests/smoke/tests/test_copilot.py.
 """
 
 import json
@@ -104,10 +113,13 @@ def draft_reply_with_copilot(
     """Ask Copilot to draft a reply to an email.
 
     Returns Copilot's drafted text for the caller to review and pass into
-    reply_email(body=...) - it does not send anything itself. Whether
-    Copilot's compose-time drafting actually populates a live reply window
-    instead of the plain chat pane is unconfirmed; see the discovery-spike
-    notes in PROJECT_STATUS.md.
+    reply_email(body=...) - it does not send anything itself.
+
+    The chat pane is the right surface for this: the discovery capture
+    recorded Outlook's "help me reply" entry point being served from the
+    side panel, not from a compose window. What it did *not* see is a
+    free-text input in that panel - only preset prompt chips - so passing
+    arbitrary `instructions` through is still an inference.
 
     Args:
         item_id: The email's item ID to reply to.
@@ -130,12 +142,12 @@ def draft_reply_with_copilot(
 def coach_draft(item_id: str, draft_text: str, timeout: float = 90, ctx: Context = None) -> str:
     """Ask Copilot's compose coaching for feedback on a draft reply.
 
-    Unverified: Copilot's "Coaching" affordance appears to live inside an
-    in-progress compose window rather than the standalone chat pane, which
-    this tool drives - it may need a materially different flow once the
-    discovery spike confirms how coaching is actually triggered. Treat
-    results from this tool as provisional until PROJECT_STATUS.md marks it
-    verified.
+    The least-evidenced tool in this module. A recorded live Copilot session
+    (capture 20260911-112708-e917) exercised every other surface here but
+    turned up **no Coaching affordance at all**, so it's unknown whether the
+    feature exists on this tenant, let alone whether it lives in the chat
+    pane this tool drives or inside an in-progress compose window. Treat
+    results as provisional until PROJECT_STATUS.md marks it verified.
 
     Args:
         item_id: The email being replied to, for context.

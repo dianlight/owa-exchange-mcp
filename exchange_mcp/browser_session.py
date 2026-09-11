@@ -80,6 +80,17 @@ _CRASH_HINTS = (
     "'nonetype' object has no attribute",
 )
 
+# Copilot's chat UI is served from a *different origin* than OWA and rendered
+# in an iframe - confirmed by discovery capture 20260911-112708-e917, where
+# every recorded Copilot click reported one of these hosts as its frame URL
+# while the surrounding app was on outlook.office365.com. Matched as substrings
+# so a tenant/cloud variant of the host still resolves.
+_COPILOT_FRAME_HOST_HINTS = (
+    "m365copilotapp.svc.cloud.microsoft",
+    "m365copilotapp",
+    "copilot.cloud.microsoft",
+)
+
 # Copilot has no documented API - text hints scraped from its own chat pane
 # are the only signal available for these conditions. Update if the live
 # wording turns out different (see the Copilot module's discovery-spike notes).
@@ -93,6 +104,18 @@ _COPILOT_SIGNIN_HINTS = (
     "sign in",
     "session has expired",
     "you've been signed out",
+)
+# The pane renders in the mailbox's display language (the capture ran on an
+# it-IT tenant), so an English-only "Stop generating" regex silently never
+# matches and the generation-complete check degrades to text-stability alone.
+# Add localisations here rather than in the polling code.
+_COPILOT_STOP_HINTS = (
+    "stop",         # en
+    "interrompi",   # it
+    "arrêter",      # fr
+    "detener",      # es
+    "beenden",      # de
+    "parar",        # pt
 )
 
 
@@ -823,42 +846,99 @@ class BrowserSession:
     # Copilot (chat pane UI automation - no documented API exists)
     # ------------------------------------------------------------------
     #
-    # Everything below drives Copilot's actual chat pane DOM inside the
-    # already-rendered anchor page, instead of a JSON action - Copilot has
-    # no service.svc equivalent. The selectors are best-effort guesses based
-    # on Fluent UI ARIA conventions used elsewhere in the modern Outlook web
-    # client (role-based queries, since Fluent UI consistently annotates
-    # interactive elements with accessible names/roles) and have NOT been
-    # confirmed against a live Copilot pane. Run the discovery spike
-    # (--show-browser, inspect the real DOM) and correct these methods -
-    # they're deliberately the only place selector knowledge lives, so a
-    # correction only has to happen here.
+    # Everything below drives Copilot's actual chat pane DOM instead of a JSON
+    # action - Copilot has no service.svc equivalent, and discovery capture
+    # 20260911-112708-e917 confirmed there is no HTTP endpoint carrying either
+    # the prompt or the generated answer (see the Copilot notes in
+    # PROJECT_STATUS.md for what that capture did and didn't settle).
+    #
+    # The load-bearing fact, and the reason the first implementation failed
+    # every live test: **the chat pane is a cross-origin iframe.** OWA runs on
+    # the mailbox host, the pane is served from _COPILOT_FRAME_HOST_HINTS. A
+    # Playwright `page.locator(...)` only ever searches the main frame, so the
+    # original `role=complementary` / `[class*="Copilot"]` queries could not
+    # match no matter how well guessed - the nodes are in another frame tree.
+    # Everything here therefore resolves the *frame* first and roots every
+    # subsequent query inside it.
+    #
+    # The launch button is the one part that *is* main-frame OWA chrome, and
+    # matching it on the accessible name "Copilot" works because Microsoft
+    # doesn't translate the brand name. The prompts inside the pane are
+    # localised - see _COPILOT_STOP_HINTS.
 
-    async def _async_copilot_locate_pane(self, page):
-        pane = page.get_by_role("complementary", name=re.compile("copilot", re.I))
-        if await pane.count() == 0:
-            pane = page.locator('[class*="Copilot" i][role]').first
-        return pane
+    async def _async_copilot_frame(self, page, timeout: float):
+        """Return the Copilot iframe's Frame, or None if it hasn't appeared yet.
+
+        Polls instead of matching once: the iframe is created after the
+        launcher click and its document load is a separate navigation, so it
+        can be attached-but-blank for a moment.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for frame in page.frames:
+                url = (frame.url or "").lower()
+                if any(hint in url for hint in _COPILOT_FRAME_HOST_HINTS):
+                    return frame
+            await asyncio.sleep(0.5)
+        return None
+
+    async def _async_copilot_locate_pane(self, page, timeout: float = 10):
+        """Locate the pane root as a locator *inside* the Copilot iframe.
+
+        Returns a `body`-rooted locator rather than the Frame itself so that
+        _async_copilot_submit / _async_copilot_wait_and_read can keep using
+        ordinary locator methods (`get_by_role`, `inner_text`, `count`) -
+        Frame's API differs just enough to matter (`Frame.inner_text` requires
+        a selector argument).
+        """
+        frame = await self._async_copilot_frame(page, timeout)
+        if frame is None:
+            return None
+        return frame.locator("body")
 
     async def _async_copilot_open_pane(self, page, timeout: float):
-        pane = await self._async_copilot_locate_pane(page)
-        if await pane.count() and await pane.first.is_visible():
-            return pane.first
+        pane = await self._async_copilot_locate_pane(page, timeout=1)
+        if pane is not None and await pane.count():
+            return pane
 
         launcher = page.get_by_role("button", name=re.compile("copilot", re.I))
         if await launcher.count() == 0:
             raise RuntimeError(
-                "Could not find a Copilot launch button on the current page - "
-                "selectors need updating (see discovery spike notes)."
+                "Could not find a Copilot launch button on the current page "
+                f"({page.url}) - the page may not offer Copilot at all. Note "
+                "that a calendar *item* page has no launcher; grounding an "
+                "event goes via the calendar view (see _async_copilot_ask)."
             )
         await launcher.first.click(timeout=timeout * 1000)
 
-        pane = await self._async_copilot_locate_pane(page)
-        await pane.first.wait_for(state="visible", timeout=timeout * 1000)
-        return pane.first
+        pane = await self._async_copilot_locate_pane(page, timeout=timeout)
+        if pane is None:
+            hosts = ", ".join(_COPILOT_FRAME_HOST_HINTS)
+            raise RuntimeError(
+                "Clicked the Copilot launcher but no Copilot iframe appeared "
+                f"within {timeout}s (looked for a frame whose URL contains one "
+                f"of: {hosts}). Either the pane host changed - update "
+                "_COPILOT_FRAME_HOST_HINTS - or the pane failed to load."
+            )
+        await pane.wait_for(state="attached", timeout=timeout * 1000)
+        return pane
 
     async def _async_copilot_submit(self, pane, prompt: str, timeout: float) -> None:
+        """Type a free-text prompt into the pane's input box and send it.
+
+        The discovery capture only ever recorded the user clicking Copilot's
+        *suggested prompt chips*, so the presence of a free-text box in the
+        side panel is inferred, not observed. If it turns out there isn't one,
+        this is where a chip-clicking path would go - hence the explicit error
+        rather than a bare Playwright timeout.
+        """
         input_box = pane.get_by_role("textbox").first
+        if await input_box.count() == 0:
+            raise RuntimeError(
+                "Copilot's iframe was found but it has no textbox to type into. "
+                "The side panel may only offer preset prompt chips on this "
+                "tenant - a chip-clicking path belongs in _async_copilot_submit."
+            )
         await input_box.wait_for(state="visible", timeout=timeout * 1000)
         await input_box.fill(prompt)
         await input_box.press("Enter")
@@ -867,14 +947,19 @@ class BrowserSession:
         """Poll the pane until generation settles, a rate-limit banner appears, or timeout.
 
         "Settled" is approximated as: no visible "Stop generating"-style
-        control, and the pane's text hasn't changed since the last poll -
-        a real generation-complete DOM signal (data-* state attribute, etc.)
-        should replace this once the spike identifies one; text-stability
-        polling is a reasonable but slower fallback.
+        control, and the pane's text has been unchanged for two consecutive
+        polls. Two rather than one because the stop-button signal is not
+        reliable - its accessible name is localised (_COPILOT_STOP_HINTS is a
+        best-effort table), and on a language we haven't listed the check
+        silently degrades to text-stability alone, where a single mid-stream
+        pause would otherwise be read as completion.
         """
         deadline = time.time() + timeout
         last_text = ""
-        stop_button = pane.get_by_role("button", name=re.compile("stop", re.I))
+        stable_polls = 0
+        stop_button = pane.get_by_role(
+            "button", name=re.compile("|".join(_COPILOT_STOP_HINTS), re.I)
+        )
 
         while time.time() < deadline:
             text = (await pane.inner_text()).strip()
@@ -887,14 +972,20 @@ class BrowserSession:
 
             still_generating = await stop_button.count() > 0
             if not still_generating and text and text == last_text:
-                return {"status": "ok", "text": text}
+                stable_polls += 1
+                if stable_polls >= 2:
+                    return {"status": "ok", "text": text}
+            else:
+                stable_polls = 0
 
             last_text = text
             await asyncio.sleep(1)
 
         return {"status": "timeout", "partial_text": last_text}
 
-    async def _async_copilot_ask(self, prompt: str, nav_url: str | None, timeout: float) -> dict:
+    async def _async_copilot_ask(
+        self, prompt: str, nav_url: str | None, timeout: float, launcher_fallback_url: str | None = None
+    ) -> dict:
         await self._async_ensure_context()
         await self._async_ensure_auth()
         if self._auth_mode != "bearer":
@@ -914,18 +1005,42 @@ class BrowserSession:
                 except Exception:
                     pass  # grounding is best-effort - fall through and ask ungrounded
 
-            pane = await self._async_copilot_open_pane(page, timeout=10)
+            try:
+                pane = await self._async_copilot_open_pane(page, timeout=10)
+            except RuntimeError:
+                # Not every page that can *display* an item also offers a
+                # Copilot launcher: the discovery capture showed a calendar
+                # item page with no launcher at all, and the user reaching
+                # meeting prep from the calendar view instead. Navigating on
+                # to the item first is still what selects it, so we keep the
+                # grounding navigation and only retry the launcher elsewhere.
+                if not launcher_fallback_url:
+                    raise
+                await page.goto(launcher_fallback_url, wait_until="networkidle", timeout=15000)
+                pane = await self._async_copilot_open_pane(page, timeout=10)
+
             await self._async_copilot_submit(pane, prompt, timeout=10)
             return await self._async_copilot_wait_and_read(pane, timeout=timeout)
 
-    def copilot_ask(self, prompt: str, *, nav_url: str | None = None, timeout: float = 90) -> dict:
+    def copilot_ask(
+        self,
+        prompt: str,
+        *,
+        nav_url: str | None = None,
+        launcher_fallback_url: str | None = None,
+        timeout: float = 90,
+    ) -> dict:
         """Ask Copilot a question via its chat pane. See _async_copilot_ask for caveats.
+
+        `launcher_fallback_url` is where to retry if `nav_url` turns out to be a
+        page with no Copilot launcher (calendar item pages are one such).
 
         Returns {"status": "ok", "text": ...} or {"status": "timeout", "partial_text": ...}.
         Raises BearerModeRequiredError, SessionExpiredError, or CopilotUnavailableError.
         """
         return self._run_with_recovery(
-            lambda: self._async_copilot_ask(prompt, nav_url, timeout), timeout=timeout + 30
+            lambda: self._async_copilot_ask(prompt, nav_url, timeout, launcher_fallback_url),
+            timeout=timeout + 30,
         )
 
     # ------------------------------------------------------------------

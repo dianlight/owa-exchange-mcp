@@ -45,6 +45,55 @@ KNOWN_API_COVERED = "known_api_covered"
 
 _VERDICT_RANK = {UNKNOWN_API: 0, KNOWN_API_NEW_PARAMETERS: 1, KNOWN_API_COVERED: 2}
 
+# Request keys that are EWS *scaffolding*, not capabilities, and are therefore
+# subtracted before deciding a verdict. Without this, `known_api_covered` is
+# unreachable in practice: capture 20260911-112708-e917 scored 0 covered out of
+# 150 endpoints because a real OWA session sends body-rendering options and
+# restriction/sort scaffolding on essentially every read, so every known action
+# came back as "new parameters" and the noise buried the two findings on
+# FindConversation that actually mattered (`FocusedViewFilter`, `SearchFolderId`).
+#
+# The line to draw - and it is a fine one - is between a key that says *a
+# feature is in use* and a key that is merely the grammar inside it.
+# `Restriction` is a finding ("OWA filters this read and we never do");
+# `FieldURIOrConstant`, `Path` and `Value` are the syntax of the filter and say
+# nothing on their own. So `Restriction`, `SortOrder`, `AdditionalProperties`
+# and `TimeZoneContext` are deliberately **not** listed here.
+#
+# Two groups, both content-free:
+#  - *Shape grammar*: how a restriction, sort spec or extended-property
+#    reference is spelled, plus pure addressing (`Id`, `Item`).
+#  - *Body-rendering options*: how OWA wants HTML sanitised and inline images
+#    rewritten for a browser. We deliberately never send these - a tool
+#    returning raw values has no use for a CSS scope class.
+#
+# Keep it conservative. A key listed here can never be reported again, so add
+# only what is genuinely content-free; matching is case-insensitive, and
+# tests/unit/test_capability_classify.py pins `Restriction` as reportable
+# precisely to stop this table growing back over the line.
+_STRUCTURAL_REQUEST_KEYS = frozenset(
+    k.lower() for k in (
+        # shape grammar and addressing
+        "BaseShape", "Condition", "Constant", "ExtendedFieldURI", "FieldURI",
+        "FieldURIOrConstant", "Id", "IndexedFieldURI", "IsEqualTo", "Item",
+        "ItemShape", "Order", "Path", "ShapeName", "TimeZoneDefinition", "Value",
+        "DistinguishedPropertySetId", "PropertyName", "PropertySetId",
+        "PropertyTag", "PropertyType",
+        # body-rendering options
+        "AddBlankTargetToLinks", "BlockContentFromUnknownSenders",
+        "BlockExternalImagesIfSenderUntrusted", "ClientSupportsIrm",
+        "CssScopeClassName", "FilterHtmlContent", "FilterInlineSafetyTips",
+        "ImageProxyCapability", "InlineImageCustomDataTemplate",
+        "InlineImageUrlOnLoadTemplate", "InlineImageUrlTemplate",
+        "MaximumBodySize",
+    )
+)
+
+
+def _capability_keys(keys) -> list[str]:
+    """Drop structural scaffolding, keeping only keys that name a capability."""
+    return sorted(k for k in keys if k.lower() not in _STRUCTURAL_REQUEST_KEYS)
+
 # Domains this server already has a module for: file stem -> keywords matched
 # against an observation's action name, URL path and the UI text around it.
 _COVERED_DOMAINS: dict[str, tuple[str, ...]] = {
@@ -420,7 +469,7 @@ def classify(
             new_keys = obs["request_keys"]
             new_uris = obs["field_uris"]
         else:
-            new_keys = sorted(set(obs["request_keys"]) - coverage.payload_keys)
+            new_keys = _capability_keys(set(obs["request_keys"]) - coverage.payload_keys)
             new_uris = sorted(set(obs["field_uris"]) - coverage.field_uris)
             verdict = KNOWN_API_NEW_PARAMETERS if (new_keys or new_uris) else KNOWN_API_COVERED
 

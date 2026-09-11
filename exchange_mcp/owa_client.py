@@ -648,9 +648,12 @@ class OWAClient:
             {"status": "ok", "text": ...} or {"status": "timeout", "partial_text": ...}
         """
         nav_url = self._copilot_item_url(item_id, item_kind) if item_id else None
+        fallback_url = self._copilot_launcher_fallback_url(item_kind) if item_id else None
         for attempt in range(2):
             try:
-                return self.browser.copilot_ask(prompt, nav_url=nav_url, timeout=timeout)
+                return self.browser.copilot_ask(
+                    prompt, nav_url=nav_url, launcher_fallback_url=fallback_url, timeout=timeout
+                )
             except SessionExpiredError:
                 if attempt == 0:
                     self._relogin_or_raise()
@@ -660,15 +663,32 @@ class OWAClient:
         raise SessionExpiredError("Session expired. Call the login tool to log in again.")
 
     def _copilot_item_url(self, item_id: str, item_kind: str) -> str | None:
-        """Best-effort deep link to ground Copilot on a specific item.
+        """Deep link to ground Copilot on a specific item.
 
-        URL shape is unconfirmed against a live modern-Outlook session - see
-        the Copilot module's discovery-spike notes (PROJECT_STATUS.md).
-        BrowserSession.copilot_ask treats a failed navigation to this URL as
-        non-fatal (falls back to an ungrounded ask), so a wrong guess here
-        degrades rather than breaks the call - update once confirmed.
+        Both shapes are **confirmed** against a live modern-Outlook session by
+        discovery capture 20260911-112708-e917, which recorded exactly these
+        navigations (`/mail/inbox/id/<urlencoded id>` when opening a message,
+        `/calendar/item/<urlencoded id>` when opening an event). The one known
+        limitation is the hardcoded `inbox` segment: the real URL carries the
+        item's *folder*, so a message living elsewhere is not addressed
+        precisely. BrowserSession.copilot_ask treats a failed navigation as
+        non-fatal (falls back to an ungrounded ask), so that degrades rather
+        than breaks the call.
         """
         origin = self.browser.bearer_origin
         if item_kind == "event":
             return f"{origin}/calendar/item/{quote(item_id, safe='')}"
         return f"{origin}/mail/inbox/id/{quote(item_id, safe='')}"
+
+    def _copilot_launcher_fallback_url(self, item_kind: str) -> str | None:
+        """Where to look for a Copilot launcher when the item page has none.
+
+        A calendar *item* page carries no Copilot button - the discovery
+        capture caught the user bouncing back to `/calendar/view/day` and
+        reaching meeting prep from there, which also matches the original
+        smoke failure ("Could not find a Copilot launch button"). Mail item
+        pages do have a launcher, so they need no fallback.
+        """
+        if item_kind == "event":
+            return f"{self.browser.bearer_origin}/calendar/view/day"
+        return None
