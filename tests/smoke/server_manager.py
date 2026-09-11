@@ -4,16 +4,25 @@ The suite never stops this process itself: start_server() launches it detached
 (survives after this Python process exits) the first time it's needed, and
 every later call reuses it by checking whether the port is already listening.
 Only an explicit `python -m tests.smoke.server_manager stop` tears it down.
+
+`EXCHANGE_SMOKE_HOST`/`EXCHANGE_SMOKE_PORT` point the suite at a server that is
+*already* running elsewhere (e.g. a long-lived instance on another port) instead
+of spawning one here. That matters because two servers cannot share one browser
+profile directory -- Chromium holds an exclusive lock on it -- so spawning a
+second server while another already owns the default profile fails or, worse,
+disturbs the live session. Reuse the running one instead:
+    EXCHANGE_SMOKE_PORT=8767 python -m tests.smoke.tests.test_copilot
 """
 
+import os
 import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-HOST = "127.0.0.1"
-PORT = 8765
+HOST = os.environ.get("EXCHANGE_SMOKE_HOST", "127.0.0.1")
+PORT = int(os.environ.get("EXCHANGE_SMOKE_PORT", "8765"))
 SERVER_URL = f"http://{HOST}:{PORT}/mcp"
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
