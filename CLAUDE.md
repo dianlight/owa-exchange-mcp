@@ -52,6 +52,14 @@ exchange-mcp-server --transport http --port 8765 --show-browser
 # Pure-logic tests (no mailbox, no browser, no EXCHANGE_OWA_URL)
 python -m tests.unit.test_auth_errors
 python -m tests.unit.test_recurrence_expansion
+
+# Live-mailbox smoke tests: one module per tool group, run individually.
+# The harness starts its own server on 127.0.0.1:8765 if nothing is listening
+# there; set EXCHANGE_SMOKE_HOST/EXCHANGE_SMOKE_PORT to reuse a server that is
+# already running instead — two servers can't share one browser profile
+# directory (Chromium holds an exclusive lock on it).
+python -m tests.smoke.tests.test_copilot
+EXCHANGE_SMOKE_PORT=8767 python -m tests.smoke.tests.test_copilot
 ```
 
 There is no credential setup step and no login CLI: the first start opens a browser
@@ -92,7 +100,7 @@ Deliberate design points, each of which has a wrong-looking-but-tempting alterna
 
 **Transport (`stdio` vs `http`)**: `main()` picks the transport via `--transport`/`EXCHANGE_MCP_TRANSPORT`. The lifespan that creates the `BrowserSession` runs exactly once per process either way — under `stdio` that process is spawned and killed per client session, so the warm browser/login is rebuilt every time; under `--transport http` the process is long-lived and the same `BrowserSession`/login is shared across every client connection that hits it, but it must be started manually — there is no autostart mechanism. Never bind `--host`/`EXCHANGE_MCP_HOST` off `127.0.0.1` — the MCP endpoint has no auth of its own, and FastMCP's `transport_security` (Host header validation) must stay enabled to block DNS-rebinding from other pages in the user's browser.
 
-**Copilot tools (`tools/copilot.py`)**: unlike every other tool module, Copilot has no documented API to call — there is no EWS action, no REST endpoint, nothing to POST. These tools instead drive Copilot's own chat pane inside the modern Outlook web client directly via Playwright UI automation (`BrowserSession`'s Copilot section: `_async_copilot_locate_pane`/`_open_pane`/`_submit`/`_wait_and_read`/`_async_copilot_ask`/`copilot_ask()`), the same "automate OWA's own web UI" escape hatch already used for the calendar category write-path (`_set_event_categories`, see PROJECT_STATUS.md #208/#209) when no API exists. Only available in `bearer` auth mode (modern Outlook) — raises `BearerModeRequiredError` on classic canary-cookie OWA, the same exception `find_people`/`post_substrate` use for their own modern-backend-only surfaces. Because there's no DOM/API reference to build against, every selector, the generation-complete polling heuristic, and the item-grounding deep-link URL shape are best-guess placeholders pending a live discovery spike (`--show-browser` inspection of a real Copilot pane) — treat results as provisional until PROJECT_STATUS.md's Copilot rows (#901-905) move past `Pending`.
+**Copilot tools (`tools/copilot.py`)**: unlike every other tool module, Copilot has no documented API to call — there is no EWS action, no REST endpoint, nothing to POST. These tools instead drive Copilot's own chat pane inside the modern Outlook web client directly via Playwright UI automation (`BrowserSession`'s Copilot section: `_async_copilot_locate_pane`/`_open_pane`/`_submit`/`_wait_and_read`/`_async_copilot_ask`/`copilot_ask()`), the same "automate OWA's own web UI" escape hatch already used for the calendar category write-path (`_set_event_categories`, see PROJECT_STATUS.md #208/#209) when no API exists. Only available in `bearer` auth mode (modern Outlook) — raises `BearerModeRequiredError` on classic canary-cookie OWA, the same exception `find_people`/`post_substrate` use for their own modern-backend-only surfaces. Because there's no DOM/API reference to build against, every selector, the generation-complete polling heuristic, and the item-grounding deep-link URL shape are best-guess placeholders pending a live discovery spike (`--show-browser` inspection of a real Copilot pane). The 2026-09-11 smoke run ([tests/smoke/tests/test_copilot.py](tests/smoke/tests/test_copilot.py)) confirmed that they are in fact wrong: all five tools fail on a live bearer-mode tenant, in two distinct ways (see PROJECT_STATUS.md's Copilot rows #901-905, now `KO`, and the §1 update). Don't expect any of these tools to work until the spike has corrected `browser_session.py` and that test passes.
 
 ## Maintaining PROJECT_STATUS.md
 
