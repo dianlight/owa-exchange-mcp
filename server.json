@@ -7,12 +7,12 @@
     "url": "https://github.com/dianlight/owa-exchange-mcp",
     "source": "github"
   },
-  "version": "2.0.0b2",
+  "version": "2.0.0b3",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "exchange-mcp-server",
-      "version": "2.0.0b2",
+      "version": "2.0.0b3",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

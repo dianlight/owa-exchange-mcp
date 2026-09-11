@@ -261,6 +261,7 @@ import exchange_mcp.tools.analytics     # noqa: E402, F401
 import exchange_mcp.tools.auth          # noqa: E402, F401
 import exchange_mcp.tools.categories     # noqa: E402, F401
 import exchange_mcp.tools.copilot        # noqa: E402, F401
+import exchange_mcp.tools.tasks          # noqa: E402, F401
 
 # Tools with a known, unfixable server-side bug (see PROJECT_STATUS.md KO rows)
 # rather than merely untested or degraded-but-working ones (e.g. get_meeting_contacts,

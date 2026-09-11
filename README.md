@@ -2,7 +2,7 @@
 
 # OWA Exchange MCP Server
 
-MCP (Model Context Protocol) server for any Microsoft Exchange / OWA (Outlook Web Access) deployment. Gives LLM agents access to email, calendar, directory search, folders, categories, availability, meeting analytics, and Copilot delegation via 48 tools.
+MCP (Model Context Protocol) server for any Microsoft Exchange / OWA (Outlook Web Access) deployment. Gives LLM agents access to email, calendar, tasks (Microsoft To Do), directory search, folders, categories, availability, meeting analytics, and Copilot delegation via 54 tools.
 
 Works with any on-premise or hosted Exchange server that exposes OWA.
 
@@ -125,7 +125,7 @@ setup step, no login script. The persistent browser profile *is* the session.
 Every line goes to stderr:
 
 ```
-[exchange-mcp] exchange-mcp-server 2.0.0b2
+[exchange-mcp] exchange-mcp-server 2.0.0b3
 [exchange-mcp] OWA URL:     https://owa.example.com
 [exchange-mcp] Profile dir: /home/you/owa-mcp/.browser-profile
 [exchange-mcp]   source:    default for an installed package
@@ -194,7 +194,7 @@ Note that this is *diagnosis only*. The login window never aborts early on an
 error message: you're sitting in front of it, so a mistyped password or an
 accidentally denied push is something you just retry there.
 
-## Tools (48)
+## Tools (54)
 
 ### Email (15)
 | Tool | Description |
@@ -229,6 +229,24 @@ accidentally denied push is something you just retry there.
 | `assign_event_categories` | Tag calendar events with one or more categories |
 | `remove_event_categories` | Remove categories from calendar events |
 | `find_events_by_category` | Find calendar events tagged with a given category |
+
+### Tasks (6)
+
+Exchange `Task` items — the same items **Microsoft To Do** shows in Outlook on the web.
+Every tool takes a `task_folder`, which is the To Do list to work in: `tasks` (the
+default) for the mailbox's default list, a list name, a `tasks/<list>` path, or a folder
+ID from `get_folders(parent_folder_id="tasks")`. Managing the *lists* themselves is the
+folder tools' job, not these. To Do's "Flagged Email" list isn't made of tasks — use
+`set_email_flag` for that.
+
+| Tool | Description |
+|---|---|
+| `get_tasks` | List tasks in a To Do list, due-date first, open-only by default |
+| `get_task` | Get one task's full detail, including its note body |
+| `create_task` | Create a task with due/start dates, note, categories and reminder |
+| `update_task` | Update only the fields you pass; can also clear dates/reminder |
+| `complete_task` | Mark tasks complete, or reopen them |
+| `delete_task` | Delete tasks (soft to Deleted Items, or permanent) |
 
 ### Categories (4)
 | Tool | Description |
@@ -296,6 +314,7 @@ exchange_mcp/
   tools/
     email.py              # Email tools
     calendar.py           # Calendar tools
+    tasks.py              # Task / Microsoft To Do CRUD
     categories.py         # Master category list CRUD
     people.py             # Directory search
     folders.py            # Folder management & session check

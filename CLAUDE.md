@@ -24,12 +24,12 @@ Any variable above can also be placed in a gitignored `.env.local` next to `pypr
 
 ## Structure
 
-- `exchange_mcp/` — MCP server package (48 tools)
+- `exchange_mcp/` — MCP server package (54 tools)
   - `server.py` — FastMCP server with lifespan context; launches the browser on the persistent profile and, if that profile isn't signed in, opens a visible sign-in window (off the handshake path — see "Authentication" below)
   - `browser_session.py` — `BrowserSession`: one persistent Chromium context for the process's lifetime, reused by every OWA call
   - `owa_client.py` — OWA API client; delegates transport to `BrowserSession`, keeps the request/response/folder-resolution logic
   - `auth_errors.py` — Pure diagnosis of a *timed-out* interactive sign-in: reason codes, the AADSTS/page-text/URL hint tables, per-reason remediation text, and `AuthenticationRequiredError`. Imports nothing else from the package (no Playwright) so it stays unit-testable — see "Authentication" below.
-  - `tools/` — Tool modules: email, calendar, categories, people, folders, availability, analytics, auth, copilot
+  - `tools/` — Tool modules: email, calendar, categories, people, folders, availability, analytics, auth, copilot, tasks
 - `tests/unit/` — Pure-logic tests, no live mailbox / browser / `EXCHANGE_OWA_URL` needed (`python -m tests.unit.test_auth_errors`, `python -m tests.unit.test_recurrence_expansion`). Separate from `tests/smoke/`, which is live-mailbox end-to-end.
 
 ## Running
@@ -92,14 +92,31 @@ Deliberate design points, each of which has a wrong-looking-but-tempting alterna
 
 **Transport (`stdio` vs `http`)**: `main()` picks the transport via `--transport`/`EXCHANGE_MCP_TRANSPORT`. The lifespan that creates the `BrowserSession` runs exactly once per process either way — under `stdio` that process is spawned and killed per client session, so the warm browser/login is rebuilt every time; under `--transport http` the process is long-lived and the same `BrowserSession`/login is shared across every client connection that hits it, but it must be started manually — there is no autostart mechanism. Never bind `--host`/`EXCHANGE_MCP_HOST` off `127.0.0.1` — the MCP endpoint has no auth of its own, and FastMCP's `transport_security` (Host header validation) must stay enabled to block DNS-rebinding from other pages in the user's browser.
 
+**Task tools (`tools/tasks.py`)**: `Task` is Exchange's own name for the item class
+(`Task:#Exchange`, `IPM.Task`) in the `tasks` distinguished folder, and the modern web UI
+surfaces the same items as **Microsoft To Do** (`outlook.cloud.microsoft/host/<app-guid>/ToDoId`),
+where each To Do *list* is a child folder of that root. So these tools use the ordinary EWS item
+actions (`FindItem`/`GetItem`/`CreateItem`/`UpdateItem`/`DeleteItem`) rather than To Do's own
+private REST surface — that path works on both backends and needs no new transport. Three
+non-obvious constraints, all documented at length in the module docstring: reads use
+`BaseShape: "AllProperties"` with **no** `AdditionalProperties` (one bad `FieldURI` fails the whole
+request on this backend), every write-side `FieldURI` spelling lives in the module's `_FIELD` dict
+so a live-test correction is one line, and task `DueDate`/`StartDate` are written as UTC midnight
+(`…T00:00:00.000Z`) because that's how Exchange stores them — a local-midnight write comes back a
+day off. `Status`, `PercentComplete` and `CompleteDate` are three spellings of the same state and
+the last one Exchange processes wins, so never send two in one request. There is no task-list
+(folder) CRUD here: a To Do list is a plain folder, so `get_folders(parent_folder_id="tasks")`
+and the `*_folder` tools cover it — except *creating* one, since `create_folder` hardcodes
+`FolderClass: "IPF.Note"` (see PROJECT_STATUS.md §4).
+
 **Copilot tools (`tools/copilot.py`)**: unlike every other tool module, Copilot has no documented API to call — there is no EWS action, no REST endpoint, nothing to POST. These tools instead drive Copilot's own chat pane inside the modern Outlook web client directly via Playwright UI automation (`BrowserSession`'s Copilot section: `_async_copilot_locate_pane`/`_open_pane`/`_submit`/`_wait_and_read`/`_async_copilot_ask`/`copilot_ask()`), the same "automate OWA's own web UI" escape hatch already used for the calendar category write-path (`_set_event_categories`, see PROJECT_STATUS.md #208/#209) when no API exists. Only available in `bearer` auth mode (modern Outlook) — raises `BearerModeRequiredError` on classic canary-cookie OWA, the same exception `find_people`/`post_substrate` use for their own modern-backend-only surfaces. Because there's no DOM/API reference to build against, every selector, the generation-complete polling heuristic, and the item-grounding deep-link URL shape are best-guess placeholders pending a live discovery spike (`--show-browser` inspection of a real Copilot pane) — treat results as provisional until PROJECT_STATUS.md's Copilot rows (#901-905) move past `Pending`.
 
 ## Maintaining PROJECT_STATUS.md
 
 [PROJECT_STATUS.md](PROJECT_STATUS.md) tracks, per MCP tool: a permanent ID, automated-test coverage, and manual QA result (`Pending`/`OK`/`KO`). Keep it in sync as part of the same change, not as a follow-up:
 
-- **ID column and numbering rule**: every tool row's first column is a permanent 3-digit ID — digit 1 is the tool's module number, digits 2-3 are the tool's sequence number within that module (`e.g. 208` = module 2 (Calendar), 8th tool assigned in that module). Module numbers are fixed: 1 Email, 2 Calendar, 3 Categories, 4 Directory (`people.py`), 5 Folders, 6 Availability, 7 Analytics, 8 Auth, 9 Copilot — a brand-new module gets the next unused digit, never a reused or renumbered one. **An ID never changes once assigned**, even if the table is reordered or the tool is later removed — do not renumber existing rows to close a gap, and do not reuse a retired tool's ID for a different tool. Adding a tool to an existing module → give it the next unused 2-digit sequence number in that module (append at the end of that module's existing max, regardless of where the row is placed in the table). Removing a tool → delete its row; leave the gap in the sequence rather than shifting later IDs down.
-- Adding, removing, or renaming a tool → add/remove/update its row (and the module's tool count in its section header and in the "48 tools" totals here and in README.md).
+- **ID column and numbering rule**: every tool row's first column is a permanent ID of the form `<module number><2-digit sequence within that module>` — 3 digits for the single-digit modules, 4 from module 10 onward (`e.g. 208` = module 2 (Calendar), 8th tool assigned in that module; `1003` = module 10 (Tasks), 3rd tool there). Module numbers are fixed: 1 Email, 2 Calendar, 3 Categories, 4 Directory (`people.py`), 5 Folders, 6 Availability, 7 Analytics, 8 Auth, 9 Copilot, 10 Tasks — a brand-new module gets the next unused module number, never a reused or renumbered one, so once the single digits ran out (Tasks, 2026-09-11) the module part grew a digit rather than colliding. **An ID never changes once assigned**, even if the table is reordered or the tool is later removed — do not renumber existing rows to close a gap, and do not reuse a retired tool's ID for a different tool. Adding a tool to an existing module → give it the next unused 2-digit sequence number in that module (append at the end of that module's existing max, regardless of where the row is placed in the table). Removing a tool → delete its row; leave the gap in the sequence rather than shifting later IDs down.
+- Adding, removing, or renaming a tool → add/remove/update its row (and the module's tool count in its section header and in the "54 tools" totals here and in README.md).
 - Changing a tool's behavior (new params, different OWA action, altered response shape) → update its Description cell if it's no longer accurate, and reset its Manual QA status to `Pending` unless it's been re-verified.
 - Running or receiving the result of a manual test against a live OWA mailbox → update that tool's Manual QA / Status cell to `OK` or `KO` (with a one-line note for `KO`), don't leave it stale at `Pending`.
 - A tool becoming, or ceasing to be, a confirmed unfixable server-side failure (not merely `Pending`, and not a degraded-but-working case like `get_meeting_contacts`'s empty-result-plus-`warnings` behavior) → keep its Stability column cell (`Stable`/`Dev`) and `KNOWN_BUGGY_TOOLS` in `exchange_mcp/server.py` in sync with each other. `KNOWN_BUGGY_TOOLS` is what `--stable`/`EXCHANGE_MCP_STABLE` excludes from the MCP tool listing at startup.
