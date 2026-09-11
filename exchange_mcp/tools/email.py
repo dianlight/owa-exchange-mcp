@@ -587,6 +587,223 @@ def _local_search_fallback(
 
 
 # ------------------------------------------------------------------
+# FindConversation paging
+# ------------------------------------------------------------------
+
+# Conversations pulled per FindConversation call. Deep pages are assembled
+# from several calls rather than one huge window, because this backend has
+# been observed not to always respect MaxEntriesReturned (see below).
+_CONV_PAGE_SIZE = 200
+
+# Ceiling on how many conversations one get_emails call will enumerate when
+# it has to filter client-side (unread_only). Bounded work, reported through
+# the pagination block when hit rather than silently truncated - same spirit
+# as analytics.py's scan cap.
+_CONV_MAX_SCAN = 2000
+
+# Reasons paging stopped before the caller's window was filled. Both mean
+# "there may be more, we could not get to it" - never "end of folder".
+_PAGINATION_SCAN_LIMIT = "pagination_scan_limit_reached"
+_PAGINATION_OFFSET_UNSUPPORTED = "pagination_offset_unsupported"
+
+_PAGINATION_ERRORS = {
+    _PAGINATION_SCAN_LIMIT: (
+        f"Scanned the {_CONV_MAX_SCAN}-conversation cap without reaching this "
+        f"offset. Narrow the request (e.g. drop unread_only, which forces a "
+        f"scan from the start of the folder) or use search_emails."
+    ),
+    _PAGINATION_OFFSET_UNSUPPORTED: (
+        "The server re-served conversations it had already returned instead of "
+        "honouring the paging offset, so this page could not be reached. "
+        "Results beyond this point are unavailable on this backend."
+    ),
+}
+
+
+def _conversation_key(conv: dict) -> str:
+    """Stable identity for a FindConversation row, for repeat detection."""
+    cid = (conv.get("ConversationId") or {}).get("Id") or ""
+    if cid:
+        return cid
+    # No ConversationId is not expected, but falling back beats treating every
+    # such row as a duplicate of every other one.
+    return f"{conv.get('ConversationTopic', '')}|{conv.get('LastDeliveryTime', '')}"
+
+
+def _find_conversations(
+    client: OWAClient,
+    folder_id: str,
+    offset: int,
+    count: int,
+) -> list[dict]:
+    """One FindConversation call: up to `count` conversations from `offset`.
+
+    `offset` is a real server-side IndexedPageView offset, the same field
+    FindItem pages with everywhere else in this package - it is the only way
+    to address a position deeper than one response window.
+    """
+    find_body = {
+        "__type": "FindConversationRequest:#Exchange",
+        "ParentFolderId": {
+            "__type": "TargetFolderId:#Exchange",
+            "BaseFolderId": OWAClient.folder_id_dict(folder_id),
+        },
+        "ConversationShape": {
+            "__type": "ConversationResponseShape:#Exchange",
+            "BaseShape": "IdOnly",
+        },
+        # Required by the modern Outlook backend: without it,
+        # FindConversation rejects the request as "no query string,
+        # traversal not allowed" even though this is a plain listing.
+        "ShapeName": "ReactConversationListView",
+        # Deliberately not "Unread" for unread_only - see _page_conversations.
+        "ViewFilter": "All",
+        "Paging": {
+            "__type": "IndexedPageView:#Exchange",
+            "BasePoint": "Beginning",
+            "Offset": offset,
+            "MaxEntriesReturned": count,
+        },
+    }
+
+    payload = {
+        "__type": "FindConversationJsonRequest:#Exchange",
+        "Header": {
+            "__type": "JsonRequestHeaders:#Exchange",
+            "RequestServerVersion": "Exchange2013",
+        },
+        "Body": find_body,
+    }
+
+    data = client.request("FindConversation", payload)
+
+    # FindConversation's response envelope is {"Body": {"Conversations":
+    # [...]}}, not the classic {"Body": {"ResponseMessages": {"Items":
+    # [...]}}} - extract_items() doesn't apply here.
+    return (data.get("Body") or {}).get("Conversations") or []
+
+
+def _page_conversations(
+    client: OWAClient,
+    folder_id: str,
+    offset: int,
+    limit: int,
+    unread_only: bool,
+) -> tuple[list[dict], dict]:
+    """Assemble one page of conversations, honouring `offset` server-side.
+
+    Returns (page, pagination). `pagination` is always populated so that an
+    empty page can never be mistaken for the end of the folder: it carries
+    `reached_end_of_folder` when the server really ran out of rows, and an
+    `error_code` from _PAGINATION_ERRORS when paging stopped for any other
+    reason. Before this, `offset` indexed into a single fixed-size response
+    window that always started at record 0, so every offset past that window
+    (as little as 50) returned {"count": 0} indistinguishable from success.
+
+    unread_only is a client-side filter, so a filtered page has no server-side
+    address: that path enumerates from the start of the folder and skips after
+    filtering, bounded by _CONV_MAX_SCAN. An unfiltered page goes straight to
+    the server offset - one request at any depth.
+
+    Pushing unread_only into FindConversation's own `ViewFilter: "Unread"`
+    would make that path cheap too, and was tried and rejected on 2026-09-11:
+    a backend that accepted the filter and ignored it would leave `offset`
+    addressing the *unfiltered* sequence, returning genuinely-unread
+    conversations from the wrong position (the client-side check below keeps
+    read mail out, so nothing looks wrong) and skipping unread ones entirely.
+    That cannot be probed for reliably - when a folder's newest conversations
+    are all unread, which is the common case, an ignored filter is
+    indistinguishable from an honoured one. Not worth trading this function's
+    one guarantee for a faster rare path; if you revisit it, the probe has to
+    be decisive, not merely usually right.
+    """
+    server_offset = 0 if unread_only else offset
+    skip = offset if unread_only else 0
+
+    # One row past the caller's window, so has_more is observed rather than
+    # guessed.
+    want = skip + limit + 1
+
+    kept: list[dict] = []
+    seen_keys: set[str] = set()
+    raw_seen = 0
+    stop_reason = None
+
+    anchor_key = None
+    if server_offset > 0:
+        # Witness that the server honours a paging Offset at all. A backend
+        # that ignored it would answer a deep request with the *first* page's
+        # conversations wearing a deeper offset - wrong data, silently, which
+        # is worse than the empty pages this function replaced. One page of
+        # results can't reveal that on its own, so identify row 0 up front and
+        # compare; two conversations at different positions never share a
+        # ConversationId, so this cannot misfire. Costs one small extra request
+        # per deep page, and nothing at all at offset 0.
+        anchor = _find_conversations(client, folder_id, 0, 1)
+        anchor_key = _conversation_key(anchor[0]) if anchor else None
+
+    while len(kept) < want:
+        if raw_seen >= _CONV_MAX_SCAN:
+            stop_reason = _PAGINATION_SCAN_LIMIT
+            break
+
+        batch_size = min(_CONV_PAGE_SIZE, _CONV_MAX_SCAN - raw_seen)
+        batch = _find_conversations(
+            client, folder_id, server_offset + raw_seen, batch_size
+        )
+
+        # Only an *empty* page ends the folder. A short page must not: this
+        # backend is already known not to always respect MaxEntriesReturned,
+        # and reading a short page as the end would reintroduce exactly the
+        # silent truncation this function exists to prevent. The cost is one
+        # extra request at the true end of a folder.
+        if not batch:
+            stop_reason = "end_of_folder"
+            break
+
+        # A backend that ignored our Offset would re-serve rows we have
+        # already seen. Report that instead of handing the caller page 1's
+        # conversations labelled as a deeper page.
+        keys = [_conversation_key(c) for c in batch]
+        if not raw_seen and anchor_key is not None and keys[0] == anchor_key:
+            stop_reason = _PAGINATION_OFFSET_UNSUPPORTED
+            break
+        if raw_seen and seen_keys.issuperset(keys):
+            stop_reason = _PAGINATION_OFFSET_UNSUPPORTED
+            break
+        seen_keys.update(keys)
+
+        raw_seen += len(batch)
+        kept.extend(
+            c for c in batch
+            if not unread_only or c.get("UnreadCount", 0) > 0
+        )
+
+    page = kept[skip:skip + limit]
+    has_more = len(kept) > skip + len(page)
+
+    pagination = {
+        "offset": offset,
+        "limit": limit,
+        "returned": len(page),
+        "conversations_scanned": raw_seen,
+        "has_more": has_more,
+        "next_offset": offset + len(page) if has_more else None,
+        "reached_end_of_folder": stop_reason == "end_of_folder" and not has_more,
+    }
+
+    if stop_reason in _PAGINATION_ERRORS:
+        # Stopped early, so there is more in principle even though we did not
+        # see it - the caller must not read this as the end of the folder.
+        pagination["has_more"] = True
+        pagination["next_offset"] = None
+        pagination["error_code"] = stop_reason
+        pagination["error"] = _PAGINATION_ERRORS[stop_reason]
+
+    return page, pagination
+
+
+# ------------------------------------------------------------------
 # Tools
 # ------------------------------------------------------------------
 
@@ -611,12 +828,24 @@ def get_emails(
     Args:
         folder: Folder name (Inbox, Sent, Drafts, Deleted, Junk, or custom name).
         limit: Maximum number of conversations to return (default 10, max 50).
-        offset: Number of conversations to skip for pagination.
+        offset: Number of conversations to skip for pagination. This is a real
+            position in the folder's conversation list, valid to any depth -
+            pass the `pagination.next_offset` from the previous call to walk a
+            folder's history.
         include_body: If True, fetch the latest message's full body for each
             conversation (slower).
         unread_only: If True, only return conversations with unread messages.
+            Filtered client-side, so a large offset with this set has to
+            enumerate the folder from the start and can hit the scan cap.
         ids_only: If True, return only conversation/item IDs and dates
             (compact, for bulk ops). Max limit raised to 500 in this mode.
+
+    Every response carries a `pagination` object, so an empty page is never
+    ambiguous: `reached_end_of_folder` true means the folder really has no
+    conversations at this offset, while an `error_code` (with `error`) means
+    paging stopped early and there may be more that could not be reached.
+    Use `has_more`/`next_offset` to drive pagination rather than assuming an
+    empty or short page means the end.
 
     Each result includes flag_status ("NotFlagged"/"Flagged"/"Complete").
     At the default FindConversation shape this value is unverified against
@@ -629,65 +858,23 @@ def get_emails(
         max_limit = 500 if ids_only else 50
         if limit > max_limit:
             limit = max_limit
+        if limit < 1:
+            limit = 1
+        offset = max(0, offset)
 
         # Resolve folder name to ID
         folder_id = client.get_folder_id(folder)
         if not folder_id:
             return json.dumps({"error": f"Folder '{folder}' not found."})
 
-        # FindConversation's server-side paging has been observed to not
-        # always respect MaxEntriesReturned, so we over-fetch and clamp
-        # offset/limit/unread_only client-side instead of trusting it.
-        fetch_count = min(max(limit * 4, 50), 200)
-
-        find_body = {
-            "__type": "FindConversationRequest:#Exchange",
-            "ParentFolderId": {
-                "__type": "TargetFolderId:#Exchange",
-                "BaseFolderId": OWAClient.folder_id_dict(folder_id),
-            },
-            "ConversationShape": {
-                "__type": "ConversationResponseShape:#Exchange",
-                "BaseShape": "IdOnly",
-            },
-            # Required by the modern Outlook backend: without it,
-            # FindConversation rejects the request as "no query string,
-            # traversal not allowed" even though this is a plain listing.
-            "ShapeName": "ReactConversationListView",
-            "ViewFilter": "All",
-            "Paging": {
-                "__type": "IndexedPageView:#Exchange",
-                "BasePoint": "Beginning",
-                "Offset": 0,
-                "MaxEntriesReturned": fetch_count,
-            },
-        }
-
-        payload = {
-            "__type": "FindConversationJsonRequest:#Exchange",
-            "Header": {
-                "__type": "JsonRequestHeaders:#Exchange",
-                "RequestServerVersion": "Exchange2013",
-            },
-            "Body": find_body,
-        }
-
-        data = client.request("FindConversation", payload)
-
-        # FindConversation's response envelope is {"Body": {"Conversations":
-        # [...]}}, not the classic {"Body": {"ResponseMessages": {"Items":
-        # [...]}}} - extract_items() doesn't apply here.
-        conversations = (data.get("Body") or {}).get("Conversations") or []
-
-        if unread_only:
-            conversations = [c for c in conversations if c.get("UnreadCount", 0) > 0]
-
-        conversations = conversations[offset:offset + limit]
+        conversations, pagination = _page_conversations(
+            client, folder_id, offset, limit, unread_only
+        )
 
         if not conversations:
             return json.dumps(
-                {"item_ids": [], "count": 0} if ids_only
-                else {"emails": [], "count": 0}
+                {"item_ids": [], "count": 0, "pagination": pagination} if ids_only
+                else {"emails": [], "count": 0, "pagination": pagination}
             )
 
         if ids_only:
@@ -700,7 +887,11 @@ def get_emails(
                     "date": conv.get("LastDeliveryTime", ""),
                     "subject": conv.get("ConversationTopic", ""),
                 })
-            return json.dumps({"item_ids": result, "count": len(result)})
+            return json.dumps({
+                "item_ids": result,
+                "count": len(result),
+                "pagination": pagination,
+            })
 
         emails = []
         for conv in conversations:
@@ -724,7 +915,11 @@ def get_emails(
 
             emails.append(email)
 
-        return json.dumps({"emails": emails, "count": len(emails)})
+        return json.dumps({
+            "emails": emails,
+            "count": len(emails),
+            "pagination": pagination,
+        })
 
     except SessionExpiredError as e:
         return json.dumps({"error": str(e)})

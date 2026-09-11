@@ -697,6 +697,86 @@ Untouched by this run, and therefore still entirely unexercised: the generation-
 heuristic in `_async_copilot_wait_and_read`, and the rate-limit / sign-in hint tables it
 consults. Nothing ever got far enough to reach them.
 
+**Update 2026-09-11 — the Copilot discovery spike ran, and the root cause is structural:
+the chat pane is a cross-origin iframe.** Capture `20260911-112708-e917` (scope: chat pane
+ungrounded + email-grounded, Draft with Copilot, meeting prep; 8m43s, 572 API calls, 38 UI
+actions, 150 distinct endpoints) settled four things and left one open.
+
+1. **The pane is in another frame, on another origin.** Every recorded Copilot click reported
+   its frame URL as `m365copilotapp.svc.cloud.microsoft/hosted/semanticoverview/Users('OID:…')
+   ?renderingSurface=copilotSidePanel&hostName=Outlook`, while the surrounding app was on
+   `outlook.office365.com`. A Playwright `page.locator(...)` searches only the main frame, so
+   the original `role=complementary` / `[class*="Copilot" i][role]` queries could never match
+   — the nodes are in a different frame tree. This explains the #901-904 failure *exactly*,
+   including its asymmetry: the launcher is genuine main-frame OWA chrome and was found and
+   clicked, and everything after the click lives in the iframe. Fixed by resolving the frame
+   first (`_async_copilot_frame`, `_COPILOT_FRAME_HOST_HINTS`) and rooting every subsequent
+   query inside it.
+2. **Both deep-link shapes were already correct.** The capture recorded
+   `/mail/inbox/id/<urlencoded id>` and `/calendar/item/<urlencoded id>` — byte-for-byte what
+   `OWAClient._copilot_item_url` builds. So the second half of #905's open question is
+   answered the other way: the URL was right, and **a calendar item page simply has no Copilot
+   launcher**. The capture caught the user bouncing back to `/calendar/view/day` and reaching
+   meeting prep from there. `copilot_ask` now takes a `launcher_fallback_url` and
+   `_copilot_launcher_fallback_url` supplies the calendar view for events. The one remaining
+   weakness is the hardcoded `inbox` segment: the real URL is folder-qualified, so a message
+   in another folder isn't addressed precisely.
+3. **The pane is localised, and one hint table was silently English-only.** The tenant runs
+   `culture=it-IT` and the recorded entry points were Italian prompt chips ("Riepiloga questo
+   messaggio e-mail", "Aiutami a rispondere", "Cosa devo sapere prima di questa riunione?").
+   `_async_copilot_wait_and_read`'s `/stop/i` regex for the "Stop generating" control could
+   therefore never match, silently degrading the completion check to text-stability alone.
+   Now `_COPILOT_STOP_HINTS` (a correctable table) plus a requirement of two consecutive
+   stable polls, so an unlisted language degrades safely instead of reading a mid-stream
+   pause as completion.
+4. **There is no HTTP endpoint carrying the prompt or the answer** — so the module stays UI
+   automation; there is no `request_substrate` path to migrate to. Stated precisely, because
+   the distinction matters: of 572 records only 4 went to `m365copilotapp.svc.cloud.microsoft`
+   (all `GET /chat` → HTTP 501, expected for a URL carrying `iframeCreationMethod=POST`), and
+   the `semanticoverview` frame that actually served every answer appears zero times. Two
+   endpoints that *look* like wins are not: `MessageService/api/v1/getConversationSummary`
+   sends `fields: ["REACTION_SUMMARY"]` and returns a `reactionsDictionary` — it is emoji
+   reactions, not an AI summary — and `weveb2/…/FindRelevantInsights` is a compose-time
+   suggestion call (`UserAction: "Compose"`) that returned `value: []` both times.
+
+**Still open**: whether Copilot's generation rides a WebSocket. The recorder hooked only
+`response`/`requestfailed`, so a WS backend was *invisible rather than ruled out*. It now
+records WebSockets too (see the discovery-module notes below), so one more capture can settle
+it. Also unverified: whether the side panel offers a free-text box at all — the capture only
+ever recorded prompt-chip clicks, so `_async_copilot_submit` now raises an explicit error
+naming itself as the place a chip-clicking path would go. And **#904 (Coaching) has no
+evidence either way**: no Coaching interaction was captured, so it may not exist in this
+tenant's UI.
+
+The five rows stay `KO`/`Dev` until `tests/smoke/tests/test_copilot.py` is re-run — the fixes
+are derived from captured evidence, but evidence-derived is not the same as verified.
+
+**Update 2026-09-11 — discovery tooling corrected by its own first real capture.** The same
+session exposed two faults in the discovery module, both fixed with unit coverage in
+[tests/unit/test_capability_classify.py](tests/unit/test_capability_classify.py):
+
+- **Instrumentation dominated the report.** The single loudest "discovery" was
+  `/pacman/api/clientevents` (52 calls) proposed as a new tool, and a whole *fabricated*
+  module 12 "groups" was proposed off `/config/v1/Fluid` — an ECS feature-flag fetch. A
+  Copilot-heavy session logs a client event per interaction, which is precisely the traffic a
+  report must not surface. `_NOISE_PATH_HINTS` now covers those paths and the telemetry hosts;
+  on this capture the new table drops 190 of 572 recorded calls.
+- **`extend_tools` was ~80% scaffolding.** `GetItem` was reported as having 19 unsent
+  parameters, of which 18 were HTML-sanitisation options (`FilterHtmlContent`,
+  `InlineImageUrlTemplate`, `CssScopeClassName`) and extended-property grammar we deliberately
+  never send. `_STRUCTURAL_REQUEST_KEYS` now subtracts content-free keys before the verdict,
+  cutting `GetItem` from 19 findings to 1 (`MaximumRecipientsToReturn`) and `FindConversation`
+  from 14 to 5 — where `FocusedViewFilter` and `SearchFolderId` are genuinely actionable, as
+  are `FindItem`'s `FocusedViewFilter`/`ViewFilter` and `FindFolder`'s `ReturnParentFolder`.
+  The line drawn is between a key that says a *feature is in use* and one that is merely the
+  grammar inside it: `Restriction` and `SortOrder` stay reportable, and a test pins
+  `Restriction` specifically to stop the table growing back over that line.
+
+One thing initially read as a third fault but is not: `known_api_covered: 0`. Re-classifying
+the capture with the corrected code leaves it at 0, and that is *correct* — on a real OWA
+session every one of the 8 known actions genuinely is called with at least one parameter we
+never send. The defect was the noise in those lists, not the verdict.
+
 Also, to make the run possible at all: `tests/smoke/server_manager.py` now honors
 `EXCHANGE_SMOKE_HOST`/`EXCHANGE_SMOKE_PORT`, so the suite can reuse a server that is
 already running on another port instead of spawning its own. Two servers cannot share one
@@ -817,7 +897,7 @@ per-row listing degradation and `get_email`'s typed error — while the read/wri
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 101 | `get_emails` | List emails from a folder, grouped by conversation/thread, with unread/pagination filters; each row includes `flag_status`, and `body_error` when `include_body=True` could not fetch that row | `tests/smoke/tests/test_get_emails.py`, `tests/smoke/tests/test_email_flag.py`, `tests/smoke/tests/test_unfetchable_item_resilience.py` | OK (2026-09-10) — `flag_status` on every row; `include_body=True` now degrades individual unfetchable rows instead of failing the whole page (verified 10 rows / 8 bodies / 2 degraded) | Stable |
+| 101 | `get_emails` | List emails from a folder, grouped by conversation/thread, with unread/pagination filters; each row includes `flag_status`, and `body_error` when `include_body=True` could not fetch that row. `offset` is a real folder position at any depth, and every response carries a `pagination` block (`has_more`/`next_offset`/`reached_end_of_folder`, plus `error_code` when paging stopped early) so an empty page is never ambiguous | `tests/smoke/tests/test_get_emails.py`, `tests/smoke/tests/test_email_flag.py`, `tests/smoke/tests/test_unfetchable_item_resilience.py`, `tests/smoke/tests/test_get_emails_pagination.py`, `tests/unit/test_conversation_paging.py` | OK (2026-09-11) — deep-offset pagination rewritten and verified live: server-side `Offset` honoured and aligned with a from-zero enumeration, offsets 0/60/100/120/140/240 all return full pages with monotonically older dates, `ids_only limit=500` no longer capped at 200, empty pages self-describing (see §4). Earlier OK (2026-09-10) for `flag_status` on every row and per-row `include_body` degradation still holds | Stable |
 | 102 | `get_email` | Get a single email's full body, recipients, attachments, and `flag_status` (follow-up flag) | `tests/smoke/tests/test_get_email_detail.py`, `tests/smoke/tests/test_email_flag.py`, `tests/smoke/tests/test_unfetchable_item_resilience.py`, `tests/unit/test_item_errors.py` | OK (2026-09-11) — `flag_status` verified round-tripping all three states. Still fails on the messages OWA cannot serialise at full property shape (this tool asks for all of them by design); now returns `error_code: "item_not_serializable"` plus a `hint` naming the narrow reads that *do* work on the same item, see §4. `test_get_email_detail` is flaky when it happens to pick one. | Stable |
 | 103 | `send_email` | Send a new email (to/cc/bcc, HTML or plain text) | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
 | 104 | `reply_email` | Reply (or reply-all) to an email | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
@@ -900,11 +980,11 @@ per-row listing degradation and `get_email`'s typed error — while the read/wri
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 901 | `ask_copilot` | Generic delegator: sends a free-text prompt to Copilot's chat pane, optionally grounded against an email/event via a best-effort deep link | `tests/smoke/tests/test_copilot.py` | **KO (2026-09-11)** — `Failed to reach Copilot: Locator.wait_for: Timeout 10000ms exceeded waiting for [class*="Copilot" i][role]` to be visible. The tenant *is* on the bearer backend, so the module's own gate passed and this is purely the placeholder pane selectors; a Copilot-named `role=button` was found and clicked, but neither the `role=complementary` pane locator nor the CSS fallback ever matched anything visible. See "Update 2026-09-11 — Copilot smoke test written and run" below | Dev |
-| 902 | `summarize_email_thread` | Ask Copilot to summarize an email thread and list action items | `tests/smoke/tests/test_copilot.py` | **KO (2026-09-11)** — same pane-locator timeout as #901 (all four email-path tools fail identically; the grounding navigation itself is not the problem) | Dev |
-| 903 | `draft_reply_with_copilot` | Ask Copilot to draft a reply to an email per free-text instructions/tone; returns text only, doesn't send | `tests/smoke/tests/test_copilot.py` | **KO (2026-09-11)** — same pane-locator timeout as #901; the separate open question (whether drafting needs a live reply window rather than the chat pane) is still untested, since the pane is never reached | Dev |
-| 904 | `coach_draft` | Ask Copilot's compose coaching for feedback on a draft reply's tone/clarity | `tests/smoke/tests/test_copilot.py` | **KO (2026-09-11)** — same pane-locator timeout as #901; likewise, whether "Coaching" lives inside an in-progress compose window instead of the chat pane remains unverified | Dev |
-| 905 | `meeting_prep` | Ask Copilot to prepare a briefing for an upcoming meeting (context, documents, action items) | `tests/smoke/tests/test_copilot.py` | **KO (2026-09-11)** — different failure from the email tools: `Could not find a Copilot launch button on the current page`, i.e. after the guessed calendar deep link (`<origin>/calendar/item/<id>`) the page had no Copilot-named button at all. Because a failed navigation is swallowed by design, that also implicates the event deep-link shape | Dev |
+| 901 | `ask_copilot` | Generic delegator: sends a free-text prompt to Copilot's chat pane, optionally grounded against an email/event via a best-effort deep link | `tests/smoke/tests/test_copilot.py` | **KO (2026-09-11)** — root cause found by discovery capture `20260911-112708-e917` and fix landed, **re-run pending**. The original `Locator.wait_for` timeout on `[class*="Copilot" i][role]` is explained: Copilot's pane is a *cross-origin iframe* on `m365copilotapp.svc.cloud.microsoft`, which a main-frame `page.locator` can never match. `browser_session.py` now resolves the frame first. Still unverified against a live mailbox, and the capture never saw a free-text box in the pane (only preset prompt chips), so `_async_copilot_submit`'s typing path remains an inference | Dev |
+| 902 | `summarize_email_thread` | Ask Copilot to summarize an email thread and list action items | `tests/smoke/tests/test_copilot.py` | **KO (2026-09-11)** — same cross-origin-iframe root cause as #901; fix landed, re-run pending. Note the capture's Italian entry point for this operation was the chip "Riepiloga questo messaggio e-mail" | Dev |
+| 903 | `draft_reply_with_copilot` | Ask Copilot to draft a reply to an email per free-text instructions/tone; returns text only, doesn't send | `tests/smoke/tests/test_copilot.py` | **KO (2026-09-11)** — same root cause as #901; fix landed, re-run pending. The separate open question (whether drafting needs a live reply window rather than the chat pane) is now partly answered: the capture recorded the "Aiutami a rispondere" chip served *from the side panel*, not from a compose window | Dev |
+| 904 | `coach_draft` | Ask Copilot's compose coaching for feedback on a draft reply's tone/clarity | `tests/smoke/tests/test_copilot.py` | **KO (2026-09-11)** — same root cause as #901; fix landed, re-run pending. Weakest evidence of the five: **no Coaching interaction was captured at all**, so whether the affordance exists in this tenant is unknown, not merely unverified | Dev |
+| 905 | `meeting_prep` | Ask Copilot to prepare a briefing for an upcoming meeting (context, documents, action items) | `tests/smoke/tests/test_copilot.py` | **KO (2026-09-11)** — root cause found, fix landed, re-run pending, and the diagnosis inverted: the guessed event deep link `<origin>/calendar/item/<id>` is **correct** (the capture recorded exactly it), but a calendar *item* page carries no Copilot launcher. `copilot_ask` now retries the launcher on `/calendar/view/day` via `launcher_fallback_url` | Dev |
 
 ### Tasks — [exchange_mcp/tools/tasks.py](exchange_mcp/tools/tasks.py) (6)
 
@@ -1029,14 +1109,93 @@ hold a request open for.
   Still open: *which* property in the `AllProperties` set OWA can't render is unidentified
   (a one-property-at-a-time bisect on a known-bad item would settle it, and would tell us
   whether `get_email` can degrade to a near-complete narrow shape instead of failing).
+- **`get_emails` deep pagination silently truncated (#101). Fixed and verified live
+  2026-09-11.** Reported by a client skill doing backlog processing: past
+  a certain `offset`, `get_emails` returned `{"emails": [], "count": 0}` — a normal
+  end-of-folder response — while a COM-automation connector read 20 real messages at the
+  same position. Root cause was neither the conversation grouping nor a server-side paging
+  quirk: `FindConversation` was sent `"Offset": 0` *hardcoded* with a window of
+  `min(max(limit * 4, 50), 200)`, and the caller's `offset` was then applied by slicing
+  **that window**. So `offset` was never a folder position at all — it was an index into a
+  page that always started at record 0, and everything past the window was empty. Confirmed
+  live on the Inbox: `limit=20` returned a row at `offset=79` and nothing at `80` (window
+  80), `limit=5` returned rows at `offset=45` and nothing at `50` (window 50) — the cutoff
+  tracked `limit`, not the mailbox, and `offset=45,limit=5` landed on 2026-09-03 while
+  `offset=79,limit=20` landed on 2026-08-26, i.e. the same `offset` meant different
+  positions for different `limit`s. The reporter's `ids_only=True, limit=500` workaround was
+  itself capped at 200 by the same expression.
+  `_page_conversations`/`_find_conversations` now send a real `IndexedPageView.Offset` (the
+  field every `FindItem` caller in this package already pages with) and assemble deep or
+  oversized pages from successive calls. Three deliberate choices, each with a
+  wrong-looking-but-tempting alternative:
+  - **Only an *empty* page ends the folder, never a short one.** The original over-fetch
+    exists because this backend was observed not to always respect `MaxEntriesReturned`, so
+    treating a short page as the end would reintroduce the same false truncation. Costs one
+    extra request at a folder's true end.
+  - **A deep page identifies row 0 first.** A backend that ignored `Offset` would answer a
+    deep request with page 1's conversations wearing a deeper offset — wrong data, silently,
+    which is worse than the empty page being fixed. One response can't reveal that, so
+    `offset > 0` costs one extra one-row request as a witness; `offset=0` pays nothing.
+  - **The `pagination` block is nested, not hoisted.** `reached_end_of_folder` vs.
+    `error_code` (`pagination_offset_unsupported` / `pagination_scan_limit_reached`) is what
+    makes an empty page self-describing, which was the reporter's second request. It stays
+    under `pagination` because a top-level `error` key is this codebase's signal that the
+    *tool call* failed (`is_error_payload` in the smoke harness reads it that way), and a
+    page that stopped early still returned valid rows.
+  `unread_only` is still a client-side filter, so that path has no server-side address: it
+  enumerates from the start of the folder and skips after filtering, bounded by
+  `_CONV_MAX_SCAN` (2000) and reporting `pagination_scan_limit_reached` rather than
+  truncating. **`ViewFilter: "Unread"` was implemented and then reverted the same day**, and
+  the reasoning is worth keeping: it removes that scan, but a backend that accepted the
+  filter and ignored it would leave `offset` addressing the *unfiltered* sequence — every
+  returned row still genuinely unread (the client-side check keeps read mail out), just from
+  the wrong position, with unread conversations skipped entirely. The self-check that was
+  supposed to make it safe ("if any returned row is read, the filter was ignored") is not
+  decisive: when a folder's newest conversations are all unread, which is the ordinary case
+  for an Inbox, an ignored filter is indistinguishable from an honoured one. Trading this
+  function's one guarantee for a faster rare path isn't worth it;
+  `test_paging_never_asks_the_server_to_filter` pins `"All"` so it isn't reintroduced as an
+  apparently free optimisation.
+  Covered by `tests/unit/test_conversation_paging.py` (14 cases, no mailbox: deep offsets,
+  both stop reasons, short-page handling, filtered offsets, the ViewFilter guard).
+  **Live verification, 2026-09-11** on a fresh isolated profile (port 8767; the 8766
+  production instance was left untouched), `tests/smoke/tests/test_get_emails_pagination.py`
+  plus targeted probes:
+  - `FindConversation` **does** honour a server-side `IndexedPageView.Offset` on this tenant,
+    and it agrees exactly with a from-zero enumeration (the `offset=20` page was found at
+    index 20 of an `offset=0, limit=40` read). This was previously only inferred from
+    `FindItem` using the identical structure.
+  - Every offset from the bug report now returns a full page, with monotonically older dates:
+    `offset=0` → 2026-09-09..09-11, `60` → 2026-08-26..09-01, `100` → 2026-07-21..08-14,
+    `120` → 2026-06-23..07-21, `140` → 2026-05-21..06-22, `240` → 2026-03-25..04-09. The
+    first two match the offsets that already worked before the fix, so the enumeration order
+    is unchanged.
+  - `offset=100000` returns empty with `reached_end_of_folder: true` and no `error_code`;
+    a 6-page walk driven by `next_offset` yielded 120 distinct conversations with no repeats.
+  - `ids_only=True, limit=500` now returns 500 distinct conversations. The reporter's
+    workaround was silently capped at 200 by the same expression that caused the bug.
+  - `unread_only` with a deep offset behaves as designed on a mailbox with ~6 unread
+    conversations: `offset=40` scans the 2000 cap and returns 0 rows *with*
+    `pagination_scan_limit_reached`, i.e. "I stopped looking", not "end of folder".
+  Note for anyone re-checking against a COM/MAPI connector: the report's cross-validation
+  read 2026-07-14..07-27 at `offset=240`, we read 2026-03-25..04-09. Both are right — COM
+  indexes raw *messages*, `get_emails` indexes *conversations*, and each conversation
+  collapses one or more messages, so conversation 240 is further back in history than
+  message 240.
+  Same-shaped gap still open in `find_emails_by_category` (#111), which scans one 200-row
+  `FindConversation` window and filters client-side, so a category older than the newest 200
+  conversations is invisible; it has no `offset` parameter, so it truncates silently but
+  can't be wrong about a position.
 - **Automated tests are almost entirely live-mailbox smoke tests.** `tests/smoke/`
   exercises each MCP tool end-to-end against a real mailbox, one module per tool, so it
   cannot run in CI and cannot cover pure logic in isolation. `tests/unit/` is the
-  exception and now holds four suites: `test_auth_errors` (sign-in failure diagnosis and
+  exception and now holds five suites: `test_auth_errors` (sign-in failure diagnosis and
   profile-directory resolution), `test_recurrence_expansion` (occurrence arithmetic for
   every pattern/range variant, exact dates, real captured payloads, malformed-payload
-  degradation), `test_capability_classify` (discovery verdicts and redaction) and
-  `test_item_errors` (per-item failure codes and the payload shape bulk tools return).
+  degradation), `test_capability_classify` (discovery verdicts and redaction),
+  `test_item_errors` (per-item failure codes and the payload shape bulk tools return) and
+  `test_conversation_paging` (FindConversation offset paging, both of its
+  can't-reach-that-page failure modes, and the unread_only filtered-offset path).
   Other cheap pure-logic targets remain uncovered: e.g.
   `_build_recipient_list` handling empty/whitespace addresses, or `folder_id_dict()`
   picking the right `__type` for a distinguished vs. opaque folder ID.
@@ -1044,20 +1203,36 @@ hold a request open for.
   of the 54 tools have actually been run against a real OWA mailbox since the
   browser-session rewrite. This document's "Manual QA / Status" column is a template for
   that log — fill it in as you verify each tool.
-- **Copilot module (#901-905) needs a live discovery spike — now confirmed necessary, and
-  narrowed.** Every DOM selector, the generation-complete polling heuristic, and the
-  item-grounding deep-link URL shape in `browser_session.py`'s Copilot section are
-  best-guess placeholders — there is no documented Copilot API/DOM reference to build
-  against. The smoke run on 2026-09-11 (see §1 and the 5 rows above, all now `KO`)
-  established that the placeholders really are wrong on a live bearer-mode tenant, and
-  which ones: the pane locators in `_async_copilot_locate_pane` never match, while the
-  launcher query in `_async_copilot_open_pane` does find and click a Copilot-named button
-  on mail pages; the event deep link `<origin>/calendar/item/<id>` lands somewhere with no
-  Copilot entry point at all. Still completely unexercised because nothing reaches them:
-  `_async_copilot_wait_and_read`'s stability heuristic and its rate-limit/sign-in hint
-  tables. What's needed is a `--show-browser` session that opens the real pane by hand and
-  reads its actual roles/names — the tests exist now (`tests/smoke/tests/test_copilot.py`),
-  so the spike only has to correct `browser_session.py` and re-run them.
+- **Copilot module (#901-905): spike done, fixes landed, re-run outstanding.** ~~Needs a live
+  discovery spike~~ — capture `20260911-112708-e917` ran on 2026-09-11 and found the root
+  cause (the chat pane is a cross-origin iframe, so main-frame locators could never match);
+  `browser_session.py` and `owa_client.py` are corrected accordingly. See the two 2026-09-11
+  update sections in §1 for the full evidence. **What remains:** re-run
+  `tests/smoke/tests/test_copilot.py` against the live mailbox and update the 5 rows — the
+  fixes are derived from captured traffic, not yet verified by a passing test. Three specific
+  questions the capture could not answer, each needing a live check rather than more analysis:
+  (a) whether Copilot's generation rides a WebSocket, now recordable but not yet recorded;
+  (b) whether the side panel has a free-text box at all, or only preset prompt chips — the
+  capture only ever saw chip clicks; (c) whether #904's Coaching affordance exists in this
+  tenant, since no Coaching interaction was captured. Also still unexercised in practice:
+  `_async_copilot_wait_and_read`'s stability heuristic and its rate-limit/sign-in hint tables.
+- **`_copilot_item_url` hardcodes the `inbox` folder segment.** The capture confirmed the real
+  mail deep link is folder-qualified (`/mail/<folder>/id/<id>`), so grounding Copilot on a
+  message that lives outside the Inbox navigates to a URL for the wrong folder. A failed
+  navigation is swallowed by design (falls through to an ungrounded ask), so this degrades
+  the answer's grounding rather than erroring — which is also why it's easy to miss. Fixing
+  it needs the item's parent folder, which the tools don't currently pass down.
+- **M365 Groups actions are unimplemented and were seen live.** Capture
+  `20260911-112708-e917` recorded `GetUserUnifiedGroups`, `GetUnifiedGroupsSettings` and
+  `UpdateUserGroupsSetConfiguration` — real EWS actions, no tool here calls any of them. Out
+  of scope for that session (it was about Copilot), so they were noted rather than pursued;
+  they'd form a plausible new module if group membership/settings ever matter.
+- **Copilot *metadata* endpoints are unimplemented.** The same capture recorded
+  `substrate.office.com/m365Copilot/GetChats` (list Copilot chat threads),
+  `m365Copilot/GetGptList` (available agents/GPTs) and `puds/v1/me/settings/copilot`
+  (Copilot settings). These are ordinary substrate calls — unlike generation itself, they'd
+  need no UI automation. None of them produce an answer to a prompt, so they'd extend the
+  Copilot module's surface rather than fix #901-905.
 - **`BrowserSession`'s crash recovery doesn't cover a stuck profile lock.** Its documented
   recovery path (see CLAUDE.md's "Recovery" section) relaunches on the same profile directory
   and retries once if the browser process/context crashes. Observed during folder-tool testing

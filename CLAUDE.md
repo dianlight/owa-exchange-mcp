@@ -34,7 +34,7 @@ Any variable above can also be placed in a gitignored `.env.local` next to `pypr
   - `capability_inventory.py` — What this server already implements, derived by `ast`-scanning `tools/*.py` and `owa_client.py` for transport call sites, plus PROJECT_STATUS.md for the ID-numbering state. No Playwright, unit-testable.
   - `capability_classify.py` — Verdicts and implementation proposals for a recorded capture. Pure logic; the domain knowledge lives in two keyword tables, correctable in one place like `auth_errors.py`'s.
   - `tools/` — Tool modules: email, calendar, categories, people, folders, availability, analytics, auth, copilot, tasks, discovery
-- `tests/unit/` — Pure-logic tests, no live mailbox / browser / `EXCHANGE_OWA_URL` needed (`python -m tests.unit.test_auth_errors`, `python -m tests.unit.test_recurrence_expansion`, `python -m tests.unit.test_capability_classify`, `python -m tests.unit.test_item_errors`). Separate from `tests/smoke/`, which is live-mailbox end-to-end.
+- `tests/unit/` — Pure-logic tests, no live mailbox / browser / `EXCHANGE_OWA_URL` needed (`python -m tests.unit.test_auth_errors`, `python -m tests.unit.test_recurrence_expansion`, `python -m tests.unit.test_capability_classify`, `python -m tests.unit.test_item_errors`, `python -m tests.unit.test_conversation_paging`). Separate from `tests/smoke/`, which is live-mailbox end-to-end.
 - `.claude/skills/owa-capability-discovery/` — Interactive skill driving the discovery tools: scope → record → classify → propose → implement. Its `references/implementation-checklist.md` is the "turn a proposal into a tool" procedure.
 
 ## Running
@@ -59,6 +59,7 @@ python -m tests.unit.test_auth_errors
 python -m tests.unit.test_recurrence_expansion
 python -m tests.unit.test_capability_classify
 python -m tests.unit.test_item_errors
+python -m tests.unit.test_conversation_paging
 
 # Live-mailbox smoke tests: one module per tool group, run individually.
 # The harness starts its own server on 127.0.0.1:8765 if nothing is listening
@@ -104,6 +105,8 @@ Deliberate design points, each of which has a wrong-looking-but-tempting alterna
 
 **Per-item error codes**: tools taking a list of `item_ids` never abort the batch on one bad item, and report each failure with a stable `error_code` from `utils.classify_item_error()` (`item_not_serializable` / `item_not_found` / `item_access_denied` / `item_read_failed`), lifted to `failed_codes` on the batch summary. That exists because client skills were reduced to substring-matching an HTTP 500 message to decide whether to fall back to another connector. Add new signals to the tables in `utils.py`, not to the tool modules, and cover them in `tests/unit/test_item_errors.py` — an unrecognised failure must stay `item_read_failed` rather than be guessed into a specific code.
 
+7. **Page with the server's `Offset`, and only stop on an *empty* page.** A caller-supplied `offset` must go into `Paging.Offset` (`IndexedPageView`), never be applied by slicing one response — `get_emails` did the latter and turned every offset past its own window into an indistinguishable `{"count": 0}` (see PROJECT_STATUS.md §4, fixed 2026-09-11). The corollary matters just as much: because this backend doesn't reliably respect `MaxEntriesReturned`, a **short page does not mean end-of-folder** — only a genuinely empty one does, so a paging loop pays one extra request at the end rather than risking silent truncation. Tools that page must also make an empty result say *why* it's empty (`_page_conversations`'s `pagination` block: `has_more`/`next_offset`/`reached_end_of_folder`, plus an `error_code` when paging stopped early). Keep that diagnosis nested, not at the top level — a top-level `error` key means the whole call failed.
+
 **RequestServerVersion**: `Exchange2013` for reads, `V2017_08_18` for writes.
 
 **Recovery**: if the browser process/context crashes, `BrowserSession` relaunches on the same profile directory and retries the call once. If the OWA session expires, `OWAClient` retries once after a silent re-auth attempt — see "Authentication" above for what happens when that can't succeed.
@@ -127,7 +130,11 @@ the last one Exchange processes wins, so never send two in one request. There is
 and the `*_folder` tools cover it — except *creating* one, since `create_folder` hardcodes
 `FolderClass: "IPF.Note"` (see PROJECT_STATUS.md §4).
 
-**Copilot tools (`tools/copilot.py`)**: unlike every other tool module, Copilot has no documented API to call — there is no EWS action, no REST endpoint, nothing to POST. These tools instead drive Copilot's own chat pane inside the modern Outlook web client directly via Playwright UI automation (`BrowserSession`'s Copilot section: `_async_copilot_locate_pane`/`_open_pane`/`_submit`/`_wait_and_read`/`_async_copilot_ask`/`copilot_ask()`), the same "automate OWA's own web UI" escape hatch already used for the calendar category write-path (`_set_event_categories`, see PROJECT_STATUS.md #208/#209) when no API exists. Only available in `bearer` auth mode (modern Outlook) — raises `BearerModeRequiredError` on classic canary-cookie OWA, the same exception `find_people`/`post_substrate` use for their own modern-backend-only surfaces. Because there's no DOM/API reference to build against, every selector, the generation-complete polling heuristic, and the item-grounding deep-link URL shape are best-guess placeholders pending a live discovery spike (`--show-browser` inspection of a real Copilot pane). The 2026-09-11 smoke run ([tests/smoke/tests/test_copilot.py](tests/smoke/tests/test_copilot.py)) confirmed that they are in fact wrong: all five tools fail on a live bearer-mode tenant, in two distinct ways (see PROJECT_STATUS.md's Copilot rows #901-905, now `KO`, and the §1 update). Don't expect any of these tools to work until the spike has corrected `browser_session.py` and that test passes.
+**Copilot tools (`tools/copilot.py`)**: unlike every other tool module, Copilot has no documented API to call — there is no EWS action, no REST endpoint, nothing to POST. These tools instead drive Copilot's own chat pane inside the modern Outlook web client directly via Playwright UI automation (`BrowserSession`'s Copilot section: `_async_copilot_locate_pane`/`_open_pane`/`_submit`/`_wait_and_read`/`_async_copilot_ask`/`copilot_ask()`), the same "automate OWA's own web UI" escape hatch already used for the calendar category write-path (`_set_event_categories`, see PROJECT_STATUS.md #208/#209) when no API exists. Only available in `bearer` auth mode (modern Outlook) — raises `BearerModeRequiredError` on classic canary-cookie OWA, the same exception `find_people`/`post_substrate` use for their own modern-backend-only surfaces. **The one thing to know before touching this module: the chat pane is a cross-origin iframe.** OWA runs on the mailbox host; the pane is served from `m365copilotapp.svc.cloud.microsoft` (`_COPILOT_FRAME_HOST_HINTS`). A Playwright `page.locator(...)` only ever searches the main frame, so *any* selector written against the page — however well guessed — cannot match a node in the pane. That is what made all five tools fail their first live run, and it's why `_async_copilot_frame` resolves the frame before anything else and every other helper takes a locator already rooted inside it. The launch button is the one exception: it's genuine main-frame OWA chrome, matched on the accessible name "Copilot" (which Microsoft doesn't translate — the prompts inside the pane *are* localised, hence `_COPILOT_STOP_HINTS`).
+
+Discovery capture `20260911-112708-e917` also established that **no HTTP endpoint carries the prompt or the generated answer**, so there is no transport to migrate to and the UI automation is not a temporary shim. Whether generation rides a WebSocket is still open — the recorder was blind to WebSockets when that capture ran and now isn't. Two shapes it *did* confirm, both already correct in the code: the mail deep link `/mail/<folder>/id/<urlencoded id>` and the event deep link `/calendar/item/<urlencoded id>`. A calendar *item* page has no Copilot launcher, though, so `copilot_ask` takes a `launcher_fallback_url` (the calendar view) for events.
+
+Still unverified, and worth knowing before trusting a result: the fixes above are derived from captured traffic, not from a passing test — `tests/smoke/tests/test_copilot.py` has not been re-run since, and PROJECT_STATUS.md's rows #901-905 remain `KO`/`Dev`. The capture never saw a free-text input in the pane (only preset prompt chips), and never saw a Coaching affordance at all (#904).
 
 **Capability discovery (`tools/discovery.py`, module 11)**: the only tool module that doesn't
 touch a mailbox. It exists because every gap closed in this codebase so far was found the same
@@ -157,8 +164,24 @@ Four things about it are load-bearing:
   an allowlisted set of headers is recorded (never `Authorization` / `Cookie` / `X-OWA-CANARY`),
   the injected page script records tag/role/label but never input values, and response bodies are
   stored as a content-free field/type skeleton unless raw bodies are explicitly requested.
-  `tests/unit/test_capability_classify.py` asserts each of those directly rather than trusting
-  them.
+  WebSocket frames follow the same opt-in: by default only the socket's URL, each frame's
+  direction and its size reach disk, because a frame on a chat socket *is* mailbox content (the
+  prompt, the generated answer). `tests/unit/test_capability_classify.py` asserts each of those
+  directly rather than trusting them.
+- **HTTP-only would have been a misleading capture.** The recorder hooks `page.on("websocket")`
+  as well as `response`/`requestfailed`, because the first real capture
+  (`20260911-112708-e917`, the Copilot spike) produced answers on screen with no HTTP request
+  carrying them — and a recorder that only sees HTTP reports that as "no endpoint" rather than
+  "no endpoint *of the kind I can see*". Those are very different findings to act on.
+- **Two filters keep instrumentation out of the findings**, and both were added because that
+  same capture was drowned by it: `_NOISE_PATH_HINTS` (here) drops telemetry and client-config
+  paths at record time — `/pacman/`, `/clientevents`, `/config/v1/`, the `events.data.microsoft.com`
+  hosts — and `_STRUCTURAL_REQUEST_KEYS` (in `capability_classify.py`) drops content-free
+  request keys before a verdict. Before them, the loudest "discovery" in a Copilot session was a
+  client-event logger with 52 calls, and `GetItem` was reported as having 19 unsent parameters
+  of which 18 were HTML-sanitisation options. The structural-key table draws a fine line worth
+  respecting: a key that says a *feature is in use* (`Restriction`, `SortOrder`) stays
+  reportable; only the grammar inside it (`Path`, `FieldURI`, `Value`) is dropped.
 - **Classification reads the capture files, not the live recorder**, so a session survives a
   restart, can be re-classified under a different scope, and can be re-run after implementing a
   proposal as a free check that the endpoint moved to `known_api_covered`.
