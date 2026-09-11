@@ -660,6 +660,62 @@ thread that process exit kills outright. Now retried while Chromium releases its
 the outcome recorded in the manifest, plus a sweep of abandoned `owa-discovery-*` profiles at
 the start of each session. The live-mailbox path (a real sign-in, a real OWA exploration) has
 not been driven by a human yet, so all six rows are `Pending`.
+**Update 2026-09-11 — Copilot smoke test written and run: all five tools KO,
+and the discovery spike is now precisely scoped.** Added
+[tests/smoke/tests/test_copilot.py](tests/smoke/tests/test_copilot.py), closing the last
+module with no automated coverage at all. It drives #901-905 read-only (the drafting and
+coaching tools only *ask* Copilot for text; nothing is sent or saved) and treats two
+different results as a pass, because the module's contract is backend-dependent: on the
+modern backend each tool must return `status: ok` with text (or a `timeout` carrying real
+`partial_text`, which the tools document as a non-failure), while on classic canary-cookie
+OWA the documented behavior is to fail *clearly* with the `BearerModeRequiredError`
+message — so that exact message is a pass, recorded with a note. Anything else is a KO.
+
+Run against the live mailbox, all five failed. Crucially the tenant is on the **bearer**
+backend (`check_session` returns no `mailbox`/`unread`, which is the modern-backend
+signature), so `BearerModeRequiredError` never fired: the module's gate passed and every
+failure is in the UI automation itself, not in tenant capability. Two distinct failure
+modes, which is more diagnostic than a uniform one:
+
+- **#901/#902/#903/#904 (ungrounded and email-grounded):** `Locator.wait_for: Timeout
+  10000ms exceeded` waiting for `[class*="Copilot" i][role]` to be visible. Reading that
+  backwards: `_async_copilot_locate_pane`'s primary `role=complementary` + name `/copilot/i`
+  query matched nothing (else the CSS fallback would never appear in the message), a
+  Copilot-named `role=button` *was* found and clicked by `_async_copilot_open_pane` (else
+  the explicit "Could not find a Copilot launch button" error would have been raised
+  instead), and the pane still never became visible under either locator. So the launcher
+  guess is at least approximately right and the pane guess is wrong — or the click opened
+  something other than the chat pane.
+- **#905 (event-grounded):** `Could not find a Copilot launch button on the current page`.
+  After navigating the guessed calendar deep link there was no Copilot-named button at all,
+  where the mail-side page had one. Since `_async_copilot_ask` swallows a failed grounding
+  navigation by design (best-effort, falls through to an ungrounded ask), this single error
+  can't distinguish "the `<origin>/calendar/item/<id>` shape is wrong" from "that page has
+  no Copilot entry point" — the spike should check both.
+
+Untouched by this run, and therefore still entirely unexercised: the generation-complete
+heuristic in `_async_copilot_wait_and_read`, and the rate-limit / sign-in hint tables it
+consults. Nothing ever got far enough to reach them.
+
+Also, to make the run possible at all: `tests/smoke/server_manager.py` now honors
+`EXCHANGE_SMOKE_HOST`/`EXCHANGE_SMOKE_PORT`, so the suite can reuse a server that is
+already running on another port instead of spawning its own. Two servers cannot share one
+browser profile directory — Chromium holds an exclusive lock on it — so with a long-lived
+instance already owning the default profile, spawning a second one on the harness's usual
+port either fails or disturbs the live session. Defaults are unchanged (`127.0.0.1:8765`).
+
+All five moved to `Dev` and into `KNOWN_BUGGY_TOOLS` in
+[server.py](exchange_mcp/server.py), so `--stable` / `EXCHANGE_MCP_STABLE` drops them from
+the tool listing instead of letting a client call something that cannot work. That widens
+the column's original bar (which said *unfixable server-side* fault) to "reproducibly fails
+on every call attempt", and §2 now says so: this is a client-side gap the spike is expected
+to close, and the five entries in `KNOWN_BUGGY_TOOLS` should be deleted when it does.
+
+Reproducibility note: the failures were first observed through a long-lived server on the
+default profile (2026-09-10), then reproduced by the new test on an **independently
+launched server with its own profile directory** (`.browser-profile-dev`, port 8767,
+2026-09-11) — same two error strings, same split between the email and event paths. So this
+is a property of the selectors, not of one browser profile's state.
 
 ## 2. How to read the table
 
@@ -681,11 +737,15 @@ not been driven by a human yet, so all six rows are `Pending`.
   **`Pending`** unless you tell me otherwise. Update this column as you validate each tool;
   use `OK` / `KO` once you have an actual result, and add a one-line note (error text,
   date) for any `KO`.
-- **Stability** — `Stable` unless the tool has a confirmed, unfixable server-side fault,
-  in which case it's `Dev`. None currently qualify — `find_meeting_time` #602 was the
-  only `Dev`-tagged tool, fixed 2026-09-09 by switching to the `GetSchedule` GraphQL
-  operation (see the update above); `GetUserAvailability` itself is still unimplemented
-  on this tenant, but no tool depends on it exclusively anymore. This is a narrower bar than `KO`/`Pending`:
+- **Stability** — `Stable` unless the tool reproducibly fails on every call attempt, in
+  which case it's `Dev`. Currently `Dev`: the 5 Copilot tools #901-905 (chat-pane
+  selectors confirmed wrong by the 2026-09-11 smoke run — note this is a *client-side*
+  gap the discovery spike is expected to fix, a deliberate widening of the original
+  "unfixable server-side fault" bar to cover any tool that fails 100% of the time).
+  `find_meeting_time` #602 was previously `Dev`, fixed 2026-09-09 by switching to the
+  `GetSchedule` GraphQL operation (see the update above); `GetUserAvailability` itself is
+  still unimplemented on this tenant, but no tool depends on it exclusively anymore.
+  This is a narrower bar than `KO`/`Pending`:
   a tool that degrades gracefully instead of failing (e.g. `get_meeting_contacts` #702,
   which returns an empty result plus a `warnings` field rather than erroring) stays
   `Stable`, and an untested (`Pending`) tool also stays `Stable` by default — only move a
@@ -783,11 +843,11 @@ not been driven by a human yet, so all six rows are `Pending`.
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 901 | `ask_copilot` | Generic delegator: sends a free-text prompt to Copilot's chat pane, optionally grounded against an email/event via a best-effort deep link | None | Pending — see "Update 2026-09-09 — new Copilot tool module added" above; DOM selectors are unverified placeholders pending a live discovery spike | Stable |
-| 902 | `summarize_email_thread` | Ask Copilot to summarize an email thread and list action items | None | Pending — same caveats as #901 | Stable |
-| 903 | `draft_reply_with_copilot` | Ask Copilot to draft a reply to an email per free-text instructions/tone; returns text only, doesn't send | None | Pending — same caveats as #901; whether Copilot's compose-time drafting needs a live reply window instead of the plain chat pane is also unconfirmed | Stable |
-| 904 | `coach_draft` | Ask Copilot's compose coaching for feedback on a draft reply's tone/clarity | None | Pending — same caveats as #901; Copilot's "Coaching" affordance may live inside an in-progress compose window rather than the chat pane this tool drives, unconfirmed | Stable |
-| 905 | `meeting_prep` | Ask Copilot to prepare a briefing for an upcoming meeting (context, documents, action items) | None | Pending — same caveats as #901 | Stable |
+| 901 | `ask_copilot` | Generic delegator: sends a free-text prompt to Copilot's chat pane, optionally grounded against an email/event via a best-effort deep link | `tests/smoke/tests/test_copilot.py` | **KO (2026-09-11)** — `Failed to reach Copilot: Locator.wait_for: Timeout 10000ms exceeded waiting for [class*="Copilot" i][role]` to be visible. The tenant *is* on the bearer backend, so the module's own gate passed and this is purely the placeholder pane selectors; a Copilot-named `role=button` was found and clicked, but neither the `role=complementary` pane locator nor the CSS fallback ever matched anything visible. See "Update 2026-09-11 — Copilot smoke test written and run" below | Dev |
+| 902 | `summarize_email_thread` | Ask Copilot to summarize an email thread and list action items | `tests/smoke/tests/test_copilot.py` | **KO (2026-09-11)** — same pane-locator timeout as #901 (all four email-path tools fail identically; the grounding navigation itself is not the problem) | Dev |
+| 903 | `draft_reply_with_copilot` | Ask Copilot to draft a reply to an email per free-text instructions/tone; returns text only, doesn't send | `tests/smoke/tests/test_copilot.py` | **KO (2026-09-11)** — same pane-locator timeout as #901; the separate open question (whether drafting needs a live reply window rather than the chat pane) is still untested, since the pane is never reached | Dev |
+| 904 | `coach_draft` | Ask Copilot's compose coaching for feedback on a draft reply's tone/clarity | `tests/smoke/tests/test_copilot.py` | **KO (2026-09-11)** — same pane-locator timeout as #901; likewise, whether "Coaching" lives inside an in-progress compose window instead of the chat pane remains unverified | Dev |
+| 905 | `meeting_prep` | Ask Copilot to prepare a briefing for an upcoming meeting (context, documents, action items) | `tests/smoke/tests/test_copilot.py` | **KO (2026-09-11)** — different failure from the email tools: `Could not find a Copilot launch button on the current page`, i.e. after the guessed calendar deep link (`<origin>/calendar/item/<id>`) the page had no Copilot-named button at all. Because a failed navigation is swallowed by design, that also implicates the event deep-link shape | Dev |
 
 ### Tasks — [exchange_mcp/tools/tasks.py](exchange_mcp/tools/tasks.py) (6)
 
@@ -912,14 +972,20 @@ hold a request open for.
   of the 54 tools have actually been run against a real OWA mailbox since the
   browser-session rewrite. This document's "Manual QA / Status" column is a template for
   that log — fill it in as you verify each tool.
-- **Copilot module (#901-905) needs a live discovery spike.** Every DOM selector,
-  the generation-complete polling heuristic, and the item-grounding deep-link URL
-  shape in `browser_session.py`'s Copilot section are best-guess placeholders — there
-  is no documented Copilot API/DOM reference to build against. Needs a
-  `--show-browser` session against a real Copilot chat pane to confirm/correct the
-  selectors before any of the 5 rows above can move past `Pending`. Deferred in the
-  session that added this module to avoid colliding with another concurrently
-  active session's use of the shared browser profile/dev port.
+- **Copilot module (#901-905) needs a live discovery spike — now confirmed necessary, and
+  narrowed.** Every DOM selector, the generation-complete polling heuristic, and the
+  item-grounding deep-link URL shape in `browser_session.py`'s Copilot section are
+  best-guess placeholders — there is no documented Copilot API/DOM reference to build
+  against. The smoke run on 2026-09-11 (see §1 and the 5 rows above, all now `KO`)
+  established that the placeholders really are wrong on a live bearer-mode tenant, and
+  which ones: the pane locators in `_async_copilot_locate_pane` never match, while the
+  launcher query in `_async_copilot_open_pane` does find and click a Copilot-named button
+  on mail pages; the event deep link `<origin>/calendar/item/<id>` lands somewhere with no
+  Copilot entry point at all. Still completely unexercised because nothing reaches them:
+  `_async_copilot_wait_and_read`'s stability heuristic and its rate-limit/sign-in hint
+  tables. What's needed is a `--show-browser` session that opens the real pane by hand and
+  reads its actual roles/names — the tests exist now (`tests/smoke/tests/test_copilot.py`),
+  so the spike only has to correct `browser_session.py` and re-run them.
 - **`BrowserSession`'s crash recovery doesn't cover a stuck profile lock.** Its documented
   recovery path (see CLAUDE.md's "Recovery" section) relaunches on the same profile directory
   and retries once if the browser process/context crashes. Observed during folder-tool testing

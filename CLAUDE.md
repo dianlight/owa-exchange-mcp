@@ -58,6 +58,14 @@ exchange-mcp-server --transport http --port 8765 --show-browser
 python -m tests.unit.test_auth_errors
 python -m tests.unit.test_recurrence_expansion
 python -m tests.unit.test_capability_classify
+
+# Live-mailbox smoke tests: one module per tool group, run individually.
+# The harness starts its own server on 127.0.0.1:8765 if nothing is listening
+# there; set EXCHANGE_SMOKE_HOST/EXCHANGE_SMOKE_PORT to reuse a server that is
+# already running instead — two servers can't share one browser profile
+# directory (Chromium holds an exclusive lock on it).
+python -m tests.smoke.tests.test_copilot
+EXCHANGE_SMOKE_PORT=8767 python -m tests.smoke.tests.test_copilot
 ```
 
 There is no credential setup step and no login CLI: the first start opens a browser
@@ -115,7 +123,7 @@ the last one Exchange processes wins, so never send two in one request. There is
 and the `*_folder` tools cover it — except *creating* one, since `create_folder` hardcodes
 `FolderClass: "IPF.Note"` (see PROJECT_STATUS.md §4).
 
-**Copilot tools (`tools/copilot.py`)**: unlike every other tool module, Copilot has no documented API to call — there is no EWS action, no REST endpoint, nothing to POST. These tools instead drive Copilot's own chat pane inside the modern Outlook web client directly via Playwright UI automation (`BrowserSession`'s Copilot section: `_async_copilot_locate_pane`/`_open_pane`/`_submit`/`_wait_and_read`/`_async_copilot_ask`/`copilot_ask()`), the same "automate OWA's own web UI" escape hatch already used for the calendar category write-path (`_set_event_categories`, see PROJECT_STATUS.md #208/#209) when no API exists. Only available in `bearer` auth mode (modern Outlook) — raises `BearerModeRequiredError` on classic canary-cookie OWA, the same exception `find_people`/`post_substrate` use for their own modern-backend-only surfaces. Because there's no DOM/API reference to build against, every selector, the generation-complete polling heuristic, and the item-grounding deep-link URL shape are best-guess placeholders pending a live discovery spike (`--show-browser` inspection of a real Copilot pane) — treat results as provisional until PROJECT_STATUS.md's Copilot rows (#901-905) move past `Pending`.
+**Copilot tools (`tools/copilot.py`)**: unlike every other tool module, Copilot has no documented API to call — there is no EWS action, no REST endpoint, nothing to POST. These tools instead drive Copilot's own chat pane inside the modern Outlook web client directly via Playwright UI automation (`BrowserSession`'s Copilot section: `_async_copilot_locate_pane`/`_open_pane`/`_submit`/`_wait_and_read`/`_async_copilot_ask`/`copilot_ask()`), the same "automate OWA's own web UI" escape hatch already used for the calendar category write-path (`_set_event_categories`, see PROJECT_STATUS.md #208/#209) when no API exists. Only available in `bearer` auth mode (modern Outlook) — raises `BearerModeRequiredError` on classic canary-cookie OWA, the same exception `find_people`/`post_substrate` use for their own modern-backend-only surfaces. Because there's no DOM/API reference to build against, every selector, the generation-complete polling heuristic, and the item-grounding deep-link URL shape are best-guess placeholders pending a live discovery spike (`--show-browser` inspection of a real Copilot pane). The 2026-09-11 smoke run ([tests/smoke/tests/test_copilot.py](tests/smoke/tests/test_copilot.py)) confirmed that they are in fact wrong: all five tools fail on a live bearer-mode tenant, in two distinct ways (see PROJECT_STATUS.md's Copilot rows #901-905, now `KO`, and the §1 update). Don't expect any of these tools to work until the spike has corrected `browser_session.py` and that test passes.
 
 **Capability discovery (`tools/discovery.py`, module 11)**: the only tool module that doesn't
 touch a mailbox. It exists because every gap closed in this codebase so far was found the same

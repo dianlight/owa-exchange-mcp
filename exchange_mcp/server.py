@@ -264,11 +264,28 @@ import exchange_mcp.tools.copilot        # noqa: E402, F401
 import exchange_mcp.tools.tasks          # noqa: E402, F401
 import exchange_mcp.tools.discovery      # noqa: E402, F401
 
-# Tools with a known, unfixable server-side bug (see PROJECT_STATUS.md KO rows)
-# rather than merely untested or degraded-but-working ones (e.g. get_meeting_contacts,
-# which returns an empty result plus a `warnings` field instead of failing). Excluded
-# from the MCP tool listing under --stable so a client can't call them and hit a fault.
-KNOWN_BUGGY_TOOLS: dict[str, str] = {}
+# Tools that reproducibly fail at call time (see PROJECT_STATUS.md KO rows) rather
+# than merely untested or degraded-but-working ones (e.g. get_meeting_contacts, which
+# returns an empty result plus a `warnings` field instead of failing). Excluded from
+# the MCP tool listing under --stable so a client can't call them and hit a fault.
+#
+# The Copilot module is here for a client-side reason rather than the usual
+# server-side one: its chat-pane selectors are unverified placeholders and the
+# 2026-09-11 smoke run (tests/smoke/tests/test_copilot.py) confirmed all five tools
+# fail 100% of the time on a live bearer-mode tenant. Delete these five entries once
+# the discovery spike corrects browser_session.py and that test passes.
+_COPILOT_PENDING_SPIKE = (
+    "Copilot chat-pane selectors are unverified placeholders; every call currently "
+    "fails - see PROJECT_STATUS.md #901-905"
+)
+
+KNOWN_BUGGY_TOOLS: dict[str, str] = {
+    "ask_copilot": _COPILOT_PENDING_SPIKE,
+    "summarize_email_thread": _COPILOT_PENDING_SPIKE,
+    "draft_reply_with_copilot": _COPILOT_PENDING_SPIKE,
+    "coach_draft": _COPILOT_PENDING_SPIKE,
+    "meeting_prep": _COPILOT_PENDING_SPIKE,
+}
 
 
 def _apply_stable_mode() -> None:
