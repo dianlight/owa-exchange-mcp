@@ -691,6 +691,17 @@ def get_calendar_events(
     Returns:
         JSON array of event objects with subject, start, end, location,
         categories, attendees, etc.
+
+        `categories` is always populated in list mode - it comes from the
+        single CalendarView request, NOT from a per-item detail call, so
+        `include_body=False` returns it too. A full calendar tagging pass is
+        therefore one read plus one write per event and needs no Outlook COM
+        fallback: `get_calendar_events(..., include_body=False)` to list with
+        tags, then `assign_event_categories` / `remove_event_categories`
+        (both verified end-to-end against this tenant - see PROJECT_STATUS.md
+        rows 201/208/209). `find_events_by_category` is the narrower read
+        when only one tag matters.
+
         By default a recurring series appears once, as its master item
         (calendar_item_type "RecurringMaster"), not expanded into one entry per
         occurrence -- this OWA deployment's CalendarView does not perform
@@ -801,6 +812,16 @@ def get_calendar_events(
             details = None
             if (include_body or (expand_recurrences and event["is_recurring"])) and item_id:
                 details = _get_event_details(client, item_id)
+
+            # `categories` above comes from the list request itself, so a
+            # bulk category pass needs no per-item call (verified live on this
+            # tenant: include_body=False still returns them). When a detail
+            # call happened anyway, treat it as a backstop for an empty list
+            # value rather than ignoring what we already fetched - the write
+            # path and the read path must never disagree about an event's
+            # tags, and that is the only way this can go wrong silently.
+            if details and not event["categories"] and details.get("categories"):
+                event["categories"] = details["categories"]
 
             if include_body and details:
                 event["organizer"] = details["organizer"]
@@ -1723,10 +1744,23 @@ def assign_event_categories(
 ) -> str:
     """Add one or more categories to calendar events, keeping any categories already present.
 
+    This is the OWA-native counterpart to `assign_email_categories`, and it
+    works on this tenant end-to-end - no Outlook COM fallback is needed for
+    calendar tagging. Pair it with
+    `get_calendar_events(..., include_body=False)`, which already returns each
+    event's `categories` in bulk.
+
     Categories are just strings on the item (standard EWS behavior) - any
     name works, including ones not present in the mailbox's master category
     list (see the category_* tools). Assigning a brand-new name does not
     register it in the master list or give it a color.
+
+    Two properties that matter for unattended runs: attendees are never
+    notified (`ShouldSendUpdateToAttendees: False` in `_set_event_categories`,
+    so tagging someone else's meeting invite sends nothing), and tagging a
+    RecurringMaster's item_id tags the whole series - synthesized occurrences
+    from `expand_recurrences` carry no item_id precisely so they can't be
+    passed here by accident.
 
     Args:
         item_ids: List of Exchange ItemIds to tag (from get_calendar_events).

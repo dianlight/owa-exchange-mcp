@@ -1030,6 +1030,83 @@ occurrences. Removing it from history would need a rewrite of the public reposit
 history, which is deliberately out of scope here. The one live-file occurrence outside
 `tests/` — the `find_person(...)` example in the 2026-09-09 substrate-search update above —
 was redacted in the same change, so the *current* tree carries the address nowhere.
+**Update 2026-09-14 — `move_email` couldn't reach a custom folder by name *or* by ID.**
+Reported from the unattended `inbox-maintenance-hourly` task, which was falling back to
+Outlook COM (an exclusive global lock, slower, riskier unattended) because of it:
+`move_email(target_folder="Quarantena")` returned `{"error": "Folder 'Quarantena' not
+found."}`, and retrying with the exact folder ID `get_folders` had just returned failed
+identically, echoing the ID back. **Two unrelated causes, both confirmed live:**
+
+1. **"Quarantena" is a child of the Inbox, not a top-level folder.** It looked top-level in
+   the report because `get_folders(parent_folder_id="msgfolderroot", recursive=true)` flattens
+   the tree — the shallow listing of `msgfolderroot` has 41 folders and no Quarantena, while
+   `get_folders(parent_folder_id="inbox", recursive=true)` returns it with exactly the
+   reported `total_count: 300`. `get_folder_id()`'s bare-name lookup searched direct children
+   of `msgfolderroot` only, so the 2026-09-09 fix above (which added `/`-path walking) never
+   covered the bare-name case that a caller reaches for first.
+2. **An opaque folder ID was read as a path.** `get_folder_id()` tested `"/" in folder_name`
+   *before* anything else, and EWS folder IDs are base64 blobs that routinely contain "/"
+   (this tenant's do) — so a valid ID was split into segments matching nothing. The one form
+   a caller cannot get wrong was the one guaranteed to fail.
+
+Fixed by replacing that logic with `OWAClient.resolve_folder()`, which returns a
+`FolderResolution` (`folder_id`, `matched_by`, `candidates`, `error_code`) and tries, in
+order: **opaque ID** (first, before any "/" handling) → **`/`-path** → **distinguished name**
+→ **top-level display name** → **direct child of the Inbox** → **unique match anywhere in the
+mailbox** (one Deep `FindFolder`) → **bare distinguished ID** (last, so a technical ID can't
+shadow a real folder — same ordering rationale as `tasks.py`'s `_resolve_task_folder()`).
+`get_folder_id()` is now a thin wrapper over it, so `get_emails`/`search_emails`/
+`find_emails_by_category`/the calendar and tasks reads all inherit the fix.
+
+Two deliberate refusals to guess. A name matching **several** folders returns
+`error_code: "folder_name_ambiguous"` plus every `candidates` entry (name, id, item count)
+rather than picking the server's first hit — this mailbox has many similar short names
+("Prj-*"), and silently filing mail into the wrong one is worse than failing. And
+`move_email` now reports `resolved_folder_id`/`matched_by` on success, so an unattended run
+logs which folder it actually wrote to instead of only which name it asked for.
+
+Also fixed alongside, same root area: **folder listing was capped at one 200-entry
+`FindFolder` request** with no paging, in both the resolver and `get_folders`. This backend
+doesn't honour `MaxEntriesReturned` reliably (see §4), so that silently truncated large
+mailboxes — a folder past the first page was unresolvable and absent from `get_folders`.
+`iter_child_folders()` now pages with the server's own `Offset`, stops only on an **empty**
+page, advances by what actually arrived rather than by the page size requested, and treats a
+page that adds no new folder IDs as the end (a backend ignoring `Offset` degrades to a
+truncated answer instead of an endless loop).
+
+New unit suite [test_folder_resolution.py](tests/unit/test_folder_resolution.py) — 18 tests,
+a fake transport serving an in-memory folder tree, so the *request count* is assertable:
+an ID resolves with **zero** requests, an ID containing "/" is not read as a path, a name on
+page 2 of ~250 top-level folders resolves, short pages don't end the walk, an
+`Offset`-ignoring backend terminates, and an ambiguous name yields both candidate IDs.
+New live regression [test_move_email_custom_folder.py](tests/smoke/tests/test_move_email_custom_folder.py)
+covers each accepted form against disposable tagged folders, asserting `matched_by` (not just
+success — a name silently resolving via the deep fallback would otherwise pass while the tier
+under test is broken): **10/10 `OK`, exit 0**, verified 2026-09-14 on a server launched from
+this worktree (port 8767, `EXCHANGE_BROWSER_PROFILE_DIR=.browser-profile-dev`, identity probe
+`60 tools` and the new docstrings present; production on 8766 untouched).
+
+**Update 2026-09-14 — calendar category tagging needs no COM fallback (no code fix).** The
+same report asked whether `assign_event_categories` works end-to-end on this tenant and
+whether `get_calendar_events` can return `categories` in bulk. Both already do, verified live
+rather than from the table: `get_calendar_events(..., include_body=False)` returned real tags
+(`["Prj-GECO", "Prj-UnipolService"]`, ...) straight from the single `CalendarView` request —
+**no per-item detail call is involved**, so `categories` is a bulk-mode field, unlike email's
+`flag_status`. A full round-trip on a real event then confirmed the write path:
+`assign_event_categories` → tag visible in list mode alongside the pre-existing ones →
+`remove_event_categories` → `find_events_by_category` finds nothing → the event's original two
+tags intact. So a complete tagging pass is `get_calendar_events` + `assign_event_categories`,
+purely over OWA.
+
+What did come out of it is documentation, since the tools were correct and the reason to trust
+them wasn't written anywhere a caller would look: `get_calendar_events` now states that
+`categories` is populated in list mode and names the COM-free tagging loop, and
+`assign_event_categories` records that attendees are never notified
+(`ShouldSendUpdateToAttendees: False`) and that tagging a `RecurringMaster`'s `item_id` tags
+the whole series. One robustness change: when a detail call happened anyway (`include_body=True`
+or `expand_recurrences=True`), an empty list-mode `categories` now falls back to the detail
+value — the read and write paths must never disagree about an event's tags, and that was the
+only way this could have gone wrong silently.
 
 ## 2. How to read the table
 
@@ -1085,7 +1162,7 @@ was redacted in the same change, so the *current* tree carries the address nowhe
 | 104 | `reply_email` | Reply (or reply-all) to an email | `tests/smoke/tests/test_email_lifecycle.py`, `tests/unit/test_recipient_list.py` | OK (2026-09-07) | Stable |
 | 105 | `forward_email` | Forward an email to new recipients | `tests/smoke/tests/test_email_lifecycle.py`, `tests/unit/test_recipient_list.py` | OK (2026-09-07) | Stable |
 | 106 | `mark_email_read` | Mark one or more emails read/unread | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
-| 107 | `move_email` | Move one or more emails to another folder; `target_folder` accepts a bare name (direct child of `msgfolderroot`/a distinguished folder) or a `/`-delimited path for folders nested deeper (e.g. `Projects/ClientFolder`, `Inbox/Triage`) | `tests/smoke/tests/test_email_lifecycle.py`, `tests/smoke/tests/test_move_email_nested_folder.py`, `tests/unit/test_folder_id_dict.py` | OK (2026-09-09, re-verified) — see "Update 2026-09-09 — move_email couldn't resolve nested destination folders" below | Stable |
+| 107 | `move_email` | Move one or more emails to another folder. `target_folder` accepts a **folder id** from `get_folders` (authoritative — no lookup, so nesting and duplicate names can't defeat it), a `/`-delimited **path** (`Inbox/Quarantena`, `Progetti/ClientFolder`), or a **display name** resolved distinguished → top-level → Inbox child → unique match anywhere. Several matches returns `error_code: "folder_name_ambiguous"` + `candidates` rather than guessing; success reports `resolved_folder_id`/`matched_by` | `tests/smoke/tests/test_email_lifecycle.py`, `tests/smoke/tests/test_move_email_nested_folder.py`, `tests/smoke/tests/test_move_email_custom_folder.py`, `tests/unit/test_folder_resolution.py`, `tests/unit/test_folder_id_dict.py` | OK (2026-09-14, re-verified) — custom top-level folder by name and by id, Inbox child by bare name, and an ambiguous name refused with both candidate ids, all live; see "Update 2026-09-14 — move_email couldn't reach a custom folder by name or by ID" above | Stable |
 | 108 | `delete_email` | Delete (soft or permanent) one or more emails | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
 | 109 | `download_attachments` | Download all file attachments from an email to disk | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
 | 110 | `get_email_links` | Extract hyperlinks from an email's HTML body | `tests/smoke/tests/test_get_email_detail.py` | OK (2026-09-07) | Stable |
@@ -1099,15 +1176,15 @@ was redacted in the same change, so the *current* tree carries the address nowhe
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 201 | `get_calendar_events` | List events in a date range, including each event's `categories`. By default a recurring series appears once, as its master item; `expand_recurrences=True` additionally synthesizes one entry per occurrence client-side (marked `is_synthesized_occurrence`, empty `item_id` — see §4) | `tests/smoke/tests/test_get_calendar_events.py`, `tests/smoke/tests/test_calendar_event_detail.py`, `tests/smoke/tests/test_recurrence_expansion.py`, `tests/unit/test_recurrence_expansion.py` | OK (2026-09-10) — `categories` verified round-tripping a real tag; `expand_recurrences` verified live (46 synthesized occurrences over 14 days, all in-window, all `item_id`-less, no duplicated masters, correct time-of-day) and all 127 recurring series in this mailbox expand, relative patterns included; re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change | Stable |
+| 201 | `get_calendar_events` | List events in a date range, including each event's `categories` — populated in list mode (`include_body=False`) from the list request itself, not a per-item detail call. By default a recurring series appears once, as its master item; `expand_recurrences=True` additionally synthesizes one entry per occurrence client-side (marked `is_synthesized_occurrence`, empty `item_id` — see §4) | `tests/smoke/tests/test_get_calendar_events.py`, `tests/smoke/tests/test_calendar_event_detail.py`, `tests/smoke/tests/test_recurrence_expansion.py`, `tests/unit/test_recurrence_expansion.py` | OK (2026-09-14, re-verified) — `categories` confirmed populated in **list mode** (`include_body=False`, straight from the single `CalendarView` request, no per-item detail call), so a bulk tagging pass needs no COM fallback; previously verified round-tripping a real tag; `expand_recurrences` verified live (46 synthesized occurrences over 14 days, all in-window, all `item_id`-less, no duplicated masters, correct time-of-day) and all 127 recurring series in this mailbox expand, relative patterns included; also re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change | Stable |
 | 202 | `create_meeting` | Create a meeting with attendees, location, reminder, sensitivity | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
 | 203 | `update_meeting` | Update a meeting (implemented as cancel + recreate — OWA JSON API has no reliable `UpdateItem` for calendar items) | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
 | 204 | `cancel_meeting` | Cancel a meeting and notify attendees (soft-delete only — moves to Deleted Items, no permanent-delete option) | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
 | 205 | `respond_to_meeting` | Accept / decline / tentatively accept a meeting invite | None — self-invite produces no meeting-request email to respond to (confirmed 2026-09-08; Exchange doesn't ask an organizer to accept their own invite), so this can't be covered by a self-contained automated test | OK (2026-09-08, manual) — verified against a real incoming Google Calendar invite from a different account (Tentative response sent successfully) | Stable |
 | 206 | `download_event_attachments` | Download file attachments from a calendar event | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
 | 207 | `get_event_links` | Extract hyperlinks from an event's HTML description | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
-| 208 | `assign_event_categories` | Add one or more categories to events, keeping any already present | `tests/smoke/tests/test_calendar_category_tagging.py` | OK (2026-09-08) — fixed by switching `_set_event_categories` to the bespoke `UpdateCalendarEvent` action captured from OWA's own web client; see "Update 2026-09-08 (continued) — fixed the category write-path" below. | Stable |
-| 209 | `remove_event_categories` | Remove one or more categories from events, keeping any others present | `tests/smoke/tests/test_calendar_category_tagging.py` | OK (2026-09-08) — same fix as `assign_event_categories` above (shares `_set_event_categories`). | Stable |
+| 208 | `assign_event_categories` | Add one or more categories to events, keeping any already present | `tests/smoke/tests/test_calendar_category_tagging.py` | OK (2026-09-14, re-verified) — full round-trip on a real event against this tenant (tag → visible in `get_calendar_events` list mode → removed → original tags intact), so calendar tagging needs no Outlook COM fallback; attendees are never notified. Originally fixed by switching `_set_event_categories` to the bespoke `UpdateCalendarEvent` action captured from OWA's own web client; see "Update 2026-09-08 (continued) — fixed the category write-path" below. | Stable |
+| 209 | `remove_event_categories` | Remove one or more categories from events, keeping any others present | `tests/smoke/tests/test_calendar_category_tagging.py` | OK (2026-09-14, re-verified) — untag verified live in the same round-trip as `assign_event_categories`; same fix as `assign_event_categories` above (shares `_set_event_categories`). | Stable |
 | 210 | `find_events_by_category` | Find events tagged with a given category within a date range | `tests/smoke/tests/test_calendar_category_tagging.py` | OK (2026-09-08, re-verified) — pure `FindItem`+`CalendarView` read, unaffected by the write-path bug above; its date-range filtering had the same silent no-op bug as `get_calendar_events` (see below) and is now fixed by the same client-side filter. | Stable |
 | 211 | `get_calendar_event` | Get full details for a single calendar event by ItemId (subject, start/end, location, body, organizer, attendees, categories, change_key, recurrence) | `tests/smoke/tests/test_calendar_event_detail.py` | OK (2026-09-10) — verified against a disposable tagged event: subject/start/end/categories/change_key all returned, assigned category round-tripped, bogus item_id rejected cleanly | Stable |
 
@@ -1131,7 +1208,7 @@ was redacted in the same change, so the *current* tree carries the address nowhe
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
 | 501 | `check_session` | Lightweight auth check (`FindFolder` on inbox) — reports mailbox name + unread count when the backend's response includes them (omitted on the modern OAuth/Bearer backend, which never returns `ParentFolder`). An unauthenticated profile now comes back as `authorization_required` + `reason` + `remediation` rather than a generic error string, pointing the caller at the `login` tool (see the 2026-09-10 update below) | `tests/smoke/tests/test_check_session.py`, `tests/smoke/tests/test_mcp_session_lifecycle.py` (transport-session reuse / dead-session-id 404, issue #18) | OK (2026-09-07) for the authenticated/generic-error paths, re-confirmed live 2026-09-14 while triaging issue #18 (whose "Session not found" is the MCP transport's 404, not this tool — see the 2026-09-14 update above); the new `authorization_required` branch is `Pending`; re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change | Stable |
-| 502 | `get_folders` | List mail folders (shallow or recursive) with counts | `tests/smoke/tests/test_get_folders.py`, `tests/unit/test_folder_id_dict.py` | OK (2026-09-08); re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change | Stable |
+| 502 | `get_folders` | List mail folders (shallow or recursive) with counts. Pages through the whole listing rather than returning one 200-entry request, which silently truncated large mailboxes | `tests/smoke/tests/test_get_folders.py`, `tests/unit/test_folder_resolution.py`, `tests/unit/test_folder_id_dict.py` | OK (2026-09-14, re-verified) — paging added; see "Update 2026-09-14 — move_email couldn't reach a custom folder" above; also re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change | Stable |
 | 503 | `create_folder` | Create a new folder — mail folder by default, or any Exchange folder class via `folder_class` (`IPF.Task` under `parent_folder_id="tasks"` makes a **Microsoft To Do list**). Echoes the class the server actually stored, because an unrecognised prefix is silently downgraded to `IPF.Note` rather than rejected | `tests/smoke/tests/test_folder_lifecycle.py` (default `IPF.Note` path), `tests/smoke/tests/test_task_folder_targeting.py` (`IPF.Task` To Do list), `tests/unit/test_folder_id_dict.py` | OK (2026-09-14) — `folder_class` added and re-verified live on both paths: the mail-folder default is unchanged (folder-lifecycle test still green) and `folder_class="IPF.Task"` under the `tasks` root produces a real To Do list that the task tools can address by name, by path and by raw ID. Both `IPF.Task` and `IPF.Task.Todo` are accepted and stored verbatim — the latter only because folder classes are *prefixes* (EWS treats `IPF.Task.*` as a task folder), so the plain `IPF.Task` is what the docstring recommends | Stable |
 | 504 | `rename_folder` | Rename an existing folder | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) | Stable |
 | 505 | `empty_folder` | Empty all items from a folder | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) | Stable |

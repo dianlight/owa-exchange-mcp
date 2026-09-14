@@ -8,6 +8,7 @@ requests.Session replaying exported cookies can't replicate.
 
 import re
 from datetime import datetime
+from typing import Iterator, NamedTuple
 from urllib.parse import quote
 
 from exchange_mcp.auth_errors import (  # noqa: F401
@@ -54,6 +55,63 @@ _DISTINGUISHED_IDS = set(DISTINGUISHED_FOLDERS.values()) | {
     "msgfolderroot", "root", "contacts", "tasks", "notes",
     "journal", "searchfolders", "publicfoldersroot", "favorites",
 }
+
+# How many folders one FindFolder page asks for. This backend does not
+# reliably honour MaxEntriesReturned, so it's a hint rather than a contract --
+# which is exactly why _iter_child_folders() pages instead of trusting one
+# response to be complete.
+_FOLDER_PAGE_SIZE = 200
+
+# Hard stop on the paging loop. A mailbox with more folders than this
+# (50 * 200 = 10 000) is beyond what folder-name resolution can usefully
+# serve anyway, and the cap means a backend that mishandles Offset in some
+# new way degrades into a truncated answer instead of an endless loop.
+_FOLDER_PAGE_LIMIT = 50
+
+# A base64-ish blob this long is an EWS folder ID, not a DisplayName. The
+# charset check is what makes it safe: a display name that long would
+# essentially always contain a space or punctuation outside this set.
+_FOLDER_ID_SHAPE = re.compile(r"^[A-Za-z0-9+/=_-]+$")
+
+
+def looks_like_folder_id(value: str) -> bool:
+    """True if `value` is an opaque EWS folder ID rather than a folder name.
+
+    Every folder resolver has to ask this *first*, before any name or path
+    handling: EWS folder IDs are long base64 blobs that routinely contain
+    "/" (verified live on this tenant), so a resolver that splits on "/" to
+    walk a path would otherwise chop a perfectly good ID into nonsense
+    segments and report the folder as missing. That's precisely the bug
+    behind "passing the exact ID from get_folders also fails" -- see
+    OWAClient.resolve_folder().
+    """
+    value = (value or "").strip()
+    return len(value) > 80 and bool(_FOLDER_ID_SHAPE.match(value))
+
+
+class FolderResolution(NamedTuple):
+    """Outcome of resolving a caller-supplied folder name / path / ID.
+
+    `folder_id` is None exactly when resolution failed, and then
+    `error_code` says which of the two failure modes it was, because they
+    need different fixes from the caller:
+
+    - "folder_not_found"      -- nothing anywhere in the mailbox matched.
+    - "folder_name_ambiguous" -- several folders share that display name, so
+      picking one would be a coin flip. `candidates` then carries every
+      match (name + id + item count) so the caller can re-issue the call
+      with an id, which always resolves unambiguously.
+
+    `matched_by` records *how* it resolved ("folder_id", "path",
+    "distinguished", "name", "inbox_child", "deep_name"). Tools surface it
+    on success so an unattended run's logs show which folder was actually
+    hit rather than just that something was.
+    """
+
+    folder_id: str | None
+    matched_by: str
+    candidates: tuple[dict, ...] = ()
+    error_code: str | None = None
 
 
 class OWAClient:
@@ -275,53 +333,142 @@ class OWAClient:
         return {"__type": "FolderId:#Exchange", "Id": folder_id}
 
     def get_folder_id(self, folder_name: str) -> str | None:
-        """Resolve a folder name to its Exchange folder ID.
+        """Resolve a folder name / path / ID to an Exchange folder ID, or None.
 
-        Supports distinguished folder names (inbox, sentitems, drafts, etc.)
-        in both English and Russian, plus custom folder names looked up
-        via FindFolder on msgfolderroot, plus "/"-delimited paths
-        (e.g. "Projects/ClientFolder" or "Inbox/Triage") for folders
-        nested more than one level deep - see _resolve_folder_path().
-
-        Distinguished folders are normally returned as-is (e.g. "inbox")
-        without a GetFolder round-trip: on the classic canary-cookie OWA
-        backend, GetFolder returns a flattened {"Folders": [...]} shape with
-        no FolderId at all, but DistinguishedFolderId is already a valid
-        identifier everywhere a resolved FolderId would be used - see
-        folder_id_dict(). On the modern OAuth/Bearer backend ("new Outlook"),
-        GetFolder works correctly and FindConversation there requires a real
-        opaque FolderId rather than the bare distinguished name, so we
-        resolve it properly in that mode instead of short-circuiting.
+        Thin wrapper over resolve_folder() for the many call sites that only
+        need "did it resolve?". Anything reporting an error to a user should
+        call resolve_folder() directly instead and surface its `error_code` /
+        `candidates`: "not found" and "that name means three different
+        folders" are not the same problem, and this signature can't tell
+        them apart.
         """
-        if "/" in folder_name:
-            return self._resolve_folder_path(folder_name)
+        return self.resolve_folder(folder_name).folder_id
 
-        folder_lower = folder_name.lower()
+    def resolve_folder(self, folder_spec: str) -> FolderResolution:
+        """Resolve a folder spec - an ID, a "/"-path, or a display name.
 
-        distinguished_id = DISTINGUISHED_FOLDERS.get(folder_lower)
+        Accepted forms, tried in this order (the order is the contract; each
+        tier exists because the one above it provably isn't enough):
+
+        1. **An opaque folder ID** as returned by `get_folders`, passed
+           through untouched. This is the authoritative form and is
+           guaranteed to work: it needs no lookup, so it can't be defeated
+           by duplicate names, nesting, or paging. It has to be checked
+           first because those IDs contain "/" and would otherwise be
+           mistaken for a path (see looks_like_folder_id()).
+        2. **A "/"-delimited path** ("Progetti/ClientFolder",
+           "Inbox/Quarantena"), walked one Shallow FindFolder per segment -
+           see _resolve_folder_path(). Use this to disambiguate a name that
+           several folders share.
+        3. **A distinguished folder name** ("inbox", "sent", "deleted", ...
+           English or Russian). Normally returned as-is, without a GetFolder
+           round-trip: on the classic canary-cookie backend GetFolder
+           returns a flattened {"Folders": [...]} shape with no FolderId at
+           all, while DistinguishedFolderId is already valid everywhere a
+           resolved FolderId would be used (see folder_id_dict()). On the
+           modern OAuth/Bearer backend GetFolder does work, and
+           FindConversation there insists on a real opaque FolderId, so it
+           is resolved properly in that mode.
+        4. **A display name of a direct child of msgfolderroot** (a
+           top-level folder).
+        5. **A display name of a direct child of the Inbox.** Cheap, and it
+           covers the single most common place a user puts folders -- the
+           reported failure ("Quarantena", live-confirmed to be an Inbox
+           child, not the top-level folder it appeared to be in a recursive
+           listing) landed exactly here.
+        6. **A display name found anywhere in the mailbox** (one Deep
+           FindFolder), accepted only when *exactly one* folder matches.
+           Several matches is reported as "folder_name_ambiguous" with every
+           candidate rather than silently resolved to whichever the server
+           listed first - this mailbox has many similar short names
+           ("Prj-*"), and quietly filing mail into the wrong one of them is
+           worse than failing.
+        7. **A bare distinguished ID** ("msgfolderroot", "deleteditems", ...)
+           - last, so that a technical ID can never shadow a real folder
+           that happens to share the name. Same reasoning as
+           tools/tasks.py's _resolve_task_folder().
+        """
+        spec = (folder_spec or "").strip()
+        if not spec:
+            return FolderResolution(None, "none", (), "folder_not_found")
+
+        # 1. Opaque folder ID -- before the "/" split, or IDs containing "/"
+        #    get chopped into path segments and never match anything.
+        if looks_like_folder_id(spec):
+            return FolderResolution(spec, "folder_id")
+
+        # 2. "/"-delimited path
+        if "/" in spec:
+            folder_id = self._resolve_folder_path(spec)
+            if folder_id:
+                return FolderResolution(folder_id, "path")
+            return FolderResolution(None, "path", (), "folder_not_found")
+
+        # 3. Distinguished folder name
+        distinguished_id = DISTINGUISHED_FOLDERS.get(spec.lower())
         if distinguished_id:
-            if self.browser.auth_mode != "bearer":
-                return distinguished_id
-            return self._resolve_distinguished_folder_id(distinguished_id) or distinguished_id
+            return FolderResolution(
+                self._distinguished_folder_ref_id(distinguished_id), "distinguished"
+            )
 
         root_ref = {"__type": "DistinguishedFolderId:#Exchange", "Id": "msgfolderroot"}
-        return self._find_child_folder_id(root_ref, folder_name)
+
+        # 4. Top-level folder by display name
+        folder_id = self._find_child_folder_id(root_ref, spec)
+        if folder_id:
+            return FolderResolution(folder_id, "name")
+
+        # 5. Inbox child by display name
+        inbox_ref = {"__type": "DistinguishedFolderId:#Exchange", "Id": "inbox"}
+        folder_id = self._find_child_folder_id(inbox_ref, spec)
+        if folder_id:
+            return FolderResolution(folder_id, "inbox_child")
+
+        # 6. Anywhere in the mailbox, unique match only
+        matches = self._find_child_folders_by_name(root_ref, spec, traversal="Deep")
+        if len(matches) == 1:
+            return FolderResolution(matches[0]["id"], "deep_name")
+        if len(matches) > 1:
+            return FolderResolution(None, "deep_name", tuple(matches), "folder_name_ambiguous")
+
+        # 7. Bare distinguished ID, only once every name lookup has missed.
+        if spec.lower() in _DISTINGUISHED_IDS:
+            return FolderResolution(
+                self._distinguished_folder_ref_id(spec.lower()), "distinguished"
+            )
+
+        return FolderResolution(None, "name", (), "folder_not_found")
+
+    def _distinguished_folder_ref_id(self, distinguished_id: str) -> str:
+        """Return the identifier to use for a distinguished folder in this auth mode.
+
+        See resolve_folder() step 3 for why the two backends differ.
+        """
+        if self.browser.auth_mode != "bearer":
+            return distinguished_id
+        return self._resolve_distinguished_folder_id(distinguished_id) or distinguished_id
 
     def _resolve_folder_path(self, folder_path: str) -> str | None:
         """Resolve a "/"-delimited folder path by walking one Shallow
         FindFolder per segment.
 
-        get_folder_id()'s plain-name lookup only searches direct children
-        of msgfolderroot (Shallow traversal), so a folder nested under
-        another custom folder (e.g. "ClientFolder" under "Projects") or
-        under a distinguished folder (e.g. "Triage" under "Inbox") is
-        invisible to it - confirmed live: neither the bare name nor a
-        literal "Projects/ClientFolder" string (which can never equal a
-        single-segment DisplayName) matched. Walking the path segment by
-        segment, resolving each as a child of the previous, handles any
-        depth and disambiguates same-named folders living at different
-        levels (this mailbox has both a top-level "Client - Folder" and a
-        nested "ClientFolder" under "Projects").
+        Originally added because plain-name lookup searched direct children
+        of msgfolderroot only, so a folder nested under another custom
+        folder (e.g. "ClientFolder" under "Projects") or under a
+        distinguished folder (e.g. "Triage" under "Inbox") was invisible to
+        it - confirmed live: neither the bare name nor a literal
+        "Projects/ClientFolder" string (which can never equal a
+        single-segment DisplayName) matched.
+
+        resolve_folder() now also falls back to an Inbox-child lookup and a
+        unique Deep match, so a path is no longer the *only* way to reach a
+        nested folder. It stays the way to reach an unambiguous *specific*
+        one: walking segment by segment disambiguates same-named folders at
+        different levels (this mailbox has both a top-level "Client -
+        Folder" and a nested "ClientFolder" under "Projects"), which is
+        exactly what a bare name cannot do - and what a
+        "folder_name_ambiguous" result asks the caller to supply, alongside
+        passing an id.
         """
         segments = [s for s in folder_path.split("/") if s]
         if not segments:
@@ -344,8 +491,14 @@ class OWAClient:
 
         return folder_id if segments else parent_ref.get("Id")
 
-    def _find_child_folder_id(self, parent_ref: dict, child_name: str) -> str | None:
-        """Shallow FindFolder for a single child folder by DisplayName under parent_ref."""
+    def find_folder_page(
+        self, parent_ref: dict, *, traversal: str = "Shallow", offset: int = 0
+    ) -> list[dict]:
+        """One page of raw FindFolder results (the API's own Folder dicts).
+
+        Public because the tools that *list* folders need the same paging as
+        the ones that resolve a name - see iter_child_folders().
+        """
         payload = {
             "__type": "FindFolderJsonRequest:#Exchange",
             "Header": {
@@ -359,25 +512,90 @@ class OWAClient:
                     "BaseShape": "Default",
                 },
                 "ParentFolderIds": [parent_ref],
-                "Traversal": "Shallow",
+                "Traversal": traversal,
                 "Paging": {
                     "__type": "IndexedPageView:#Exchange",
                     "BasePoint": "Beginning",
-                    "Offset": 0,
-                    "MaxEntriesReturned": 200,
+                    "Offset": offset,
+                    "MaxEntriesReturned": _FOLDER_PAGE_SIZE,
                 },
             },
         }
 
         data = self.request("FindFolder", payload)
-        child_lower = child_name.lower()
+        folders: list[dict] = []
         for msg in self.extract_items(data):
             if "RootFolder" in msg and "Folders" in msg["RootFolder"]:
-                for f in msg["RootFolder"]["Folders"]:
-                    if f.get("DisplayName", "").lower() == child_lower:
-                        return f.get("FolderId", {}).get("Id")
+                folders.extend(msg["RootFolder"]["Folders"])
+        return folders
 
+    def iter_child_folders(
+        self, parent_ref: dict, *, traversal: str = "Shallow"
+    ) -> Iterator[dict]:
+        """Yield every child folder under parent_ref, paging with the server's Offset.
+
+        Three rules here, each of them load-bearing on this backend:
+
+        - **Only an empty page ends the walk.** MaxEntriesReturned is not
+          honoured reliably, so a short page proves nothing (the same rule
+          email.py's conversation paging follows). One wasted request at the
+          end beats silently truncating the folder list - which is what the
+          single 200-entry request this replaces did: a mailbox with more
+          folders than one page simply couldn't resolve the ones past it.
+        - **The next Offset advances by what actually arrived**, not by
+          _FOLDER_PAGE_SIZE, so a short page doesn't skip folders.
+        - **A page that adds no new folder IDs also ends the walk.** If a
+          backend ignores Offset it would otherwise hand back page 1 forever;
+          stopping on "nothing new" turns that into a truncated answer rather
+          than an infinite loop. _FOLDER_PAGE_LIMIT backstops both.
+        """
+        offset = 0
+        seen: set[str] = set()
+        for _ in range(_FOLDER_PAGE_LIMIT):
+            page = self.find_folder_page(parent_ref, traversal=traversal, offset=offset)
+            if not page:
+                return
+            fresh = 0
+            for folder in page:
+                key = folder.get("FolderId", {}).get("Id", "")
+                if key:
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                fresh += 1
+                yield folder
+            if fresh == 0:
+                return
+            offset += len(page)
+
+    def _find_child_folder_id(self, parent_ref: dict, child_name: str) -> str | None:
+        """First child folder under parent_ref whose DisplayName matches, or None."""
+        child_lower = child_name.lower()
+        for folder in self.iter_child_folders(parent_ref):
+            if folder.get("DisplayName", "").lower() == child_lower:
+                return folder.get("FolderId", {}).get("Id")
         return None
+
+    def _find_child_folders_by_name(
+        self, parent_ref: dict, name: str, *, traversal: str = "Shallow"
+    ) -> list[dict]:
+        """Every folder under parent_ref matching `name`, as candidate dicts.
+
+        Returns the same {name, id, total_count} shape tools report back to
+        the caller, so an ambiguous match can be handed straight to them as
+        a list of ids to choose from.
+        """
+        name_lower = name.lower()
+        matches: list[dict] = []
+        for folder in self.iter_child_folders(parent_ref, traversal=traversal):
+            if folder.get("DisplayName", "").lower() != name_lower:
+                continue
+            matches.append({
+                "name": folder.get("DisplayName", ""),
+                "id": folder.get("FolderId", {}).get("Id", ""),
+                "total_count": folder.get("TotalCount", 0),
+            })
+        return matches
 
     def _resolve_distinguished_folder_id(self, distinguished_id: str) -> str | None:
         """Resolve a distinguished folder name to its real opaque FolderId via GetFolder.

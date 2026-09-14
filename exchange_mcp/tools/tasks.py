@@ -83,7 +83,7 @@ from datetime import datetime
 from mcp.server.mcpserver import Context
 
 from exchange_mcp.server import mcp, AppContext
-from exchange_mcp.owa_client import OWAClient, SessionExpiredError
+from exchange_mcp.owa_client import OWAClient, SessionExpiredError, looks_like_folder_id
 from exchange_mcp.utils import format_date, format_datetime, html_to_text, parse_date
 
 # Names that mean "the mailbox's default task list" (the `tasks`
@@ -151,8 +151,12 @@ def _looks_like_folder_id(value: str) -> bool:
     Checked *before* any name lookup because opaque IDs are long base64
     blobs that routinely contain "/" - which `get_folder_id()` would
     otherwise read as a path separator and try to walk.
+
+    Delegates to owa_client so this test lives in exactly one place: the same
+    confusion, unfixed there, is what made a `move_email` caller unable to
+    use a folder id at all.
     """
-    return len(value) > 80 and "=" in value
+    return looks_like_folder_id(value)
 
 
 def _resolve_task_folder(client: OWAClient, task_folder: str) -> str | None:
