@@ -266,7 +266,7 @@ folder tools' job, not these. To Do's "Flagged Email" list isn't made of tasks â
 | Tool | Description |
 |---|---|
 | `get_folders` | List mail folders with unread counts |
-| `create_folder` | Create a new mail folder |
+| `create_folder` | Create a folder â€” a mail folder by default, or a Microsoft To Do list with `folder_class="IPF.Task"` under `parent_folder_id="tasks"` |
 | `rename_folder` | Rename an existing folder |
 | `empty_folder` | Empty all items from a folder |
 | `delete_folder` | Delete a mail folder |

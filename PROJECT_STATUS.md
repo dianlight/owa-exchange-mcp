@@ -854,6 +854,43 @@ per-row listing degradation and `get_email`'s typed error — while the read/wri
 (and the mutation it implies) belongs to the new dedicated test. The §4 bullet claiming
 "there is no client-side fix" is corrected there too.
 
+**Update 2026-09-14 — `create_folder` can create a To Do list, and the test it was blocking
+now covers itself.** `create_folder` (#503) hardcoded `FolderClass: "IPF.Note"`, so every
+folder it made was a *mail* folder. A Microsoft To Do list is just a folder with a task class
+under the `tasks` root, which meant the one kind of folder the Task module tells callers to
+create with the `*_folder` tools was the one kind those tools couldn't create. It now takes a
+`folder_class` argument defaulting to `"IPF.Note"`, so existing behaviour is byte-identical and
+`folder_class="IPF.Task"` with `parent_folder_id="tasks"` makes a real list.
+
+Verified live 2026-09-14 (isolated server on `.browser-profile-dev`, port 8767, production
+instance on 8766 untouched). Three findings worth keeping:
+
+- **Both candidate spellings work, and that isn't a coincidence.** `IPF.Task` and
+  `IPF.Task.Todo` are each accepted and stored verbatim, and a task created in either folder
+  is found by `get_tasks` through all three `task_folder` spellings. EWS treats folder classes
+  as **prefixes** — `IPF.Task.*` is a task folder — so `IPF.Task.Todo` works as a suffixed
+  variant, not as a distinct thing the backend recognises. Plain `IPF.Task` is therefore the
+  documented recommendation.
+- **A wrong class fails silently, which is why the response echoes it.** EWS treats any class
+  whose prefix isn't predefined as `IPF.Note` rather than rejecting it, and a class can't be
+  changed after creation. So a typo'd `folder_class` yields a perfectly working *mail* folder
+  and the symptom surfaces much later as "`get_tasks` finds nothing in a folder that plainly
+  exists". `create_folder` now returns `folder_class` read back from the server's own
+  `CreateFolder` response, and `test_task_folder_targeting.py` asserts on it.
+- **The test that was skipping now covers itself.** It creates a disposable `IPF.Task` list
+  when the mailbox has none (this one has none — `get_folders(parent_folder_id="tasks")`
+  returns `[]`) and deletes it afterwards; when a list *does* exist it targets the first one
+  and leaves it alone, cleaning up only the tagged task it put inside. All three non-default
+  `task_folder` spellings (bare name, `tasks/<list>` path, raw opaque folder ID) and the
+  negative "child-list task must not appear in the default list" case are now exercised for
+  real (#1001/#1003), closing the §4 bullet.
+
+One incidental cleanup: `create_folder`'s `name` parameter collides with the smoke harness's
+`call(s, name, **args)` signature, and `test_folder_lifecycle.py` carried a local copy of the
+raw `call_tool` plumbing to work around it. That workaround is now
+`tests/smoke/mcp_client.call_args(s, tool, args)` — one implementation with the retry logic,
+used by both tests rather than duplicated into a second one.
+
 **Update 2026-09-14 — issue #18 (`check_session` fails with "Session not found") is a
 transport-session report, not a `check_session` bug.** The reported text is not this
 codebase's: `"Session not found"` is emitted verbatim by the MCP SDK's
@@ -1033,7 +1070,7 @@ port it reports "could not determine" instead of raising.
 |---|---|---|---|---|---|
 | 501 | `check_session` | Lightweight auth check (`FindFolder` on inbox) — reports mailbox name + unread count when the backend's response includes them (omitted on the modern OAuth/Bearer backend, which never returns `ParentFolder`). An unauthenticated profile now comes back as `authorization_required` + `reason` + `remediation` rather than a generic error string, pointing the caller at the `login` tool (see the 2026-09-10 update below) | `tests/smoke/tests/test_check_session.py`, `tests/smoke/tests/test_mcp_session_lifecycle.py` (transport-session reuse / dead-session-id 404, issue #18) | OK (2026-09-07) for the authenticated/generic-error paths, re-confirmed live 2026-09-14 while triaging issue #18 (whose "Session not found" is the MCP transport's 404, not this tool — see the 2026-09-14 update above); the new `authorization_required` branch is `Pending` | Stable |
 | 502 | `get_folders` | List mail folders (shallow or recursive) with counts | `tests/smoke/tests/test_get_folders.py` | OK (2026-09-08) | Stable |
-| 503 | `create_folder` | Create a new mail folder | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) | Stable |
+| 503 | `create_folder` | Create a new folder — mail folder by default, or any Exchange folder class via `folder_class` (`IPF.Task` under `parent_folder_id="tasks"` makes a **Microsoft To Do list**). Echoes the class the server actually stored, because an unrecognised prefix is silently downgraded to `IPF.Note` rather than rejected | `tests/smoke/tests/test_folder_lifecycle.py` (default `IPF.Note` path), `tests/smoke/tests/test_task_folder_targeting.py` (`IPF.Task` To Do list) | OK (2026-09-14) — `folder_class` added and re-verified live on both paths: the mail-folder default is unchanged (folder-lifecycle test still green) and `folder_class="IPF.Task"` under the `tasks` root produces a real To Do list that the task tools can address by name, by path and by raw ID. Both `IPF.Task` and `IPF.Task.Todo` are accepted and stored verbatim — the latter only because folder classes are *prefixes* (EWS treats `IPF.Task.*` as a task folder), so the plain `IPF.Task` is what the docstring recommends | Stable |
 | 504 | `rename_folder` | Rename an existing folder | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) | Stable |
 | 505 | `empty_folder` | Empty all items from a folder | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) | Stable |
 | 506 | `delete_folder` | Delete a mail folder | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) | Stable |
@@ -1084,16 +1121,17 @@ of that root. These tools therefore use the plain EWS item actions (`FindItem`/`
 exists on both the classic canary-cookie and modern bearer backends and needs no new transport.
 There is deliberately **no task-list (folder) CRUD here**: a To Do list is an ordinary folder, so
 `get_folders(parent_folder_id="tasks")` enumerates them and the `*_folder` tools already
-create/rename/delete them (caveat: `create_folder` hardcodes `FolderClass: "IPF.Note"`, so it
-makes a *mail* folder — creating a genuine To Do list still needs Outlook/To Do itself, see §4).
+create/rename/delete them — including *creating* one since 2026-09-14, via
+`create_folder(name=…, parent_folder_id="tasks", folder_class="IPF.Task")` (#503; it used to
+hardcode `FolderClass: "IPF.Note"` and could only make a *mail* folder).
 To Do's "Flagged Email" list is a view over flagged messages, not `Task` items, so it isn't
 visible to these tools — use `set_email_flag` (#115).
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 1001 | `get_tasks` | List tasks from a To Do list / task folder, due-date ascending with undated last; filters completed client-side (`include_completed`), skips non-`Task` items (a mail folder would otherwise yield subject-only pseudo-tasks — reported as `skipped_non_task_items`), optional per-task body with per-item `body_error` degradation, reports `scanned` so "no matches" is distinguishable from the 500-item scan ceiling | `tests/smoke/tests/test_task_lifecycle.py`, `tests/smoke/tests/test_task_folder_targeting.py` | OK (2026-09-11) — 14 tasks listed from the default list, completed-filter verified both ways; non-task filter verified by pointing it at `deleteditems` (500 scanned, 499 skipped, the 1 real task found). `task_folder` name/path resolution is **not** covered — its test skips itself, see §4 | Stable |
+| 1001 | `get_tasks` | List tasks from a To Do list / task folder, due-date ascending with undated last; filters completed client-side (`include_completed`), skips non-`Task` items (a mail folder would otherwise yield subject-only pseudo-tasks — reported as `skipped_non_task_items`), optional per-task body with per-item `body_error` degradation, reports `scanned` so "no matches" is distinguishable from the 500-item scan ceiling | `tests/smoke/tests/test_task_lifecycle.py`, `tests/smoke/tests/test_task_folder_targeting.py` | OK (2026-09-14) — 14 tasks listed from the default list, completed-filter verified both ways; non-task filter verified by pointing it at `deleteditems` (500 scanned, 499 skipped, the 1 real task found). **`task_folder` resolution is now covered too** (2026-09-14): all three non-default spellings — bare list name, `tasks/<list>` path, raw opaque folder ID — plus the negative "a child-list task must not show up in the default list" case, against a To Do list the test creates for itself now that #503 can make one | Stable |
 | 1002 | `get_task` | Get one task's full detail (status, dates, reminder, importance, categories, owner, body, change_key) | `tests/smoke/tests/test_task_lifecycle.py` | OK (2026-09-11) — subject, UTC-midnight due date, status, body, categories, importance and reminder all verified round-tripping. `PercentComplete` arrives as a *string* (`"100"`) from this backend and is coerced to int | Stable |
-| 1003 | `create_task` | Create a task with due/start dates, note body, status, importance, categories and reminder, in any To Do list | `tests/smoke/tests/test_task_lifecycle.py`, `tests/smoke/tests/test_task_folder_targeting.py` | OK (2026-09-11) — created in the default list with every optional field set; only the default-list path is covered (see #1001) | Stable |
+| 1003 | `create_task` | Create a task with due/start dates, note body, status, importance, categories and reminder, in any To Do list | `tests/smoke/tests/test_task_lifecycle.py`, `tests/smoke/tests/test_task_folder_targeting.py` | OK (2026-09-14) — created in the default list with every optional field set, and (2026-09-14) into a named child To Do list addressed by bare name, which is the `task_folder` path that used to be untestable (see #1001) | Stable |
 | 1004 | `update_task` | Partial update — only the arguments passed are written; `clear_due_date`/`clear_start_date`/`clear_reminder` erase a field (`DeleteItemField`), and `status`+`percent_complete` together is rejected client-side (Exchange resolves the two against each other by whichever it processes last) | `tests/smoke/tests/test_task_lifecycle.py` | OK (2026-09-11) — subject + due date + `Status` + `clear_reminder` written in one request and verified by re-read, i.e. every `_FIELD` spelling exercised there is confirmed accepted (`item:Subject`, `item:ReminderIsSet`, `task:DueDate`, `task:Status`) | Stable |
 | 1005 | `complete_task` | Mark tasks complete / reopen them, writing `Status` only; returns per-item results including the *new* ItemId Exchange mints when a recurring occurrence is completed | `tests/smoke/tests/test_task_lifecycle.py` | OK (2026-09-11) — `Status=Completed` verified on the item (`is_complete`, `complete_date` = today, `percent_complete` 100 set by the server from `Status` alone) and through both listing filters. The recurring-task ID-split path is untested (no recurring task to hand) | Stable |
 | 1006 | `delete_task` | Delete tasks (soft to Deleted Items, or `permanent` HardDelete), `AffectedTaskOccurrences: AllOccurrences` | `tests/smoke/tests/test_task_lifecycle.py`, `tests/smoke/tests/test_task_folder_targeting.py` | OK (2026-09-11) — verified by absence from the folder listing. A deleted task's **ItemId stays resolvable**, so `get_task` keeps returning the item afterwards with a bumped ChangeKey; the first test run failed on exactly that wrong post-condition before the tool was cleared | Stable |
@@ -1445,16 +1483,11 @@ hold a request open for.
   config) and threading it through every `TimeZoneContext`/`CalendarView` — a codebase-wide
   change touching calendar, availability and tasks, hence logged here rather than patched
   locally. Documented in `tasks.py`'s module docstring and both tool docstrings meanwhile.
-- **`task_folder` name/path resolution is written but untested, because no To Do list exists
-  to test it against.** `create_folder` (#503) hardcodes `FolderClass: "IPF.Note"`, so it
-  makes a *mail* folder; a genuine To Do list needs `IPF.Task`(`.Todo`) under the `tasks` root.
-  So `test_task_folder_targeting.py` — which covers the bare-name, `tasks/<list>`-path and
-  raw-folder-ID spellings plus the negative "child-list task must not appear in the default
-  list" case — **skips itself** on this mailbox (verified 2026-09-11: it does skip, cleanly,
-  and reports why). Only the default-list path and the distinguished-ID fallback (probed
-  against `deleteditems`) are actually exercised today. Closing this is a one-argument change
-  to `create_folder` (expose `folder_class`), after which the test covers itself; until then,
-  creating a list by hand in To Do and re-running the test is the cheap workaround.
+- ~~**`task_folder` name/path resolution is written but untested, because no To Do list exists
+  to test it against.**~~ **Closed 2026-09-14** — `create_folder` (#503) now takes
+  `folder_class`, so `test_task_folder_targeting.py` creates its own disposable `IPF.Task`
+  list under the `tasks` root and covers all three spellings plus the negative case instead of
+  skipping. See the 2026-09-14 update above.
 - **The recurring-task paths in the Task module are untested.** `complete_task`/`update_task`
   document and propagate the ID split Exchange performs when an occurrence of a recurring task
   is completed (a new one-off item is minted and the original ID rolls forward to the next
