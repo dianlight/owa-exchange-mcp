@@ -56,7 +56,7 @@ LOG_FILE = STATE_DIR / "server.log"
 START_TIMEOUT_SECONDS = 90
 
 # CLAUDE.md: "Verify with a list_tools count of 60 before trusting a run." A count
-# of 0 is the classic `python -m exchange_mcp.server` double-FastMCP mistake; any
+# of 0 is the classic `python -m exchange_mcp.server` double-MCPServer mistake; any
 # other mismatch means the server is serving a tree with a different tool set than
 # this one -- which is precisely what a reused foreign server can silently be.
 EXPECTED_TOOL_COUNT = 60
@@ -146,14 +146,18 @@ def _probe_server_identity() -> tuple[str, str, int] | None:
     # Imported here, not at module scope: this is diagnostic-only, and the module
     # is also imported by `stop`/`status` invocations that need no MCP client.
     from mcp import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
+    from mcp.client.streamable_http import streamable_http_client
 
     async def _probe() -> tuple[str, str, int]:
-        async with streamablehttp_client(SERVER_URL) as (read, write, _):
+        # mcp 2.x: renamed transport function, two streams instead of three, and
+        # snake_case result fields (`serverInfo` -> `server_info`). The version is
+        # now exchange_mcp's own (server.py passes it explicitly); under 1.x this
+        # line reported the *SDK's* version for every server.
+        async with streamable_http_client(SERVER_URL) as (read, write):
             async with ClientSession(read, write) as s:
                 init = await s.initialize()
                 listing = await s.list_tools()
-                return (init.serverInfo.name, init.serverInfo.version,
+                return (init.server_info.name, init.server_info.version,
                         len(listing.tools))
 
     def _runner() -> tuple[str, str, int]:
@@ -278,7 +282,7 @@ def _start_detached() -> None:
         # tree instead of the one being edited, and the run looked normal.
         #
         # NOT `python -m exchange_mcp.server` either: that runs server.py as
-        # __main__, creating one FastMCP instance, and then server.py's tool
+        # __main__, creating one MCPServer instance, and then server.py's tool
         # imports (see its "Import tool modules" block) do
         # `from exchange_mcp.server import mcp`, loading the module a *second*
         # time under its real name and creating a second instance. Every

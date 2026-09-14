@@ -12,15 +12,22 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 dependencies = [
-    # Pinned below 2.0 on purpose: mcp 2.x renamed FastMCP to MCPServer and
-    # changed the surrounding API, so every module here (server.py plus all 11
-    # tool modules, each importing `mcp.server.fastmcp`) fails to import
-    # outright against it -- ModuleNotFoundError at `from mcp.server.fastmcp
-    # import Context`, not a deprecation warning. A dev machine that installed
-    # while 1.x was current never sees this; a fresh `pip install -e .` (a new
-    # contributor, or CI) gets 2.x and nothing works. Lift the pin only together
-    # with the v2 migration.
-    "mcp>=1.0.0,<2",
+    # v2 of the SDK, and the floor is 2.2.0 rather than 2.0.0 for a reason:
+    # `MCPServer` and `streamable_http_client` exist from 2.0.0, but
+    # `run(transport="streamable-http", session_idle_timeout=...)` only landed in
+    # 2.2.0 -- and server.py passes it (to switch off 2.2's new 30-minute session
+    # reaper, see the comment there). On 2.0.x/2.1.x that call is a TypeError at
+    # startup, so a wider floor would buy nothing but a worse error.
+    #
+    # The `<3` cap is the lesson of the 1.x -> 2.x jump, not caution for its own
+    # sake: that major renamed `FastMCP` to `MCPServer`, and every module here
+    # (server.py plus all 11 tool modules) died at *import* time against it --
+    # ModuleNotFoundError, not a deprecation warning. A dev machine that had
+    # installed while 1.x was current kept working and never saw it; a clean
+    # `pip install -e .` (new contributor, or CI) got 2.x and nothing ran at all
+    # (issue #16). With a cap, the next major resolves to a working 2.x instead;
+    # lifting it means doing that migration, exactly as this one was done.
+    "mcp>=2.2.0,<3",
     "playwright",
 ]
 

@@ -8,7 +8,7 @@ import json
 import re
 import shlex
 
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 
 from exchange_mcp.server import mcp, AppContext
 from exchange_mcp.owa_client import OWAClient, SessionExpiredError

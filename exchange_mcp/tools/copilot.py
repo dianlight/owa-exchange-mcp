@@ -36,7 +36,7 @@ Microsoft can restyle at any time, and the smoke test is the only tripwire.
 
 import json
 
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 
 from exchange_mcp.server import mcp, AppContext
 from exchange_mcp.owa_client import (

@@ -26,7 +26,7 @@ Any variable above can also be placed in a gitignored `.env.local` next to `pypr
 ## Structure
 
 - `exchange_mcp/` — MCP server package (60 tools)
-  - `server.py` — FastMCP server with lifespan context; launches the browser on the persistent profile and, if that profile isn't signed in, opens a visible sign-in window (off the handshake path — see "Authentication" below)
+  - `server.py` — `MCPServer` (mcp SDK v2) with lifespan context; launches the browser on the persistent profile and, if that profile isn't signed in, opens a visible sign-in window (off the handshake path — see "Authentication" below)
   - `browser_session.py` — `BrowserSession`: one persistent Chromium context for the process's lifetime, reused by every OWA call
   - `owa_client.py` — OWA API client; delegates transport to `BrowserSession`, keeps the request/response/folder-resolution logic
   - `auth_errors.py` — Pure diagnosis of a *timed-out* interactive sign-in: reason codes, the AADSTS/page-text/URL hint tables, per-reason remediation text, and `AuthenticationRequiredError`. Imports nothing else from the package (no Playwright) so it stays unit-testable — see "Authentication" below.
@@ -87,21 +87,29 @@ EXCHANGE_SMOKE_SELF_EMAIL=you@example.com \
 **Never start the server with `python -m exchange_mcp.server`** — it registers *zero* tools and
 every call fails `Unknown tool`. `-m` loads `server.py` under the name `__main__`, so when each
 tool module does `from exchange_mcp.server import mcp` Python imports the module a *second* time
-and builds a *second* `FastMCP` instance: the `@mcp.tool()` decorators land on one, `main()`
+and builds a *second* `MCPServer` instance: the `@mcp.tool()` decorators land on one, `main()`
 serves the other. Use the `exchange-mcp-server` console script. The one case where that isn't
 enough is running a **worktree's** code: `pip install -e .` resolves to its original path
 regardless of cwd, so the console script runs the main checkout no matter where you invoke it.
 For that, `cd` into the worktree and use
 `python -c "from exchange_mcp.server import main; main()" --transport http --port <port>` —
 `python -c` puts cwd first on `sys.path`, and importing `exchange_mcp.server` by its real name
-keeps the single `FastMCP` instance. Verify with a `list_tools` count of 60 before trusting a run.
+keeps the single `MCPServer` instance. Verify with a `list_tools` count of 60 before trusting a run.
 
 There is no credential setup step and no login CLI: the first start opens a browser
 window and you sign in there. See "Authentication" below.
 
-Dependencies: `mcp`, `playwright` (run `playwright install chromium` once). `mcp`'s `streamable-http` transport (`uvicorn`/`starlette`) is already a transitive dependency — no extra install needed for `--transport http`.
+Dependencies: `mcp` (v2 — see below), `playwright` (run `playwright install chromium` once). `mcp`'s `streamable-http` transport (`uvicorn`/`starlette`) is already a transitive dependency — no extra install needed for `--transport http`. An environment that predates the v2 migration is on `mcp` 1.x, which this code cannot import: re-run `pip install -e .` (1.x no longer satisfies the requirement, so pip upgrades it) and restart any long-running server.
 
-**`mcp` is pinned `<2`** in `pyproject.toml`, and the pin is load-bearing rather than cautious: mcp 2.x renamed `FastMCP` to `MCPServer`, so `server.py` and all 11 tool modules (`from mcp.server.fastmcp import Context`) raise `ModuleNotFoundError` at *import* time against it — the package doesn't start at all, no partial degradation. A machine that installed while 1.x was current keeps working and never sees this, which is why it went unnoticed until a clean `pip install -e .` ran in CI (issue #16). Lifting the pin means doing the v2 migration, not just widening the range.
+**`mcp` requires `>=2.2.0,<3`** in `pyproject.toml`: this package is on the **v2 SDK** (migrated 2026-09-14; it was pinned `<2` for a few days after a clean `pip install -e .` in CI resolved 2.x and the package stopped importing at all, issue #16). What that means when reading or writing code here:
+
+- The server object is `MCPServer` (`from mcp.server.mcpserver import MCPServer`), and tool modules import `Context` from the same place. `mcp.server.fastmcp` is gone — in 2.2.0 it exists only to raise a `ModuleNotFoundError` that names the migration guide.
+- **Transport settings are `run()` arguments, not constructor settings.** `mcp.settings.host = ...` now *raises* (`Settings` keeps only constructor-owned fields), so host/port go to `mcp.run(transport="streamable-http", host=..., port=...)`. Passing a loopback `host` there is also what arms the SDK's Host/Origin validation.
+- **The lifespan is entered once per server process, on both transports.** Under 1.x the streamable-http session manager re-entered it per *client session*; 2.x enters it at ASGI startup and shares the state. `_ensure_started()` is idempotent, so nothing here depended on the old behaviour, but comments that explained it did (see `AppContext`).
+- **Wire model fields are snake_case**: `isError` → `is_error`, `structuredContent` → `structured_content`, `serverInfo` → `server_info`, `inputSchema` → `input_schema`. Client-side, `streamablehttp_client` is `streamable_http_client` and yields two streams, not three — the `get_session_id` callback is gone (`tests/smoke/tests/test_mcp_session_lifecycle.py` shows the supported way to recover the id).
+- **`serverInfo.version` is reported verbatim and defaults to `""`**, where 1.x silently substituted the SDK's own version, so `server.py` passes `version=__version__` explicitly. That is the number the smoke harness's identity probe prints.
+- **2.2.0 reaps idle streamable-http sessions after 30 minutes** (1.x never did), and a reaped id answers exactly the 404 `"Session not found"` that issue #18 was filed about — so `server.py` passes `session_idle_timeout=None`. Relatedly, a *cleanly terminated* id now gives that same text instead of `"Not Found: Session has been terminated"`, because 2.x discards a session however it ended; the wording no longer tells the two apart.
+- v2 does not depend on `pydantic-settings`, and `Settings` is a plain `BaseModel`, so the `IncompleteFieldDefinitionWarning` filter 1.x needed at the top of `server.py` is gone. Don't reintroduce it: the import itself would fail on a clean install.
 
 ## Architecture
 
@@ -141,7 +149,7 @@ Deliberate design points, each of which has a wrong-looking-but-tempting alterna
 
 **Recovery**: if the browser process/context crashes, `BrowserSession` relaunches on the same profile directory and retries the call once. If the OWA session expires, `OWAClient` retries once after a silent re-auth attempt — see "Authentication" above for what happens when that can't succeed.
 
-**Transport (`stdio` vs `http`)**: `main()` picks the transport via `--transport`/`EXCHANGE_MCP_TRANSPORT`. The lifespan that creates the `BrowserSession` runs exactly once per process either way — under `stdio` that process is spawned and killed per client session, so the warm browser/login is rebuilt every time; under `--transport http` the process is long-lived and the same `BrowserSession`/login is shared across every client connection that hits it, but it must be started manually — there is no autostart mechanism. Never bind `--host`/`EXCHANGE_MCP_HOST` off `127.0.0.1` — the MCP endpoint has no auth of its own, and FastMCP's `transport_security` (Host header validation) must stay enabled to block DNS-rebinding from other pages in the user's browser.
+**Transport (`stdio` vs `http`)**: `main()` picks the transport via `--transport`/`EXCHANGE_MCP_TRANSPORT`. The lifespan that creates the `BrowserSession` runs exactly once per process either way (on v2 that is the SDK's own behaviour; 1.x re-entered it per streamable-http client session, which `_ensure_started()`'s process-wide state already absorbed) — under `stdio` that process is spawned and killed per client session, so the warm browser/login is rebuilt every time; under `--transport http` the process is long-lived and the same `BrowserSession`/login is shared across every client connection that hits it, but it must be started manually — there is no autostart mechanism. Never bind `--host`/`EXCHANGE_MCP_HOST` off `127.0.0.1` — the MCP endpoint has no auth of its own, and the SDK's `transport_security` (Host header validation) must stay enabled to block DNS-rebinding from other pages in the user's browser. Under v2 that protection is armed by the `host` passed to `run()` — the SDK auto-enables it for `127.0.0.1`/`localhost`/`::1` — so moving the bind address off loopback silently disarms it as well as exposing the port.
 
 **Task tools (`tools/tasks.py`)**: `Task` is Exchange's own name for the item class
 (`Task:#Exchange`, `IPM.Task`) in the `tasks` distinguished folder, and the modern web UI
