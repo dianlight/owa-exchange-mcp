@@ -909,7 +909,7 @@ per-row listing degradation and `get_email`'s typed error — while the read/wri
 | 110 | `get_email_links` | Extract hyperlinks from an email's HTML body | `tests/smoke/tests/test_get_email_detail.py` | OK (2026-09-07) | Stable |
 | 111 | `assign_email_categories` | Add one or more categories to emails (any mail-class item, meeting invites/responses included), keeping any already present; reports `updated_count`/`failed_count`/`failed`/`failed_codes`, each failure carrying a stable `error_code` | `tests/smoke/tests/test_email_category_tagging.py`, `tests/smoke/tests/test_meeting_request_categories.py`, `tests/unit/test_item_errors.py` | OK (2026-09-11) — re-verified after the meeting-invite fix: tags a real `MeetingRequestMessage` and reads it back server-side; ordinary mail unaffected. See "Update 2026-09-11 (continued) — category writes on meeting invites" below | Stable |
 | 112 | `remove_email_categories` | Remove one or more categories from emails (any mail-class item, meeting invites/responses included), keeping any others present; reports `updated_count`/`failed_count`/`failed`/`failed_codes`, each failure carrying a stable `error_code` | `tests/smoke/tests/test_email_category_tagging.py`, `tests/smoke/tests/test_meeting_request_categories.py`, `tests/unit/test_item_errors.py` | OK (2026-09-11) — same fix as `assign_email_categories` above (shares `_get_item_categories`); untag verified on both a meeting invite and ordinary mail | Stable |
-| 113 | `find_emails_by_category` | Find email conversations tagged with a given category. The match is client-side (FindConversation has no category restriction), so the folder is enumerated with a real server-side `Offset` until `limit` matches are found or it is exhausted — not just the newest 200 conversations, which is what it used to scan. Takes an `offset` counting *matching* conversations, and every response carries a `pagination` block (`has_more`/`next_offset`/`reached_end_of_folder`, plus `error_code` when the scan stopped early) so a short or empty result is never ambiguous | `tests/smoke/tests/test_email_category_tagging.py`, `tests/unit/test_conversation_paging.py`, `tests/smoke/tests/test_find_emails_by_category_pagination.py` (written, never run) | Pending — deep-scan rewrite landed 2026-09-14 (see §4); unit-tested only. The earlier OK (2026-09-08) covered a *freshly tagged* message, i.e. only the newest-200 window that always worked. Not re-verified live: whether `FindConversation` still reports `Categories` on rows fetched at a deep `Offset` is the one assumption no fake can settle | Stable |
+| 113 | `find_emails_by_category` | Find email conversations tagged with a given category. The match is client-side (FindConversation has no category restriction), so the folder is enumerated with a real server-side `Offset` until `limit` matches are found or it is exhausted — not just the newest 200 conversations, which is what it used to scan. Takes an `offset` counting *matching* conversations, and every response carries a `pagination` block (`has_more`/`next_offset`/`reached_end_of_folder`, plus `error_code` when the scan stopped early) so a short or empty result is never ambiguous | `tests/smoke/tests/test_email_category_tagging.py`, `tests/unit/test_conversation_paging.py`, `tests/smoke/tests/test_find_emails_by_category_pagination.py` (written, never run) | OK (2026-09-14) — deep-scan rewrite verified live on an isolated profile (own port; the production instance untouched) via `tests/smoke/tests/test_find_emails_by_category_pagination.py`: a category tagged on the Inbox conversation at **offset 250** was found, which settles the one assumption no fake could — `FindConversation` **does** report `Categories` on rows fetched at a deep server-side `Offset`. An absent category correctly reported `pagination_scan_limit_reached` ("stopped looking", not end of folder) and `offset=1` correctly skipped the single match; the borrowed message was untagged and independently re-checked as clean. Note this Inbox exceeds the 2000-conversation `_CONV_MAX_SCAN`, so any query not filling its `limit` early scans the full cap (~10 requests) and reports `pagination_scan_limit_reached` — honest, but it means `reached_end_of_folder` is effectively unreachable here and `search_emails`' server-side `category:<name>` is the right tool for a broad sweep. The earlier OK (2026-09-08) covered a *freshly tagged* message, i.e. only the newest-200 window that always worked. | Stable |
 | 114 | `search_emails` | Full-text search for emails, scoped to one folder or the whole mailbox. Tries EWS `FindItem`/`QueryString` (AQS syntax: `subject:`, `from:`, `body:`, `received:`, etc.) first, then transparently falls back to a client-side scan (reduced keyword subset: bare terms, `subject:`, `from:`, `category:`, `isread:`, `hasattachment:`) — this tenant's content index never returns AQS results, and `FindItem`'s `Traversal:"Deep"` is unsupported outright, so `search_all_folders` enumerates folders via `FindFolder`/`Deep` (like `get_folders`) and searches each one `Shallow` | `tests/smoke/tests/test_search_emails.py` | OK (2026-09-09) — single-folder AQS-empty + fallback, and `search_all_folders=True` across folders, both verified live; fixed `folder_id` always returning empty (`FindItem`'s `AdditionalProperties` needs the namespaced `item:ParentFolderId` FieldURI, not bare `ParentFolderId`) — re-verified non-empty `folder_id` live via the fallback path | Stable |
 | 115 | `set_email_flag` | Set the follow-up flag (`NotFlagged`/`Flagged`/`Complete`) on one or more emails, via `UpdateItem`/`SetItemField` on `item:Flag` | `tests/smoke/tests/test_email_flag.py` | OK (2026-09-10) — all three states written and read back successfully. The wire encoding is fussy: only `FieldURI: "item:Flag"` paired with `__type: "FlagType:#Exchange"` is accepted; `message:Flag` (either `__type`) returns "Invalid argument used to call method UpdateItem", and PidLidFlagStatus 0x8530 as an ExtendedFieldURI is rejected in every spelling tried. Invalid `flag_status` rejected client-side. | Stable |
 
@@ -1222,18 +1222,38 @@ hold a request open for.
   `search_emails`' server-side `category:<name>` is named in both the docstring and the
   scan-cap remediation text. The alternative (leave it out, tell callers to raise `limit`)
   just moves the ceiling from 50 matches to 50 matches.
-  **Not verified live**, and deliberately left that way: the 8766 production instance was off
-  limits for this change and an isolated run needs its own port, its own profile directory and
-  an interactive sign-in. `tests/unit/test_conversation_paging.py` grew 9 cases (deep tag
-  found, absent category reads as a full sweep, scan cap reported, short page doesn't end the
-  folder, offset counts matches, ignored-`Offset` named rather than spun on, diagnostics stay
-  nested). What they cannot establish is the one live fact the filter rests on: that
-  `FindConversation` still populates `Categories` on rows fetched at a deep `Offset`. If it
-  doesn't, this tool returns zero matches with `reached_end_of_folder: true` — correct-looking
-  and wrong. `tests/smoke/tests/test_find_emails_by_category_pagination.py` is written to
-  settle exactly that and has **never been run**; read its docstring first, because it is the
-  only smoke module here that tags a pre-existing message (it has to: a category can only be
-  deep in the folder if the message is) and it removes the tag again in a `finally`.
+  `tests/unit/test_conversation_paging.py` grew 9 cases (deep tag found, absent category reads
+  as a full sweep, scan cap reported, short page doesn't end the folder, offset counts matches,
+  ignored-`Offset` named rather than spun on, diagnostics stay nested). What they could not
+  establish is the one live fact the filter rests on: that `FindConversation` still populates
+  `Categories` on rows fetched at a deep `Offset`. Had it not, this tool would return zero
+  matches with `reached_end_of_folder: true` — correct-looking and wrong.
+  **Verified live 2026-09-14** on an isolated profile and port (the 8766 production instance
+  untouched) with `tests/smoke/tests/test_find_emails_by_category_pagination.py`, which settles
+  it: a category tagged on the Inbox conversation at **offset 250** was found, so
+  `FindConversation` **does** report `Categories` at a deep server-side `Offset`. An absent
+  category correctly reported `pagination_scan_limit_reached` rather than an unexplained empty
+  result, `offset=1` correctly skipped the single match, and the borrowed message was untagged
+  and independently re-checked as clean. Read that module's docstring before re-running it: it
+  is the only smoke module here that tags a *pre-existing* message (it has to — a category can
+  only be deep in the folder if the message is) and it removes the tag in a `finally`.
+  Two things the live run taught that the design did not predict:
+  - **This Inbox is bigger than `_CONV_MAX_SCAN`.** Every query that doesn't fill its `limit`
+    early scans the full 2000-conversation cap (~10 requests) and reports
+    `pagination_scan_limit_reached`, so `reached_end_of_folder` is effectively unreachable on
+    this mailbox. That is honest rather than wrong — and it is strictly better than the old
+    behaviour, which quietly missed everything past 200 and called it success — but it means
+    the remediation text pointing at `search_emails`' server-side `category:<name>` is the
+    common path, not the exceptional one. Raising the cap trades latency for reach; leaving it
+    keeps the tool bounded. Neither is obviously right, so it stays bounded and says so.
+  - **Launching the server as `python -m exchange_mcp.server` registers zero tools.** That
+    loads `server.py` under the name `__main__`, so when each tool module does
+    `from exchange_mcp.server import mcp` Python imports the module a *second* time and builds
+    a *second* `FastMCP` instance: the tools register on one, `main()` serves the other, and
+    every call fails `Unknown tool`. Use the console script, or
+    `python -c "from exchange_mcp.server import main; main()"` when you need a checkout other
+    than the editable install (an editable install resolves to its original path regardless of
+    cwd, so a worktree's code is *not* what runs unless you force it this way).
 - **Automated tests are almost entirely live-mailbox smoke tests.** `tests/smoke/`
   exercises each MCP tool end-to-end against a real mailbox, one module per tool, so it
   cannot run in CI and cannot cover pure logic in isolation. `tests/unit/` is the

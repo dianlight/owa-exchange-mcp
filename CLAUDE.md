@@ -70,6 +70,18 @@ python -m tests.smoke.tests.test_copilot
 EXCHANGE_SMOKE_PORT=8767 python -m tests.smoke.tests.test_copilot
 ```
 
+**Never start the server with `python -m exchange_mcp.server`** — it registers *zero* tools and
+every call fails `Unknown tool`. `-m` loads `server.py` under the name `__main__`, so when each
+tool module does `from exchange_mcp.server import mcp` Python imports the module a *second* time
+and builds a *second* `FastMCP` instance: the `@mcp.tool()` decorators land on one, `main()`
+serves the other. Use the `exchange-mcp-server` console script. The one case where that isn't
+enough is running a **worktree's** code: `pip install -e .` resolves to its original path
+regardless of cwd, so the console script runs the main checkout no matter where you invoke it.
+For that, `cd` into the worktree and use
+`python -c "from exchange_mcp.server import main; main()" --transport http --port <port>` —
+`python -c` puts cwd first on `sys.path`, and importing `exchange_mcp.server` by its real name
+keeps the single `FastMCP` instance. Verify with a `list_tools` count of 60 before trusting a run.
+
 There is no credential setup step and no login CLI: the first start opens a browser
 window and you sign in there. See "Authentication" below.
 
