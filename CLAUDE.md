@@ -77,6 +77,11 @@ python -m tests.unit.test_folder_resolution
 # directory (Chromium holds an exclusive lock on it).
 python -m tests.smoke.tests.test_copilot
 EXCHANGE_SMOKE_PORT=8767 python -m tests.smoke.tests.test_copilot
+
+# A suite that mails the mailbox itself takes its address from the
+# environment instead of a constant (this repo is public):
+EXCHANGE_SMOKE_SELF_EMAIL=you@example.com \
+    python -m tests.smoke.tests.test_move_email_custom_folder
 ```
 
 **Never start the server with `python -m exchange_mcp.server`** — it registers *zero* tools and

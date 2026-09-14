@@ -35,18 +35,25 @@ D. two folders sharing a name, by that name -> refused with
 Cleanup hard-deletes the disposable top-level folders (which takes their
 subfolders and contents with them) plus the Inbox child.
 
+Needs the signed-in mailbox's own address, since each case moves a message it
+sends to itself. That comes from `EXCHANGE_SMOKE_SELF_EMAIL` rather than a
+constant in the file: this repo is public, and a mailbox address is the one
+thing in a smoke test that has no business being committed to it.
+
 Run standalone:
-    python -m tests.smoke.tests.test_move_email_custom_folder
+    EXCHANGE_SMOKE_SELF_EMAIL=you@example.com \
+        python -m tests.smoke.tests.test_move_email_custom_folder
 """
 
 import asyncio
+import os
 import sys
 import time
 
 from tests.smoke.mcp_client import call, call_args, run, session
 from tests.smoke.results import is_error_payload, record
 
-SELF_EMAIL = "lucio.tarantino@unipol.it"
+SELF_EMAIL = os.environ.get("EXCHANGE_SMOKE_SELF_EMAIL", "")
 TAG = f"custom-folder-smoke-{int(time.time())}"
 
 TOP_LEVEL_NAME = f"[{TAG}]-toplevel"
@@ -169,6 +176,14 @@ async def _ambiguity_case(s, dup_child_ids: list[str]) -> bool:
 
 
 async def main() -> bool:
+    if not SELF_EMAIL:
+        # Fail loudly rather than sending to "" and reporting a mysterious
+        # tool error four calls later.
+        record("test_move_email_custom_folder", {}, "EXCEPTION",
+               "set EXCHANGE_SMOKE_SELF_EMAIL to the signed-in mailbox's address "
+               "(this test moves messages it sends to itself)")
+        return False
+
     async with session() as s:
         top_level_id = await _create_folder(s, TOP_LEVEL_NAME, "msgfolderroot")
         inbox_child_id = await _create_folder(s, INBOX_CHILD_NAME, "inbox")
