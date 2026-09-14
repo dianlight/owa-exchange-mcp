@@ -1,8 +1,9 @@
 """Exchange MCP Server.
 
 Exposes OWA email, calendar, directory, and availability tools via MCP.
-Uses FastMCP with a lifespan context manager to share a single OWAClient
-(backed by one persistent browser session) across all tool invocations.
+Uses the mcp SDK's MCPServer (v2; `FastMCP` in v1) with a lifespan context
+manager to share a single OWAClient (backed by one persistent browser session)
+across all tool invocations.
 """
 
 import argparse
@@ -11,21 +12,12 @@ import atexit
 import os
 import sys
 import threading
-import warnings
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from pydantic_settings.exceptions import IncompleteFieldDefinitionWarning
-
-# mcp's FastMCP.Settings has a `lifespan` field typed with a self-referential
-# generic (Callable[[FastMCP[LifespanResultT]], ...]); pydantic-settings can't
-# resolve it and warns on every FastMCP(...) construction. That field is never
-# read from an env var, so the warning doesn't apply here — silence it.
-warnings.filterwarnings("ignore", category=IncompleteFieldDefinitionWarning)
-
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from exchange_mcp import auth_errors
 from exchange_mcp import __version__
@@ -38,12 +30,19 @@ class AppContext:
     """Shared application state available to all tools via lifespan context.
 
     `pending_login` is backed by the module-level `_shared_pending_login`
-    (see _ensure_started) rather than a per-instance field: AppContext
-    itself is created fresh per client session (one per app_lifespan() call),
-    but the login tool's two-call 2FA flow needs the *second* call — which
-    may arrive on a different MCP client session than the first — to see the
-    background task the first call started. A per-instance field would only
-    ever be visible to calls on that same session.
+    (see _ensure_started) rather than a per-instance field, because the login
+    tool's two-call 2FA flow needs the *second* call — which may arrive on a
+    different MCP client session than the first — to see the background task
+    the first call started.
+
+    Under mcp 1.x that was the only thing making the flow work at all: the
+    streamable-http session manager entered `app_lifespan()` once *per client
+    session*, so a per-instance field was invisible to every other session.
+    mcp 2.x enters the lifespan once per `StreamableHTTPSessionManager.run()`
+    and shares the result across all sessions, so a single AppContext now
+    serves them all and a plain field would suffice. It stays module-level
+    anyway: that is one fewer behaviour depending on an SDK detail that has
+    already changed once, and it keeps stdio and http identical.
     """
     client: OWAClient
 
@@ -190,14 +189,18 @@ def _ensure_started() -> OWAClient:
     Called from main() at process start *and* from app_lifespan, because those are
     two genuinely different entry points:
 
-    - Under --transport http, the mcp SDK's StreamableHTTPSessionManager runs a
-      fresh low-level Server.run() - and therefore a fresh app_lifespan() call -
-      per client session. Nothing runs at all before the first client connects, so
-      relying on the lifespan alone meant no browser, no profile directory and no
-      sign-in window until something connected. main() calling this fixes that.
-    - Under stdio, main() covers it too, but app_lifespan still calls it so that
-      anything importing `mcp` and serving it directly (a test harness, an ASGI
-      embed) gets the same setup instead of an uninitialized client.
+    - main() runs it before any transport comes up. That is where a missing
+      EXCHANGE_OWA_URL becomes a clean exit(2) instead of an exception raised
+      inside a transport's lifespan, and it is the only path under --transport
+      http that predates mcp 2.x: the 1.x session manager entered
+      app_lifespan() per *client session*, so nothing at all happened - no
+      browser, no profile directory, no sign-in window - until something
+      connected. mcp 2.x enters the lifespan once, at ASGI startup, so that
+      particular gap is gone; starting from main() is still what keeps the
+      config check ahead of the port opening.
+    - app_lifespan calls it too so that anything importing `mcp` and serving it
+      directly (a test harness, an ASGI embed) gets the same setup instead of an
+      uninitialized client.
 
     Guarded by a threading.Lock, not an asyncio.Lock: this now runs from main()'s
     bare thread, from a transport's event loop, or from either, and an
@@ -234,19 +237,25 @@ def _stop_shared_browser() -> None:
 
 
 @asynccontextmanager
-async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
+async def app_lifespan(server: MCPServer) -> AsyncIterator[AppContext]:
     """Yield the process-wide shared OWAClient (see _ensure_started).
 
     Normally a no-op beyond the lookup, because main() has already started
     everything before the transport came up. Deliberately does not stop the
-    browser when an individual client session ends - only process exit
-    (_stop_shared_browser, above) does that.
+    browser on the way out - only process exit (_stop_shared_browser, above)
+    does that. Under mcp 2.x this runs once per server process on both
+    transports (1.x re-ran it per streamable-http client session), so the
+    yielded AppContext is shared by every session.
     """
     yield AppContext(client=_ensure_started())
 
 
-# Create the MCP server instance
-mcp = FastMCP("exchange", lifespan=app_lifespan)
+# Create the MCP server instance. `version` is passed explicitly because mcp 2.x
+# reports `serverInfo.version` exactly as given and defaults it to the empty
+# string - 1.x quietly substituted the *SDK's* own version, which was never the
+# right answer anyway. This is the number the smoke suite's identity probe and
+# any client's server list display.
+mcp = MCPServer("exchange", version=__version__, lifespan=app_lifespan)
 
 # ------------------------------------------------------------------
 # Import tool modules so their @mcp.tool() decorators register tools.
@@ -353,10 +362,27 @@ def main():
     # Returning normally here still runs _stop_shared_browser via atexit.
     try:
         if args.transport == "http":
-            mcp.settings.host = args.host
-            mcp.settings.port = args.port
             _log(f"Transport:   streamable-http on http://{args.host}:{args.port}/mcp")
-            mcp.run(transport="streamable-http")
+            # host/port are run() arguments in mcp 2.x, not constructor settings:
+            # `mcp.settings.host = ...` raises ValueError there (Settings keeps only
+            # the constructor-owned fields). Passing host here is also what arms
+            # DNS-rebinding protection - the SDK auto-enables Host/Origin
+            # validation when it is a loopback address, which is why --host must
+            # stay on 127.0.0.1 (the MCP endpoint has no auth of its own).
+            #
+            # session_idle_timeout=None keeps mcp 1.x's behaviour: 2.x defaults to
+            # reaping any session with no request in flight for 30 minutes, and a
+            # reaped session id answers 404 "Session not found" - the *exact*
+            # symptom reported as issue #18, which cost a full investigation to
+            # attribute. This server is deliberately long-lived, loopback-only and
+            # single-user, so the runaway-session leak the timeout guards against
+            # isn't reachable here, while a client idling half an hour very much is.
+            mcp.run(
+                transport="streamable-http",
+                host=args.host,
+                port=args.port,
+                session_idle_timeout=None,
+            )
         else:
             _log("Transport:   stdio")
             mcp.run()

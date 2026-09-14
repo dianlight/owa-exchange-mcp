@@ -15,7 +15,7 @@ import json
 import sys
 
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 URL = "http://127.0.0.1:8765/mcp"
 
@@ -34,7 +34,7 @@ async def call(session, name, args):
         for c in res.content:
             if hasattr(c, "text"):
                 text += c.text
-        if res.isError:
+        if res.is_error:
             record(name, args, "ERROR", text[:200])
             return None
         try:
@@ -52,7 +52,7 @@ async def call(session, name, args):
 
 
 async def main():
-    async with streamablehttp_client(URL) as (read, write, _):
+    async with streamable_http_client(URL) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
 

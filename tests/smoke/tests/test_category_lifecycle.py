@@ -17,11 +17,10 @@ Run standalone:
     python -m tests.smoke.tests.test_category_lifecycle
 """
 
-import json
 import sys
 import time
 
-from tests.smoke.mcp_client import call, run, session
+from tests.smoke.mcp_client import call, call_args, run, session
 from tests.smoke.results import is_error_payload, record
 
 TAG = f"cat-smoke-{int(time.time())}"
@@ -29,23 +28,11 @@ CATEGORY_NAME = f"[{TAG}]"
 RENAMED_NAME = f"[{TAG}]-renamed"
 
 
-async def _call_direct(s, tool: str, args: dict):
-    """Like call(), but for tools whose own parameter is named `name`."""
-    result = await s.call_tool(tool, args)
-    text = "".join(getattr(b, "text", "") for b in result.content)
-    if result.isError:
-        return {"_transport_error": True, "raw": text}
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return {"_non_json": True, "raw": text}
-
-
 async def main() -> bool:
     async with session() as s:
         # 1. create_category
         create_args = {"name": CATEGORY_NAME, "color": 5}
-        create_info = await _call_direct(s, "create_category", create_args)
+        create_info = await call_args(s, "create_category", create_args)
         err = is_error_payload(create_info)
         if err or not isinstance(create_info, dict) or not create_info.get("success"):
             record("create_category", create_args, "EXCEPTION" if "_exception" in str(create_info) else "TOOL_ERROR",
@@ -82,7 +69,7 @@ async def main() -> bool:
 
         # 4. delete_category (final cleanup)
         delete_args = {"name": RENAMED_NAME}
-        delete_info = await _call_direct(s, "delete_category", delete_args)
+        delete_info = await call_args(s, "delete_category", delete_args)
         err = is_error_payload(delete_info)
         if err or not isinstance(delete_info, dict) or not delete_info.get("success"):
             record("delete_category", delete_args, "EXCEPTION" if "_exception" in str(delete_info) else "TOOL_ERROR",

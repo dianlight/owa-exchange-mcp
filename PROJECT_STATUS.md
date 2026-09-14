@@ -934,6 +934,17 @@ a client should apply. Both a terminated id and a never-issued one are exercised
 asserts its *own* expected wording rather than "some 404" — so the run also fails if a future
 SDK stops distinguishing the two causes, which would invalidate the reasoning above.
 
+**That last sentence cashed out one SDK release later.** The mcp v2 migration (2026-09-14, see
+§4) found that 2.x discards a session however it ended, where 1.x deliberately kept a
+cleanly-DELETEd one registered so its id still said `"Not Found: Session has been terminated"`.
+On 2.x both a terminated and a never-issued id answer `"Session not found"`, so the *wording*
+no longer separates a tidy client from a crashed or restarted server. The conclusion below is
+unaffected — it rests on the two tools failing **identically**, which they still do (re-verified
+live on 2.2.0) — but the terminated phase now accepts either text, and anyone re-deriving #18's
+cause from the error string alone on a 2.x server will get less out of it than this triage did.
+2.x also adds a *legitimate* new producer of that exact 404: a 30-minute idle reaper, which
+`server.py` disables (`session_idle_timeout=None`) precisely so it can't be mistaken for #18.
+
 Verified live 2026-09-14: all 8 checks `OK`, exit 0 — including the never-issued id
 reproducing #18's exact `"Session not found"` **identically** for `check_session` and
 `get_tasks`, which is the direct evidence that the tool named in the report is irrelevant to
@@ -941,7 +952,8 @@ the error. `test_check_session.py` re-run alongside it: `OK`.
 
 Re-verified afterwards on a server launched from **this** worktree (port 8767,
 `EXCHANGE_BROWSER_PROFILE_DIR=.browser-profile-dev`, identity probe confirming
-`exchange 1.29.0, 60 tools`; production on 8766 untouched): 8/8 `OK` again, so the result is
+`exchange 1.29.0, 60 tools` — that version being the *SDK's*, which the v2 migration later
+fixed to report this package's own; production on 8766 untouched): 8/8 `OK` again, so the result is
 attributed to this checkout's code and not merely to a server that happened to be up.
 `test_check_session.py` and `test_get_folders.py` both `OK` on it too.
 
@@ -1022,7 +1034,7 @@ port it reports "could not determine" instead of raising.
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 101 | `get_emails` | List emails from a folder, grouped by conversation/thread, with unread/pagination filters; each row includes `flag_status`, and `body_error` when `include_body=True` could not fetch that row. `offset` is a real folder position at any depth, and every response carries a `pagination` block (`has_more`/`next_offset`/`reached_end_of_folder`, plus `error_code` when paging stopped early) so an empty page is never ambiguous | `tests/smoke/tests/test_get_emails.py`, `tests/smoke/tests/test_email_flag.py`, `tests/smoke/tests/test_unfetchable_item_resilience.py`, `tests/smoke/tests/test_get_emails_pagination.py`, `tests/unit/test_conversation_paging.py` | OK (2026-09-11) — deep-offset pagination rewritten and verified live: server-side `Offset` honoured and aligned with a from-zero enumeration, offsets 0/60/100/120/140/240 all return full pages with monotonically older dates, `ids_only limit=500` no longer capped at 200, empty pages self-describing (see §4). Earlier OK (2026-09-10) for `flag_status` on every row and per-row `include_body` degradation still holds | Stable |
+| 101 | `get_emails` | List emails from a folder, grouped by conversation/thread, with unread/pagination filters; each row includes `flag_status`, and `body_error` when `include_body=True` could not fetch that row. `offset` is a real folder position at any depth, and every response carries a `pagination` block (`has_more`/`next_offset`/`reached_end_of_folder`, plus `error_code` when paging stopped early) so an empty page is never ambiguous | `tests/smoke/tests/test_get_emails.py`, `tests/smoke/tests/test_email_flag.py`, `tests/smoke/tests/test_unfetchable_item_resilience.py`, `tests/smoke/tests/test_get_emails_pagination.py`, `tests/unit/test_conversation_paging.py` | OK (2026-09-11) — deep-offset pagination rewritten and verified live: server-side `Offset` honoured and aligned with a from-zero enumeration, offsets 0/60/100/120/140/240 all return full pages with monotonically older dates, `ids_only limit=500` no longer capped at 200, empty pages self-describing (see §4). Earlier OK (2026-09-10) for `flag_status` on every row and per-row `include_body` degradation still holds; re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change | Stable |
 | 102 | `get_email` | Get a single email's full body, recipients, attachments, and `flag_status` (follow-up flag) | `tests/smoke/tests/test_get_email_detail.py`, `tests/smoke/tests/test_email_flag.py`, `tests/smoke/tests/test_unfetchable_item_resilience.py`, `tests/unit/test_item_errors.py` | OK (2026-09-11) — `flag_status` verified round-tripping all three states. Still fails on the messages OWA cannot serialise at full property shape (this tool asks for all of them by design); now returns `error_code: "item_not_serializable"` plus a `hint` naming the narrow reads that *do* work on the same item, see §4. `test_get_email_detail` is flaky when it happens to pick one. | Stable |
 | 103 | `send_email` | Send a new email (to/cc/bcc, HTML or plain text) | `tests/smoke/tests/test_email_lifecycle.py`, `tests/unit/test_recipient_list.py` | OK (2026-09-07) | Stable |
 | 104 | `reply_email` | Reply (or reply-all) to an email | `tests/smoke/tests/test_email_lifecycle.py`, `tests/unit/test_recipient_list.py` | OK (2026-09-07) | Stable |
@@ -1035,14 +1047,14 @@ port it reports "could not determine" instead of raising.
 | 111 | `assign_email_categories` | Add one or more categories to emails (any mail-class item, meeting invites/responses included), keeping any already present; reports `updated_count`/`failed_count`/`failed`/`failed_codes`, each failure carrying a stable `error_code` | `tests/smoke/tests/test_email_category_tagging.py`, `tests/smoke/tests/test_meeting_request_categories.py`, `tests/unit/test_item_errors.py` | OK (2026-09-11) — re-verified after the meeting-invite fix: tags a real `MeetingRequestMessage` and reads it back server-side; ordinary mail unaffected. See "Update 2026-09-11 (continued) — category writes on meeting invites" below | Stable |
 | 112 | `remove_email_categories` | Remove one or more categories from emails (any mail-class item, meeting invites/responses included), keeping any others present; reports `updated_count`/`failed_count`/`failed`/`failed_codes`, each failure carrying a stable `error_code` | `tests/smoke/tests/test_email_category_tagging.py`, `tests/smoke/tests/test_meeting_request_categories.py`, `tests/unit/test_item_errors.py` | OK (2026-09-11) — same fix as `assign_email_categories` above (shares `_get_item_categories`); untag verified on both a meeting invite and ordinary mail | Stable |
 | 113 | `find_emails_by_category` | Find email conversations tagged with a given category. The match is client-side (FindConversation has no category restriction), so the folder is enumerated with a real server-side `Offset` until `limit` matches are found or it is exhausted — not just the newest 200 conversations, which is what it used to scan. Takes an `offset` counting *matching* conversations, and every response carries a `pagination` block (`has_more`/`next_offset`/`reached_end_of_folder`, plus `error_code` when the scan stopped early) so a short or empty result is never ambiguous | `tests/smoke/tests/test_email_category_tagging.py`, `tests/unit/test_conversation_paging.py`, `tests/smoke/tests/test_find_emails_by_category_pagination.py` (written, never run) | OK (2026-09-14) — deep-scan rewrite verified live on an isolated profile (own port; the production instance untouched) via `tests/smoke/tests/test_find_emails_by_category_pagination.py`: a category tagged on the Inbox conversation at **offset 250** was found, which settles the one assumption no fake could — `FindConversation` **does** report `Categories` on rows fetched at a deep server-side `Offset`. An absent category correctly reported `pagination_scan_limit_reached` ("stopped looking", not end of folder) and `offset=1` correctly skipped the single match; the borrowed message was untagged and independently re-checked as clean. Note this Inbox exceeds the 2000-conversation `_CONV_MAX_SCAN`, so any query not filling its `limit` early scans the full cap (~10 requests) and reports `pagination_scan_limit_reached` — honest, but it means `reached_end_of_folder` is effectively unreachable here and `search_emails`' server-side `category:<name>` is the right tool for a broad sweep. The earlier OK (2026-09-08) covered a *freshly tagged* message, i.e. only the newest-200 window that always worked. | Stable |
-| 114 | `search_emails` | Full-text search for emails, scoped to one folder or the whole mailbox. Tries EWS `FindItem`/`QueryString` (AQS syntax: `subject:`, `from:`, `body:`, `received:`, etc.) first, then transparently falls back to a client-side scan (reduced keyword subset: bare terms, `subject:`, `from:`, `category:`, `isread:`, `hasattachment:`) — this tenant's content index never returns AQS results, and `FindItem`'s `Traversal:"Deep"` is unsupported outright, so `search_all_folders` enumerates folders via `FindFolder`/`Deep` (like `get_folders`) and searches each one `Shallow` | `tests/smoke/tests/test_search_emails.py` | OK (2026-09-09) — single-folder AQS-empty + fallback, and `search_all_folders=True` across folders, both verified live; fixed `folder_id` always returning empty (`FindItem`'s `AdditionalProperties` needs the namespaced `item:ParentFolderId` FieldURI, not bare `ParentFolderId`) — re-verified non-empty `folder_id` live via the fallback path | Stable |
+| 114 | `search_emails` | Full-text search for emails, scoped to one folder or the whole mailbox. Tries EWS `FindItem`/`QueryString` (AQS syntax: `subject:`, `from:`, `body:`, `received:`, etc.) first, then transparently falls back to a client-side scan (reduced keyword subset: bare terms, `subject:`, `from:`, `category:`, `isread:`, `hasattachment:`) — this tenant's content index never returns AQS results, and `FindItem`'s `Traversal:"Deep"` is unsupported outright, so `search_all_folders` enumerates folders via `FindFolder`/`Deep` (like `get_folders`) and searches each one `Shallow` | `tests/smoke/tests/test_search_emails.py` | OK (2026-09-09) — single-folder AQS-empty + fallback, and `search_all_folders=True` across folders, both verified live; fixed `folder_id` always returning empty (`FindItem`'s `AdditionalProperties` needs the namespaced `item:ParentFolderId` FieldURI, not bare `ParentFolderId`) — re-verified non-empty `folder_id` live via the fallback path; re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change | Stable |
 | 115 | `set_email_flag` | Set the follow-up flag (`NotFlagged`/`Flagged`/`Complete`) on one or more emails, via `UpdateItem`/`SetItemField` on `item:Flag` | `tests/smoke/tests/test_email_flag.py` | OK (2026-09-10) — all three states written and read back successfully. The wire encoding is fussy: only `FieldURI: "item:Flag"` paired with `__type: "FlagType:#Exchange"` is accepted; `message:Flag` (either `__type`) returns "Invalid argument used to call method UpdateItem", and PidLidFlagStatus 0x8530 as an ExtendedFieldURI is rejected in every spelling tried. Invalid `flag_status` rejected client-side. | Stable |
 
 ### Calendar — [exchange_mcp/tools/calendar.py](exchange_mcp/tools/calendar.py) (11)
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 201 | `get_calendar_events` | List events in a date range, including each event's `categories`. By default a recurring series appears once, as its master item; `expand_recurrences=True` additionally synthesizes one entry per occurrence client-side (marked `is_synthesized_occurrence`, empty `item_id` — see §4) | `tests/smoke/tests/test_get_calendar_events.py`, `tests/smoke/tests/test_calendar_event_detail.py`, `tests/smoke/tests/test_recurrence_expansion.py`, `tests/unit/test_recurrence_expansion.py` | OK (2026-09-10) — `categories` verified round-tripping a real tag; `expand_recurrences` verified live (46 synthesized occurrences over 14 days, all in-window, all `item_id`-less, no duplicated masters, correct time-of-day) and all 127 recurring series in this mailbox expand, relative patterns included | Stable |
+| 201 | `get_calendar_events` | List events in a date range, including each event's `categories`. By default a recurring series appears once, as its master item; `expand_recurrences=True` additionally synthesizes one entry per occurrence client-side (marked `is_synthesized_occurrence`, empty `item_id` — see §4) | `tests/smoke/tests/test_get_calendar_events.py`, `tests/smoke/tests/test_calendar_event_detail.py`, `tests/smoke/tests/test_recurrence_expansion.py`, `tests/unit/test_recurrence_expansion.py` | OK (2026-09-10) — `categories` verified round-tripping a real tag; `expand_recurrences` verified live (46 synthesized occurrences over 14 days, all in-window, all `item_id`-less, no duplicated masters, correct time-of-day) and all 127 recurring series in this mailbox expand, relative patterns included; re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change | Stable |
 | 202 | `create_meeting` | Create a meeting with attendees, location, reminder, sensitivity | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
 | 203 | `update_meeting` | Update a meeting (implemented as cancel + recreate — OWA JSON API has no reliable `UpdateItem` for calendar items) | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
 | 204 | `cancel_meeting` | Cancel a meeting and notify attendees (soft-delete only — moves to Deleted Items, no permanent-delete option) | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
@@ -1067,14 +1079,14 @@ port it reports "could not determine" instead of raising.
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 401 | `find_person` | Search the directory for people by name/email/keyword — Substrate Search (`/search/api/v1/suggestions`) on the modern Outlook backend, falling back to `ResolveNames` on classic OWA | `tests/smoke/tests/test_find_person.py` | OK (2026-09-09) — `ResolveNames` still throws a server-side `System.NullReferenceException` on this tenant regardless of `SearchScope`/`ContactDataShape`/query shape (not fixable client-side; see the 2026-09-09 update above), but `outlook.cloud.microsoft/people`'s own search box doesn't use `ResolveNames` at all — it calls the Substrate Search REST API, which works on this tenant and returns real directory data over the same bearer token already used for Mail. `find_person` now tries that path first and only falls back to `ResolveNames` when the session is in classic canary-cookie auth mode (on-prem, or a cloud tenant not yet on the modern backend). Also breaks `get_meeting_stats`'s name-resolution step the same way — see #701, below — fixed by the same fallback. Caveat: the Substrate Search response has no manager/direct-reports/postal-address fields, so those stay empty on this path (only the `ResolveNames` fallback can populate them). | Stable |
+| 401 | `find_person` | Search the directory for people by name/email/keyword — Substrate Search (`/search/api/v1/suggestions`) on the modern Outlook backend, falling back to `ResolveNames` on classic OWA | `tests/smoke/tests/test_find_person.py` | OK (2026-09-09) — `ResolveNames` still throws a server-side `System.NullReferenceException` on this tenant regardless of `SearchScope`/`ContactDataShape`/query shape (not fixable client-side; see the 2026-09-09 update above), but `outlook.cloud.microsoft/people`'s own search box doesn't use `ResolveNames` at all — it calls the Substrate Search REST API, which works on this tenant and returns real directory data over the same bearer token already used for Mail. `find_person` now tries that path first and only falls back to `ResolveNames` when the session is in classic canary-cookie auth mode (on-prem, or a cloud tenant not yet on the modern backend). Also breaks `get_meeting_stats`'s name-resolution step the same way — see #701, below — fixed by the same fallback. Caveat: the Substrate Search response has no manager/direct-reports/postal-address fields, so those stay empty on this path (only the `ResolveNames` fallback can populate them).; re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change | Stable |
 
 ### Folders — [exchange_mcp/tools/folders.py](exchange_mcp/tools/folders.py) (7)
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 501 | `check_session` | Lightweight auth check (`FindFolder` on inbox) — reports mailbox name + unread count when the backend's response includes them (omitted on the modern OAuth/Bearer backend, which never returns `ParentFolder`). An unauthenticated profile now comes back as `authorization_required` + `reason` + `remediation` rather than a generic error string, pointing the caller at the `login` tool (see the 2026-09-10 update below) | `tests/smoke/tests/test_check_session.py`, `tests/smoke/tests/test_mcp_session_lifecycle.py` (transport-session reuse / dead-session-id 404, issue #18) | OK (2026-09-07) for the authenticated/generic-error paths, re-confirmed live 2026-09-14 while triaging issue #18 (whose "Session not found" is the MCP transport's 404, not this tool — see the 2026-09-14 update above); the new `authorization_required` branch is `Pending` | Stable |
-| 502 | `get_folders` | List mail folders (shallow or recursive) with counts | `tests/smoke/tests/test_get_folders.py`, `tests/unit/test_folder_id_dict.py` | OK (2026-09-08) | Stable |
+| 501 | `check_session` | Lightweight auth check (`FindFolder` on inbox) — reports mailbox name + unread count when the backend's response includes them (omitted on the modern OAuth/Bearer backend, which never returns `ParentFolder`). An unauthenticated profile now comes back as `authorization_required` + `reason` + `remediation` rather than a generic error string, pointing the caller at the `login` tool (see the 2026-09-10 update below) | `tests/smoke/tests/test_check_session.py`, `tests/smoke/tests/test_mcp_session_lifecycle.py` (transport-session reuse / dead-session-id 404, issue #18) | OK (2026-09-07) for the authenticated/generic-error paths, re-confirmed live 2026-09-14 while triaging issue #18 (whose "Session not found" is the MCP transport's 404, not this tool — see the 2026-09-14 update above); the new `authorization_required` branch is `Pending`; re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change | Stable |
+| 502 | `get_folders` | List mail folders (shallow or recursive) with counts | `tests/smoke/tests/test_get_folders.py`, `tests/unit/test_folder_id_dict.py` | OK (2026-09-08); re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change | Stable |
 | 503 | `create_folder` | Create a new folder — mail folder by default, or any Exchange folder class via `folder_class` (`IPF.Task` under `parent_folder_id="tasks"` makes a **Microsoft To Do list**). Echoes the class the server actually stored, because an unrecognised prefix is silently downgraded to `IPF.Note` rather than rejected | `tests/smoke/tests/test_folder_lifecycle.py` (default `IPF.Note` path), `tests/smoke/tests/test_task_folder_targeting.py` (`IPF.Task` To Do list), `tests/unit/test_folder_id_dict.py` | OK (2026-09-14) — `folder_class` added and re-verified live on both paths: the mail-folder default is unchanged (folder-lifecycle test still green) and `folder_class="IPF.Task"` under the `tasks` root produces a real To Do list that the task tools can address by name, by path and by raw ID. Both `IPF.Task` and `IPF.Task.Todo` are accepted and stored verbatim — the latter only because folder classes are *prefixes* (EWS treats `IPF.Task.*` as a task folder), so the plain `IPF.Task` is what the docstring recommends | Stable |
 | 504 | `rename_folder` | Rename an existing folder | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) | Stable |
 | 505 | `empty_folder` | Empty all items from a folder | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) | Stable |
@@ -1375,7 +1387,7 @@ hold a request open for.
   - **Launching the server as `python -m exchange_mcp.server` registers zero tools.** That
     loads `server.py` under the name `__main__`, so when each tool module does
     `from exchange_mcp.server import mcp` Python imports the module a *second* time and builds
-    a *second* `FastMCP` instance: the tools register on one, `main()` serves the other, and
+    a *second* `MCPServer` instance: the tools register on one, `main()` serves the other, and
     every call fails `Unknown tool`. Use the console script, or
     `python -c "from exchange_mcp.server import main; main()"` when you need a checkout other
     than the editable install (an editable install resolves to its original path regardless of
@@ -1414,9 +1426,60 @@ hold a request open for.
   install of this package today (new contributor, new machine, CI runner) resolved to 2.2.0
   and neither `server.py` nor any of the 11 tool modules could be imported at all. Every
   existing dev environment was on 1.29 from an earlier install and therefore silent about it.
-  Fixed by pinning `mcp>=1.0.0,<2`; lifting that pin is a v2 migration, not a version bump.
+  Stopped the bleeding by pinning `mcp>=1.0.0,<2`, then **migrated to the v2 SDK the same
+  day** (see the next bullet); the requirement is now `mcp>=2.2.0,<3`.
   This is exactly the class of breakage no amount of live smoke testing can find, because
   smoke tests run against the environment that already works.
+- **Migrated to the mcp SDK v2 (2026-09-14).** `FastMCP` → `MCPServer`
+  (`mcp.server.mcpserver`), in `server.py` and as the `Context` import in all 11 tool
+  modules; client side, `streamablehttp_client` → `streamable_http_client` (two streams, not
+  three) and the wire fields are snake_case (`is_error`, `structured_content`,
+  `server_info`, `input_schema`) in `tests/smoke/mcp_client.py`,
+  `tests/smoke/server_manager.py` and `scripts/_test_read_tools.py`. Verified against a live
+  mailbox on both transports, from this worktree's own code on port 8767 with
+  `EXCHANGE_BROWSER_PROFILE_DIR=.browser-profile-dev` (production on 8766 untouched):
+  seven read-only smoke modules pass on streamable-http — `test_check_session`,
+  `test_get_folders`, `test_get_emails`, `test_search_emails`, `test_get_calendar_events`,
+  `test_find_person` and `test_mcp_session_lifecycle` (8/8 checks) — and a stdio spawn
+  handshakes, lists 60 tools and dispatches a call. `python -m tests.unit` is green on 2.2.0
+  across all eight suites. **Six things the rename did not cover**, each of which would have
+  been a silent or delayed failure:
+  - **`mcp.settings.host`/`.port` no longer exist** — `Settings` keeps only
+    constructor-owned fields and assigning a removed one *raises*. Transport parameters are
+    `run()` arguments now: `mcp.run(transport="streamable-http", host=..., port=...)`.
+  - **The `host` passed to `run()` is what arms DNS-rebinding protection.** The SDK
+    auto-enables Host/Origin validation for `127.0.0.1`/`localhost`/`::1` at app-build time,
+    so binding off loopback disarms it in addition to exposing the port.
+  - **2.2.0 reaps streamable-http sessions idle for 30 minutes; 1.x never reaped at all**
+    (`session_idle_timeout` defaulted to `None`). A reaped id answers 404 `"Session not
+    found"` — the *exact* symptom of issue #18 — so this long-lived, loopback-only,
+    single-user server passes `session_idle_timeout=None` and keeps 1.x's behaviour. This is
+    also why the floor is 2.2.0 and not 2.0.0: that keyword doesn't exist before 2.2.0, where
+    passing it is a `TypeError` at startup.
+  - **A cleanly terminated session id now answers `"Session not found"` too.** 1.x guarded
+    its cleanup with `not http_transport.is_terminated`, deliberately leaving a DELETEd
+    session registered so its id kept giving `"Not Found: Session has been terminated"`; 2.x
+    routes every ending through `_discard_session` ("However the session ended (client
+    DELETE, idle timeout, crash), discard it"). So the 404 *wording* no longer distinguishes a
+    tidy client from a crashed/restarted server, which was the discriminator
+    `test_mcp_session_lifecycle` used to close issue #18 — confirmed live. That test now
+    accepts either text for a terminated id and rests its conclusion on the
+    tool-independence check, which is unaffected.
+  - **`serverInfo.version` is reported verbatim and defaults to `""`** (1.x substituted the
+    SDK's own version), so `server.py` passes `version=__version__`. The smoke harness's
+    identity probe now prints `exchange <this package's version>` instead of the SDK's — which
+    is what that line was always trying to say.
+  - **`get_session_id` was removed from the client transport** and the id is exposed nowhere
+    else. `test_mcp_session_lifecycle` recovers it by passing its own `httpx2.AsyncClient`
+    (a documented `streamable_http_client` parameter) with a response hook reading the
+    `mcp-session-id` header, rather than hand-rolling `initialize` — the session under test
+    stays an ordinary SDK session. Note `httpx2`: v2 depends on that, not `httpx`.
+  Two smaller consequences: v2 doesn't depend on `pydantic-settings` and `Settings` is a
+  plain `BaseModel`, so `server.py`'s `IncompleteFieldDefinitionWarning` filter is gone (its
+  import would now fail on a clean install); and the two smoke modules that had inlined their
+  own copy of `call_tool` unwrapping (`test_category_lifecycle`, `test_move_email_nested_folder`)
+  now use `mcp_client.call_args`, since each copy otherwise needed the same field rename —
+  which is what its docstring already asked for.
 - **No live/manual QA log.** There's no record (changelog, issue tracker, etc.) of which
   of the 54 tools have actually been run against a real OWA mailbox since the
   browser-session rewrite. This document's "Manual QA / Status" column is a template for

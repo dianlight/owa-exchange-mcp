@@ -12,7 +12,7 @@ import json
 from contextlib import asynccontextmanager
 
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 from tests.smoke.server_manager import SERVER_URL, ensure_server
 
@@ -26,7 +26,11 @@ FIRST_CALL_RETRY_DELAY = 5
 @asynccontextmanager
 async def session():
     ensure_server()
-    async with streamablehttp_client(SERVER_URL) as (read, write, _):
+    # mcp 2.x: `streamable_http_client` (renamed from `streamablehttp_client`)
+    # yields two streams, not three - the `get_session_id` callback was removed.
+    # test_mcp_session_lifecycle.py is the one place that needed it; see the note
+    # on _mint_session_id there.
+    async with streamable_http_client(SERVER_URL) as (read, write):
         async with ClientSession(read, write) as s:
             await s.initialize()
             yield s
@@ -54,8 +58,13 @@ async def call_args(s: ClientSession, tool: str, args: dict):
     else:
         return {"_exception": str(last_exc)}
 
+    # mcp 2.x renamed the wire fields to snake_case (`isError` -> `is_error`,
+    # `structuredContent` -> `structured_content`). A tool that *raises* still
+    # arrives here as an is_error result, exactly as under 1.x - only a tool
+    # rejecting with `MCPError` now raises client-side instead, which nothing in
+    # this codebase does (it would land in the `_exception` branch above).
     text = "".join(getattr(b, "text", "") for b in result.content)
-    if result.isError:
+    if result.is_error:
         return {"_transport_error": True, "raw": text}
     try:
         return json.loads(text)

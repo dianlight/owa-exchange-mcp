@@ -338,7 +338,7 @@ implement them.
 
 ```
 exchange_mcp/
-  server.py               # FastMCP server entry point
+  server.py               # MCPServer (mcp SDK v2) entry point
   browser_session.py      # Persistent Chromium context + interactive sign-in
   owa_client.py           # OWA API client (delegates transport to BrowserSession)
   auth_errors.py          # Diagnosis of a timed-out sign-in (reasons + remediation)
@@ -390,7 +390,7 @@ Every Exchange / OWA deployment has its own authentication setup — 2FA (push n
 - **If running with `--transport http`**: bind stays on `127.0.0.1` by
   default — never set `EXCHANGE_MCP_HOST`/`--host` to `0.0.0.0` or a LAN
   address, that would expose full mailbox access to your network with no
-  authentication of its own. Keep FastMCP's built-in `transport_security`
+  authentication of its own. Keep the SDK's built-in `transport_security`
   (Host header validation) enabled; it's what stops an unrelated web page
   in your regular browser from reaching `localhost:8765` via DNS rebinding.
   Any local process that can reach the port has the same mailbox access a
