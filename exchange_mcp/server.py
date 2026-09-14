@@ -354,14 +354,23 @@ def main():
         _log(f"Configuration error: {exc}")
         raise SystemExit(2) from exc
 
-    if args.transport == "http":
-        mcp.settings.host = args.host
-        mcp.settings.port = args.port
-        _log(f"Transport:   streamable-http on http://{args.host}:{args.port}/mcp")
-        mcp.run(transport="streamable-http")
-    else:
-        _log("Transport:   stdio")
-        mcp.run()
+    # Ctrl+C is the *documented* way to stop an http server (there is no shutdown
+    # endpoint), so it must not look like a crash. anyio's asyncio backend cancels
+    # the main task on SIGINT and then re-raises KeyboardInterrupt after uvicorn has
+    # already drained cleanly; letting that escape printed a 20-line traceback and
+    # exited 1, which is indistinguishable from a real fault to any supervisor.
+    # Returning normally here still runs _stop_shared_browser via atexit.
+    try:
+        if args.transport == "http":
+            mcp.settings.host = args.host
+            mcp.settings.port = args.port
+            _log(f"Transport:   streamable-http on http://{args.host}:{args.port}/mcp")
+            mcp.run(transport="streamable-http")
+        else:
+            _log("Transport:   stdio")
+            mcp.run()
+    except KeyboardInterrupt:
+        _log("Interrupted (Ctrl+C) - shutting down browser session and exiting.")
 
 
 if __name__ == "__main__":
