@@ -29,30 +29,14 @@ Run standalone:
 """
 
 import asyncio
-import json
 import sys
 import time
 
-from tests.smoke.mcp_client import call, run, session
+# create_folder's own tool parameter is named `name`, which collides with
+# call()'s own `name` parameter (the tool's name) when passed via **args, so
+# it goes through call_args() instead -- see call_args' docstring.
+from tests.smoke.mcp_client import call, call_args, run, session
 from tests.smoke.results import is_error_payload, record
-
-
-async def _call_create_folder(s, args: dict):
-    """Like call(), but for create_folder specifically.
-
-    create_folder's own tool parameter is named `name`, which collides
-    with call()'s own `name` parameter (the tool's name) when passed via
-    **args -- call(s, "create_folder", **{"name": ...}) raises "got
-    multiple values for argument 'name'". Call the tool directly instead.
-    """
-    result = await s.call_tool("create_folder", args)
-    text = "".join(getattr(b, "text", "") for b in result.content)
-    if result.isError:
-        return {"_transport_error": True, "raw": text}
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return {"_non_json": True, "raw": text}
 
 SELF_EMAIL = "lucio.tarantino@unipol.it"
 TAG = f"folder-smoke-{int(time.time())}"
@@ -80,7 +64,7 @@ async def main() -> bool:
     async with session() as s:
         # 1. create_folder (under Inbox)
         create_args = {"name": FOLDER_NAME, "parent_folder_id": "inbox"}
-        create_info = await _call_create_folder(s, create_args)
+        create_info = await call_args(s, "create_folder", create_args)
         err = is_error_payload(create_info)
         if err or not isinstance(create_info, dict) or "id" not in create_info:
             record("create_folder", create_args, "EXCEPTION" if "_exception" in str(create_info) else "TOOL_ERROR",

@@ -32,12 +32,19 @@ async def session():
             yield s
 
 
-async def call(s: ClientSession, name: str, **args):
-    """Call an MCP tool and return its parsed JSON payload (or raw text/dict wrapper)."""
+async def call_args(s: ClientSession, tool: str, args: dict):
+    """Same as call(), but taking the tool's arguments as an explicit dict.
+
+    Needed whenever a tool has a parameter that collides with call()'s own
+    keyword parameters - `create_folder`'s `name`, for instance, makes
+    `call(s, "create_folder", name=...)` raise "got multiple values for
+    argument 'name'". Prefer this over re-inlining the raw call_tool
+    plumbing in a test module.
+    """
     last_exc = None
     for attempt in range(FIRST_CALL_RETRIES):
         try:
-            result = await s.call_tool(name, args)
+            result = await s.call_tool(tool, args)
             break
         except Exception as e:
             last_exc = e
@@ -54,6 +61,11 @@ async def call(s: ClientSession, name: str, **args):
         return json.loads(text)
     except json.JSONDecodeError:
         return {"_non_json": True, "raw": text}
+
+
+async def call(s: ClientSession, name: str, **args):
+    """Call an MCP tool and return its parsed JSON payload (or raw text/dict wrapper)."""
+    return await call_args(s, name, args)
 
 
 def run(coro):
