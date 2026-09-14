@@ -33,7 +33,7 @@ been implemented) without re-recording anything.
 
 import json
 
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 
 from exchange_mcp import discovery_session as ds
 from exchange_mcp.capability_classify import classify, render_markdown

@@ -5,7 +5,7 @@ Ports the find-person.py logic into an MCP tool using OWAClient.
 
 import json
 
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 
 from exchange_mcp.server import mcp, AppContext
 from exchange_mcp.owa_client import BearerModeRequiredError, OWAClient

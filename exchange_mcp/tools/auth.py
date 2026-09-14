@@ -15,7 +15,7 @@ can't:
 import asyncio
 import json
 
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 
 from exchange_mcp import auth_errors
 from exchange_mcp.server import mcp, AppContext, LOGIN_WINDOW_SECONDS

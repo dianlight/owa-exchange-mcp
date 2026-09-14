@@ -31,11 +31,10 @@ Run standalone:
 """
 
 import asyncio
-import json
 import sys
 import time
 
-from tests.smoke.mcp_client import call, run, session
+from tests.smoke.mcp_client import call, call_args, run, session
 from tests.smoke.results import is_error_payload, record
 
 SELF_EMAIL = "lucio.tarantino@unipol.it"
@@ -48,19 +47,6 @@ SUBJECT_B = f"[{TAG}] nested inbox-folder move"
 
 FIND_ATTEMPTS = 6
 FIND_DELAY_SECONDS = 10
-
-
-async def _call_create_folder(s, args: dict):
-    """create_folder's own `name` parameter collides with call()'s tool-name
-    parameter when passed via **args -- call the tool directly instead."""
-    result = await s.call_tool("create_folder", args)
-    text = "".join(getattr(b, "text", "") for b in result.content)
-    if result.isError:
-        return {"_transport_error": True, "raw": text}
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return {"_non_json": True, "raw": text}
 
 
 async def _find_item_id(s, folder: str, subject_substr: str):
@@ -91,7 +77,7 @@ async def main() -> bool:
 
         # 1a. [tag]-parent directly under msgfolderroot
         parent_args = {"name": PARENT_NAME, "parent_folder_id": "msgfolderroot"}
-        parent_info = await _call_create_folder(s, parent_args)
+        parent_info = await call_args(s, "create_folder", parent_args)
         err = is_error_payload(parent_info)
         if err or not isinstance(parent_info, dict) or "id" not in parent_info:
             record("create_folder (parent)", parent_args, "EXCEPTION" if "_exception" in str(parent_info) else "TOOL_ERROR",
@@ -102,7 +88,7 @@ async def main() -> bool:
 
         # 1b. [tag]-child nested under [tag]-parent -- mirrors Projects/ClientFolder
         child_args = {"name": CHILD_NAME, "parent_folder_id": parent_id}
-        child_info = await _call_create_folder(s, child_args)
+        child_info = await call_args(s, "create_folder", child_args)
         err = is_error_payload(child_info)
         if err or not isinstance(child_info, dict) or "id" not in child_info:
             record("create_folder (child)", child_args, "EXCEPTION" if "_exception" in str(child_info) else "TOOL_ERROR",
@@ -112,7 +98,7 @@ async def main() -> bool:
 
         # 1c. [tag]-inboxchild directly under Inbox -- mirrors Inbox/Triage
         inbox_child_args = {"name": INBOX_CHILD_NAME, "parent_folder_id": "inbox"}
-        inbox_child_info = await _call_create_folder(s, inbox_child_args)
+        inbox_child_info = await call_args(s, "create_folder", inbox_child_args)
         err = is_error_payload(inbox_child_info)
         if err or not isinstance(inbox_child_info, dict) or "id" not in inbox_child_info:
             record("create_folder (inbox child)", inbox_child_args, "EXCEPTION" if "_exception" in str(inbox_child_info) else "TOOL_ERROR",
