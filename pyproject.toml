@@ -12,7 +12,15 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 dependencies = [
-    "mcp>=1.0.0",
+    # Pinned below 2.0 on purpose: mcp 2.x renamed FastMCP to MCPServer and
+    # changed the surrounding API, so every module here (server.py plus all 11
+    # tool modules, each importing `mcp.server.fastmcp`) fails to import
+    # outright against it -- ModuleNotFoundError at `from mcp.server.fastmcp
+    # import Context`, not a deprecation warning. A dev machine that installed
+    # while 1.x was current never sees this; a fresh `pip install -e .` (a new
+    # contributor, or CI) gets 2.x and nothing works. Lift the pin only together
+    # with the v2 migration.
+    "mcp>=1.0.0,<2",
     "playwright",
 ]
 

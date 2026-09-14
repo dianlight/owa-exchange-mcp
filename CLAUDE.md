@@ -34,7 +34,8 @@ Any variable above can also be placed in a gitignored `.env.local` next to `pypr
   - `capability_inventory.py` — What this server already implements, derived by `ast`-scanning `tools/*.py` and `owa_client.py` for transport call sites, plus PROJECT_STATUS.md for the ID-numbering state. No Playwright, unit-testable.
   - `capability_classify.py` — Verdicts and implementation proposals for a recorded capture. Pure logic; the domain knowledge lives in two keyword tables, correctable in one place like `auth_errors.py`'s.
   - `tools/` — Tool modules: email, calendar, categories, people, folders, availability, analytics, auth, copilot, tasks, discovery
-- `tests/unit/` — Pure-logic tests, no live mailbox / browser / `EXCHANGE_OWA_URL` needed (`python -m tests.unit.test_auth_errors`, `python -m tests.unit.test_recurrence_expansion`, `python -m tests.unit.test_capability_classify`, `python -m tests.unit.test_item_errors`, `python -m tests.unit.test_conversation_paging`, `python -m tests.unit.test_copilot_answer_text`). Separate from `tests/smoke/`, which is live-mailbox end-to-end.
+- `tests/unit/` — Pure-logic tests, no live mailbox / browser / `EXCHANGE_OWA_URL` needed. Run them all with `python -m tests.unit` (`tests/unit/__main__.py` **discovers** every `test_*.py` and calls its `main()`, so a new suite is picked up with no list to update — that's what CI runs), or one at a time as `python -m tests.unit.<suite>`. Every suite must expose `main() -> bool`; one that doesn't is reported as a failure, not skipped. Separate from `tests/smoke/`, which is live-mailbox end-to-end and can't run unattended.
+- `.github/workflows/ci.yml` — CI: `pip install -e .` then `python -m tests.unit`, on every push and PR, across Python 3.10-3.14 plus one Windows job. No secrets, no mailbox, and deliberately **no** `playwright install chromium` — Playwright's Python package is needed to *import* the tool modules, but no unit test launches a browser. `tests/smoke/` is intentionally not in CI.
 - `.claude/skills/owa-capability-discovery/` — Interactive skill driving the discovery tools: scope → record → classify → propose → implement. Its `references/implementation-checklist.md` is the "turn a proposal into a tool" procedure.
 
 ## Running
@@ -54,13 +55,19 @@ exchange-mcp-server --transport http --port 8765
 # Persistent local servet to use during smoke test
 exchange-mcp-server --transport http --port 8765 --show-browser
 
-# Pure-logic tests (no mailbox, no browser, no EXCHANGE_OWA_URL)
+# Pure-logic tests (no mailbox, no browser, no EXCHANGE_OWA_URL).
+# This is exactly what CI runs; suites are discovered, not listed.
+python -m tests.unit
+
+# ...or one suite at a time, while working on it
 python -m tests.unit.test_auth_errors
 python -m tests.unit.test_recurrence_expansion
 python -m tests.unit.test_capability_classify
 python -m tests.unit.test_item_errors
 python -m tests.unit.test_conversation_paging
 python -m tests.unit.test_copilot_answer_text
+python -m tests.unit.test_recipient_list
+python -m tests.unit.test_folder_id_dict
 
 # Live-mailbox smoke tests: one module per tool group, run individually.
 # The harness starts its own server on 127.0.0.1:8765 if nothing is listening
@@ -87,6 +94,8 @@ There is no credential setup step and no login CLI: the first start opens a brow
 window and you sign in there. See "Authentication" below.
 
 Dependencies: `mcp`, `playwright` (run `playwright install chromium` once). `mcp`'s `streamable-http` transport (`uvicorn`/`starlette`) is already a transitive dependency — no extra install needed for `--transport http`.
+
+**`mcp` is pinned `<2`** in `pyproject.toml`, and the pin is load-bearing rather than cautious: mcp 2.x renamed `FastMCP` to `MCPServer`, so `server.py` and all 11 tool modules (`from mcp.server.fastmcp import Context`) raise `ModuleNotFoundError` at *import* time against it — the package doesn't start at all, no partial degradation. A machine that installed while 1.x was current keeps working and never sees this, which is why it went unnoticed until a clean `pip install -e .` ran in CI (issue #16). Lifting the pin means doing the v2 migration, not just widening the range.
 
 ## Architecture
 
@@ -226,4 +235,4 @@ thread that process exit kills outright.
 - Changing a tool's behavior (new params, different OWA action, altered response shape) → update its Description cell if it's no longer accurate, and reset its Manual QA status to `Pending` unless it's been re-verified.
 - Running or receiving the result of a manual test against a live OWA mailbox → update that tool's Manual QA / Status cell to `OK` or `KO` (with a one-line note for `KO`), don't leave it stale at `Pending`.
 - A tool becoming, or ceasing to be, a confirmed unfixable server-side failure (not merely `Pending`, and not a degraded-but-working case like `get_meeting_contacts`'s empty-result-plus-`warnings` behavior) → keep its Stability column cell (`Stable`/`Dev`) and `KNOWN_BUGGY_TOOLS` in `exchange_mcp/server.py` in sync with each other. `KNOWN_BUGGY_TOOLS` is what `--stable`/`EXCHANGE_MCP_STABLE` excludes from the MCP tool listing at startup.
-- Landing an automated test for a tool or helper → update the Automated test column for the affected row(s) and the note in §4 if it was called out there as a gap.
+- Landing an automated test for a tool or helper → update the Automated test column for the affected row(s) and the note in §4 if it was called out there as a gap. A new `tests/unit/` suite needs **no** CI change (`python -m tests.unit` discovers it) — just give it a `main() -> bool` and add it to the per-suite list in "Running" above. A unit suite for a helper shared by many tools (e.g. `folder_id_dict()`) belongs in the Automated test column of the rows where that helper's behavior is the row's own subject, not of every caller.

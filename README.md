@@ -2,6 +2,8 @@
 
 # OWA Exchange MCP Server
 
+[![CI](https://github.com/dianlight/owa-exchange-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/dianlight/owa-exchange-mcp/actions/workflows/ci.yml)
+
 MCP (Model Context Protocol) server for any Microsoft Exchange / OWA (Outlook Web Access) deployment. Gives LLM agents access to email, calendar, tasks (Microsoft To Do), directory search, folders, categories, availability, meeting analytics, and Copilot delegation via 60 tools, plus a capability-discovery module for mapping the OWA surface this server doesn't cover yet.
 
 Works with any on-premise or hosted Exchange server that exposes OWA.
@@ -358,9 +360,20 @@ exchange_mcp/
 .claude/skills/
   owa-capability-discovery/  # Interactive discovery skill (scope -> record -> propose)
 tests/
-  unit/                   # Pure-logic tests (no mailbox, no browser)
+  unit/                   # Pure-logic tests (no mailbox, no browser) - `python -m tests.unit`
   smoke/                  # Live-mailbox end-to-end tests, one module per tool
+.github/workflows/ci.yml  # CI: runs tests/unit on every push and PR (no mailbox needed)
 pyproject.toml            # Package config
+```
+
+### Running the tests
+
+```bash
+# Pure logic: no mailbox, no browser, no EXCHANGE_OWA_URL. This is what CI runs.
+python -m tests.unit
+
+# Live mailbox, one tool group at a time (needs a signed-in profile; not in CI)
+python -m tests.smoke.tests.test_get_emails
 ```
 
 ## Warning
