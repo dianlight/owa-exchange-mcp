@@ -24,21 +24,26 @@ uniquely-tagged folder:
 Repeatable: the folder/email names include a timestamp tag, so re-runs
 never collide with a leftover folder from a prior run.
 
+Needs the mailbox's own address in $EXCHANGE_SMOKE_SELF_EMAIL (see
+tests/smoke/config.py for why it isn't written down here) -- step 4 mails the
+disposable message to it.
+
 Run standalone:
-    python -m tests.smoke.tests.test_folder_lifecycle
+    EXCHANGE_SMOKE_SELF_EMAIL=you@example.com \
+        python -m tests.smoke.tests.test_folder_lifecycle
 """
 
 import asyncio
 import sys
 import time
 
+from tests.smoke.config import require_self_email
 # create_folder's own tool parameter is named `name`, which collides with
 # call()'s own `name` parameter (the tool's name) when passed via **args, so
 # it goes through call_args() instead -- see call_args' docstring.
 from tests.smoke.mcp_client import call, call_args, run, session
 from tests.smoke.results import is_error_payload, record
 
-SELF_EMAIL = "lucio.tarantino@unipol.it"
 TAG = f"folder-smoke-{int(time.time())}"
 FOLDER_NAME = f"[{TAG}]"
 RENAMED_FOLDER_NAME = f"[{TAG}]-renamed"
@@ -61,6 +66,12 @@ async def _find_item_id(s, folder: str, subject_substr: str):
 
 
 async def main() -> bool:
+    # Checked up front, not at step 4 where it's first used: bailing out later
+    # would leave the disposable folder from step 1 behind for manual cleanup.
+    self_email = require_self_email("send_email (setup)")
+    if not self_email:
+        return False
+
     async with session() as s:
         # 1. create_folder (under Inbox)
         create_args = {"name": FOLDER_NAME, "parent_folder_id": "inbox"}
@@ -97,7 +108,7 @@ async def main() -> bool:
         record("move_folder", move_folder_args, "OK", f"id={folder_id}")
 
         # --- setup: put one disposable tagged email into the test folder ---
-        send_args = {"to": SELF_EMAIL, "subject": EMAIL_SUBJECT, "body": "Automated smoke-test message for folder lifecycle testing. Safe to ignore."}
+        send_args = {"to": self_email, "subject": EMAIL_SUBJECT, "body": "Automated smoke-test message for folder lifecycle testing. Safe to ignore."}
         send_info = await call(s, "send_email", **send_args)
         err = is_error_payload(send_info)
         if err:

@@ -20,24 +20,33 @@ bug.
 Repeatable: the subject tag includes a timestamp, so re-runs never
 collide with a leftover meeting from a prior run.
 
+Needs the mailbox's own address in $EXCHANGE_SMOKE_SELF_EMAIL (see
+tests/smoke/config.py for why it isn't written down here) -- it is the sole
+required attendee, which is what makes the meeting self-invited.
+
 Run standalone:
-    python -m tests.smoke.tests.test_calendar_lifecycle
+    EXCHANGE_SMOKE_SELF_EMAIL=you@example.com \
+        python -m tests.smoke.tests.test_calendar_lifecycle
 """
 
 import sys
 import time
 from datetime import date, timedelta
 
+from tests.smoke.config import require_self_email
 from tests.smoke.mcp_client import call, run, session
 from tests.smoke.results import is_error_payload, record
 
-SELF_EMAIL = "lucio.tarantino@unipol.it"
 TAG = f"[cal-smoke-{int(time.time())}]"
 SUBJECT = f"{TAG} Exchange MCP smoke test meeting"
 MEETING_DATE = (date.today() + timedelta(days=1)).isoformat()
 
 
 async def main() -> bool:
+    self_email = require_self_email("create_meeting")
+    if not self_email:
+        return False
+
     async with session() as s:
         # 1. create_meeting
         create_args = {
@@ -45,7 +54,7 @@ async def main() -> bool:
             "date": MEETING_DATE,
             "start_time": "14:00",
             "duration_minutes": 30,
-            "required_attendees": [SELF_EMAIL],
+            "required_attendees": [self_email],
             "location": "Test Room",
             "description": "Automated smoke-test meeting from the exchange-mcp test suite. Safe to ignore/cancel.",
         }

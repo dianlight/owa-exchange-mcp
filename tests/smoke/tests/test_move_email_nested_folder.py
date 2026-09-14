@@ -26,18 +26,23 @@ afterward. Cleanup deletes the top-level folder in each case (HardDelete of
 a folder deletes its subfolders and contents too), rather than deleting the
 moved email separately.
 
+Needs the mailbox's own address in $EXCHANGE_SMOKE_SELF_EMAIL (see
+tests/smoke/config.py for why it isn't written down here) -- both disposable
+messages are mailed to it.
+
 Run standalone:
-    python -m tests.smoke.tests.test_move_email_nested_folder
+    EXCHANGE_SMOKE_SELF_EMAIL=you@example.com \
+        python -m tests.smoke.tests.test_move_email_nested_folder
 """
 
 import asyncio
 import sys
 import time
 
+from tests.smoke.config import require_self_email
 from tests.smoke.mcp_client import call, call_args, run, session
 from tests.smoke.results import is_error_payload, record
 
-SELF_EMAIL = "lucio.tarantino@unipol.it"
 TAG = f"nested-smoke-{int(time.time())}"
 PARENT_NAME = f"[{TAG}]-parent"
 CHILD_NAME = f"[{TAG}]-child"
@@ -61,8 +66,8 @@ async def _find_item_id(s, folder: str, subject_substr: str):
     return None
 
 
-async def _send_and_locate(s, subject: str) -> str | None:
-    send_args = {"to": SELF_EMAIL, "subject": subject, "body": "Automated smoke-test message for nested-folder move testing. Safe to ignore."}
+async def _send_and_locate(s, self_email: str, subject: str) -> str | None:
+    send_args = {"to": self_email, "subject": subject, "body": "Automated smoke-test message for nested-folder move testing. Safe to ignore."}
     send_info = await call(s, "send_email", **send_args)
     err = is_error_payload(send_info)
     if err:
@@ -72,6 +77,12 @@ async def _send_and_locate(s, subject: str) -> str | None:
 
 
 async def main() -> bool:
+    # Checked up front, not where it's first used: bailing out after the three
+    # create_folder calls below would leave disposable folders behind.
+    self_email = require_self_email("send_email (setup)")
+    if not self_email:
+        return False
+
     async with session() as s:
         # --- setup: build the two nested-folder shapes from the report ---
 
@@ -110,7 +121,7 @@ async def main() -> bool:
         ok = True
 
         # --- case A: move_email to "[tag]-parent/[tag]-child" ---
-        item_a = await _send_and_locate(s, SUBJECT_A)
+        item_a = await _send_and_locate(s, self_email, SUBJECT_A)
         if not item_a:
             record("send_email (locate A)", {"tag": SUBJECT_A}, "EXCEPTION",
                    f"sent message not found in Inbox after {FIND_ATTEMPTS * FIND_DELAY_SECONDS}s")
@@ -135,7 +146,7 @@ async def main() -> bool:
                            f"moved into '{target_a}' and confirmed present")
 
         # --- case B: move_email to "Inbox/[tag]-inboxchild" ---
-        item_b = await _send_and_locate(s, SUBJECT_B)
+        item_b = await _send_and_locate(s, self_email, SUBJECT_B)
         if not item_b:
             record("send_email (locate B)", {"tag": SUBJECT_B}, "EXCEPTION",
                    f"sent message not found in Inbox after {FIND_ATTEMPTS * FIND_DELAY_SECONDS}s")

@@ -9,18 +9,22 @@ Repeatable: the subject tag includes a timestamp, so re-runs never collide
 with a leftover message from a prior run; the final delete_email step
 removes the message (and its replies/forwards) it created.
 
+Needs the mailbox's own address in $EXCHANGE_SMOKE_SELF_EMAIL (see
+tests/smoke/config.py for why it isn't written down here).
+
 Run standalone:
-    python -m tests.smoke.tests.test_email_lifecycle
+    EXCHANGE_SMOKE_SELF_EMAIL=you@example.com \
+        python -m tests.smoke.tests.test_email_lifecycle
 """
 
 import asyncio
 import sys
 import time
 
+from tests.smoke.config import require_self_email
 from tests.smoke.mcp_client import call, run, session
 from tests.smoke.results import is_error_payload, record
 
-SELF_EMAIL = "lucio.tarantino@unipol.it"
 TAG = f"[smoke-test-{int(time.time())}]"
 SUBJECT = f"{TAG} Exchange MCP smoke test"
 BODY = "Automated smoke-test message from the exchange-mcp test suite. Safe to ignore/delete."
@@ -61,9 +65,13 @@ async def _find_all_tagged(s, folders: list[str], subject_substr: str) -> list[s
 
 
 async def main() -> bool:
+    self_email = require_self_email("send_email")
+    if not self_email:
+        return False
+
     async with session() as s:
         # 1. send_email
-        send_args = {"to": SELF_EMAIL, "subject": SUBJECT, "body": BODY}
+        send_args = {"to": self_email, "subject": SUBJECT, "body": BODY}
         send_info = await call(s, "send_email", **send_args)
         err = is_error_payload(send_info)
         if err:
@@ -88,7 +96,7 @@ async def main() -> bool:
             record("reply_email", reply_args, "OK", "reply sent")
 
         # 3. forward_email
-        fwd_args = {"item_id": item_id, "to": SELF_EMAIL, "body": "Automated forward from smoke test."}
+        fwd_args = {"item_id": item_id, "to": self_email, "body": "Automated forward from smoke test."}
         fwd_info = await call(s, "forward_email", **fwd_args)
         err = is_error_payload(fwd_info)
         if err:

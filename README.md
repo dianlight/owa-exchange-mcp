@@ -374,6 +374,11 @@ python -m tests.unit
 
 # Live mailbox, one tool group at a time (needs a signed-in profile; not in CI)
 python -m tests.smoke.tests.test_get_emails
+
+# Suites that mail, invite or query the mailbox itself need its own address.
+# It is read from the environment, never hardcoded (see tests/smoke/config.py);
+# unset, those suites stop with a clear error instead of guessing.
+EXCHANGE_SMOKE_SELF_EMAIL=you@example.com python -m tests.smoke.tests.test_email_lifecycle
 ```
 
 ## Warning
