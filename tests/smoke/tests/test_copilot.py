@@ -60,6 +60,22 @@ def _classify(tool: str, args: dict, parsed) -> bool:
             record(tool, args, "OK",
                    "not applicable: classic OWA backend, Copilot unreachable by design")
             return True
+
+        # status "no_response" means the pane was reached and the prompt
+        # submitted, but nothing in the pane ever changed. It carries a
+        # content-free structural sketch of the pane, which is the whole point
+        # of the run when it fails -- print it in full rather than let record()
+        # truncate it to 300 chars, since it's what a real selector gets written
+        # from. See browser_session._async_copilot_pane_structure.
+        if isinstance(parsed, dict) and parsed.get("status") == "no_response":
+            structure = parsed.get("pane_structure") or []
+            print(f"\n--- {tool}: pane structure ({len(structure)} nodes) ---")
+            for node in structure:
+                print(f"  {node}")
+            print("--- end pane structure ---\n")
+            record(tool, args, "TOOL_ERROR", f"no_response: {err}")
+            return False
+
         record(tool, args, "EXCEPTION" if "_exception" in str(parsed) else "TOOL_ERROR", err)
         return False
 

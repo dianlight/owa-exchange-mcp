@@ -66,7 +66,27 @@ def _start_detached() -> None:
         # process and isn't killed by Ctrl+C sent to it.
         creationflags = 0x00000008 | 0x00000200
     proc = subprocess.Popen(
-        ["exchange-mcp-server", "--transport", "http", "--port", str(PORT), "--show-browser"],
+        # Launch form matters here, and both obvious spellings are wrong.
+        #
+        # NOT the `exchange-mcp-server` console script: its sys.path[0] is the
+        # interpreter's Scripts/ directory, so an editable install resolves
+        # `exchange_mcp` to whatever path `pip install -e` recorded -- the main
+        # working tree. Run from a git worktree that silently tested the *main*
+        # tree instead of the one being edited, and the run looked normal.
+        #
+        # NOT `python -m exchange_mcp.server` either: that runs server.py as
+        # __main__, creating one FastMCP instance, and then server.py's tool
+        # imports (see its "Import tool modules" block) do
+        # `from exchange_mcp.server import mcp`, loading the module a *second*
+        # time under its real name and creating a second instance. Every
+        # @mcp.tool() registers on that one while main() serves the __main__
+        # one, so the server starts cleanly and answers "Unknown tool" to
+        # everything.
+        #
+        # `-c` with a canonical import gets both right: cwd (REPO_ROOT, below)
+        # is sys.path[0], and the module is imported once under its real name.
+        [sys.executable, "-c", "from exchange_mcp.server import main; main()",
+         "--transport", "http", "--port", str(PORT), "--show-browser"],
         cwd=str(REPO_ROOT),
         stdout=log,
         stderr=subprocess.STDOUT,
@@ -75,8 +95,8 @@ def _start_detached() -> None:
         close_fds=True,
     )
     PID_FILE.write_text(str(proc.pid), encoding="utf-8")
-    print(f"[server_manager] Launched exchange-mcp-server (pid={proc.pid}), "
-          f"logging to {LOG_FILE}", file=sys.stderr)
+    print(f"[server_manager] Launched exchange_mcp.server from {REPO_ROOT} "
+          f"(pid={proc.pid}), logging to {LOG_FILE}", file=sys.stderr)
 
 
 def status() -> str:

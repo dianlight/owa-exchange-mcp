@@ -980,11 +980,11 @@ per-row listing degradation and `get_email`'s typed error — while the read/wri
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 901 | `ask_copilot` | Generic delegator: sends a free-text prompt to Copilot's chat pane, optionally grounded against an email/event via a best-effort deep link | `tests/smoke/tests/test_copilot.py` | **KO (2026-09-11)** — root cause found by discovery capture `20260911-112708-e917` and fix landed, **re-run pending**. The original `Locator.wait_for` timeout on `[class*="Copilot" i][role]` is explained: Copilot's pane is a *cross-origin iframe* on `m365copilotapp.svc.cloud.microsoft`, which a main-frame `page.locator` can never match. `browser_session.py` now resolves the frame first. Still unverified against a live mailbox, and the capture never saw a free-text box in the pane (only preset prompt chips), so `_async_copilot_submit`'s typing path remains an inference | Dev |
-| 902 | `summarize_email_thread` | Ask Copilot to summarize an email thread and list action items | `tests/smoke/tests/test_copilot.py` | **KO (2026-09-11)** — same cross-origin-iframe root cause as #901; fix landed, re-run pending. Note the capture's Italian entry point for this operation was the chip "Riepiloga questo messaggio e-mail" | Dev |
-| 903 | `draft_reply_with_copilot` | Ask Copilot to draft a reply to an email per free-text instructions/tone; returns text only, doesn't send | `tests/smoke/tests/test_copilot.py` | **KO (2026-09-11)** — same root cause as #901; fix landed, re-run pending. The separate open question (whether drafting needs a live reply window rather than the chat pane) is now partly answered: the capture recorded the "Aiutami a rispondere" chip served *from the side panel*, not from a compose window | Dev |
-| 904 | `coach_draft` | Ask Copilot's compose coaching for feedback on a draft reply's tone/clarity | `tests/smoke/tests/test_copilot.py` | **KO (2026-09-11)** — same root cause as #901; fix landed, re-run pending. Weakest evidence of the five: **no Coaching interaction was captured at all**, so whether the affordance exists in this tenant is unknown, not merely unverified | Dev |
-| 905 | `meeting_prep` | Ask Copilot to prepare a briefing for an upcoming meeting (context, documents, action items) | `tests/smoke/tests/test_copilot.py` | **KO (2026-09-11)** — root cause found, fix landed, re-run pending, and the diagnosis inverted: the guessed event deep link `<origin>/calendar/item/<id>` is **correct** (the capture recorded exactly it), but a calendar *item* page carries no Copilot launcher. `copilot_ask` now retries the launcher on `/calendar/view/day` via `launcher_fallback_url` | Dev |
+| 901 | `ask_copilot` | Generic delegator: sends a free-text prompt to Copilot's chat pane, optionally grounded against an email/event via a best-effort deep link | `tests/smoke/tests/test_copilot.py` | **OK (2026-09-11)** — verified live on an isolated bearer-mode profile: returned exactly `PONG` for a ping prompt. Confirms the pane has a real free-text composer, which the discovery capture could not (it only ever saw preset chips). Responses now also carry `grounded`. | Stable |
+| 902 | `summarize_email_thread` | Ask Copilot to summarize an email thread and list action items | `tests/smoke/tests/test_copilot.py` | **OK (2026-09-11)** — verified live: returns a real summary of the named thread ("promotional email from BeyondTrust inviting..."). Needed the grounding fix as well as the iframe/frame ones — before it Copilot answered "non vedo alcun thread email" and ran a generic mailbox search, because navigating to an item does *not* put it in the pane's context. | Stable |
+| 903 | `draft_reply_with_copilot` | Ask Copilot to draft a reply to an email per free-text instructions/tone; returns text only, doesn't send | `tests/smoke/tests/test_copilot.py` | **OK (2026-09-11)** — verified live: returns several drafted reply options honouring `instructions` and `tone`. Free-text `instructions` are no longer an inference — the composer is real. Same grounding dependency as #902. | Stable |
+| 904 | `coach_draft` | Ask Copilot's compose coaching for feedback on a draft reply's tone/clarity | `tests/smoke/tests/test_copilot.py` | **OK (2026-09-11)** — verified live: returns substantive tone/clarity coaching. The capture's "no Coaching affordance at all" turned out not to matter: coaching is just a prompt. It was the *first* of the five to work, precisely because it already pasted its content (`draft_text`) into the prompt instead of relying on the pane to see the item. | Stable |
+| 905 | `meeting_prep` | Ask Copilot to prepare a briefing for an upcoming meeting (context, documents, action items) | `tests/smoke/tests/test_copilot.py` | **OK (2026-09-11)** — verified live: returns a briefing naming the actual event ("25 meeting correlati al tema «GECO | UnipolService...»"). The calendar-item page has no Copilot launcher, so the `launcher_fallback_url` path is exercised on every call and is confirmed working. | Stable |
 
 ### Tasks — [exchange_mcp/tools/tasks.py](exchange_mcp/tools/tasks.py) (6)
 
@@ -1203,25 +1203,60 @@ hold a request open for.
   of the 54 tools have actually been run against a real OWA mailbox since the
   browser-session rewrite. This document's "Manual QA / Status" column is a template for
   that log — fill it in as you verify each tool.
-- **Copilot module (#901-905): spike done, fixes landed, re-run outstanding.** ~~Needs a live
-  discovery spike~~ — capture `20260911-112708-e917` ran on 2026-09-11 and found the root
-  cause (the chat pane is a cross-origin iframe, so main-frame locators could never match);
-  `browser_session.py` and `owa_client.py` are corrected accordingly. See the two 2026-09-11
-  update sections in §1 for the full evidence. **What remains:** re-run
-  `tests/smoke/tests/test_copilot.py` against the live mailbox and update the 5 rows — the
-  fixes are derived from captured traffic, not yet verified by a passing test. Three specific
-  questions the capture could not answer, each needing a live check rather than more analysis:
-  (a) whether Copilot's generation rides a WebSocket, now recordable but not yet recorded;
-  (b) whether the side panel has a free-text box at all, or only preset prompt chips — the
-  capture only ever saw chip clicks; (c) whether #904's Coaching affordance exists in this
-  tenant, since no Coaching interaction was captured. Also still unexercised in practice:
-  `_async_copilot_wait_and_read`'s stability heuristic and its rate-limit/sign-in hint tables.
+- **Copilot module (#901-905): ~~spike done, fixes landed, re-run outstanding~~ — all five
+  pass live as of 2026-09-11.** Rows #901-905 are `OK`/`Stable` and `KNOWN_BUGGY_TOOLS` in
+  `server.py` is now empty. The iframe fix from capture `20260911-112708-e917` was necessary
+  but not sufficient; three more defects had to be fixed, and **two of them fail in ways that
+  look like success**, which is why the "fixes landed, just needs a re-run" framing above was
+  too optimistic:
+  - **The iframe is created and then replaced** during Copilot's own load. A detached frame
+    lingers in `page.frames` with a still-matching URL, so the grounding `page.goto()` left
+    every second call operating on the *previous* call's dead pane. One race, two
+    unrelated-looking symptoms: `Locator.wait_for: Frame was detached` on two tools and
+    "iframe was found but it has no textbox to type into" on another — the latter reading as
+    "this tenant has no composer", a much more alarming and entirely wrong conclusion.
+    `_async_copilot_frame` now skips detached frames and `_async_copilot_open_pane` polls
+    until the pane is *usable* (live, with a composer) rather than merely present.
+  - **`pane.inner_text()` is the whole panel, not the answer**, and the pane's pre-answer
+    chrome is already non-empty *and* already stable — so the completion heuristic returned
+    Copilot's own UI as `{"status": "ok"}` roughly three seconds in, before Copilot had
+    answered anything. Had the re-run happened without noticing this, all five rows would have
+    been marked verified on fake passes. `_async_copilot_wait_and_read` now takes a `baseline`
+    (pane text from before submitting) and refuses to call anything settled until the text has
+    changed from it; when nothing ever changes it returns `status: "no_response"` with a
+    content-free `pane_structure`, never a fabricated `partial_text`. `_copilot_answer_text`
+    isolates the reply: everything after the last `Copilot said:` marker, minus baseline lines
+    (which is what removes the composer placeholder), minus the pane's button labels (which is
+    what removes the follow-up suggestion chips — generated per answer, so no hint table can
+    cover them, but "it is a button" always holds). Covered by
+    `tests/unit/test_copilot_answer_text.py` (24 cases, no mailbox).
+  - **Opening an item does not ground the prompt.** The chat pane is a standalone conversation
+    and does not inherit what is on screen. Asked to summarise an open Inbox thread, Copilot
+    answered *"non vedo alcun thread email allegato o identificato nel tuo messaggio"* and ran
+    a generic mailbox search; its own follow-up chips offered *"I'll paste the email thread
+    here"*. `_ask` in `copilot.py` now pastes the item's subject and body into the prompt
+    (narrow `IdOnly` + `Subject`/`Body` shape, never `AllProperties`, so a meeting invite
+    can't break grounding) and reports `grounded` / `grounding_warning`. Telling detail: the
+    one tool that produced a useful answer before this was `coach_draft`, because it already
+    put its content in the prompt.
+  Two of the capture's three open questions are settled: the pane **does** have a free-text
+  composer (#903's `instructions` are no longer an inference), and **no** Coaching affordance
+  is needed — #904 is just a prompt. Still open: whether generation rides a WebSocket. The
+  recorder can see them now, but no capture has exercised it.
+  Also newly exercised and working: `launcher_fallback_url` (a calendar *item* page has no
+  Copilot launcher, so #905 takes that path on every call). Still unexercised: the
+  rate-limit and sign-in hint tables, which need those conditions to occur.
 - **`_copilot_item_url` hardcodes the `inbox` folder segment.** The capture confirmed the real
   mail deep link is folder-qualified (`/mail/<folder>/id/<id>`), so grounding Copilot on a
   message that lives outside the Inbox navigates to a URL for the wrong folder. A failed
   navigation is swallowed by design (falls through to an ungrounded ask), so this degrades
   the answer's grounding rather than erroring — which is also why it's easy to miss. Fixing
   it needs the item's parent folder, which the tools don't currently pass down.
+  **Reframed 2026-09-11:** much less severe than it looked, because navigation was never what
+  grounded the prompt in the first place (see the entry above). Grounding now comes from
+  pasting the item's text in, which is folder-agnostic. What remains is cosmetic — the browser
+  lands on a wrong-folder URL, so `--show-browser` shows the wrong thing and any future
+  feature that *does* depend on the item being open would inherit the bug.
 - **M365 Groups actions are unimplemented and were seen live.** Capture
   `20260911-112708-e917` recorded `GetUserUnifiedGroups`, `GetUnifiedGroupsSettings` and
   `UpdateUserGroupsSetConfiguration` — real EWS actions, no tool here calls any of them. Out
