@@ -34,7 +34,7 @@ Any variable above can also be placed in a gitignored `.env.local` next to `pypr
   - `capability_inventory.py` — What this server already implements, derived by `ast`-scanning `tools/*.py` and `owa_client.py` for transport call sites, plus PROJECT_STATUS.md for the ID-numbering state. No Playwright, unit-testable.
   - `capability_classify.py` — Verdicts and implementation proposals for a recorded capture. Pure logic; the domain knowledge lives in two keyword tables, correctable in one place like `auth_errors.py`'s.
   - `tools/` — Tool modules: email, calendar, categories, people, folders, availability, analytics, auth, copilot, tasks, discovery
-- `tests/unit/` — Pure-logic tests, no live mailbox / browser / `EXCHANGE_OWA_URL` needed (`python -m tests.unit.test_auth_errors`, `python -m tests.unit.test_recurrence_expansion`, `python -m tests.unit.test_capability_classify`, `python -m tests.unit.test_item_errors`, `python -m tests.unit.test_conversation_paging`). Separate from `tests/smoke/`, which is live-mailbox end-to-end.
+- `tests/unit/` — Pure-logic tests, no live mailbox / browser / `EXCHANGE_OWA_URL` needed (`python -m tests.unit.test_auth_errors`, `python -m tests.unit.test_recurrence_expansion`, `python -m tests.unit.test_capability_classify`, `python -m tests.unit.test_item_errors`, `python -m tests.unit.test_conversation_paging`, `python -m tests.unit.test_copilot_answer_text`). Separate from `tests/smoke/`, which is live-mailbox end-to-end.
 - `.claude/skills/owa-capability-discovery/` — Interactive skill driving the discovery tools: scope → record → classify → propose → implement. Its `references/implementation-checklist.md` is the "turn a proposal into a tool" procedure.
 
 ## Running
@@ -60,6 +60,7 @@ python -m tests.unit.test_recurrence_expansion
 python -m tests.unit.test_capability_classify
 python -m tests.unit.test_item_errors
 python -m tests.unit.test_conversation_paging
+python -m tests.unit.test_copilot_answer_text
 
 # Live-mailbox smoke tests: one module per tool group, run individually.
 # The harness starts its own server on 127.0.0.1:8765 if nothing is listening
@@ -146,7 +147,13 @@ and the `*_folder` tools cover it — except *creating* one, since `create_folde
 
 Discovery capture `20260911-112708-e917` also established that **no HTTP endpoint carries the prompt or the generated answer**, so there is no transport to migrate to and the UI automation is not a temporary shim. Whether generation rides a WebSocket is still open — the recorder was blind to WebSockets when that capture ran and now isn't. Two shapes it *did* confirm, both already correct in the code: the mail deep link `/mail/<folder>/id/<urlencoded id>` and the event deep link `/calendar/item/<urlencoded id>`. A calendar *item* page has no Copilot launcher, though, so `copilot_ask` takes a `launcher_fallback_url` (the calendar view) for events.
 
-Still unverified, and worth knowing before trusting a result: the fixes above are derived from captured traffic, not from a passing test — `tests/smoke/tests/test_copilot.py` has not been re-run since, and PROJECT_STATUS.md's rows #901-905 remain `KO`/`Dev`. The capture never saw a free-text input in the pane (only preset prompt chips), and never saw a Coaching affordance at all (#904).
+**All five tools pass `tests/smoke/tests/test_copilot.py` as of 2026-09-11** (rows #901-905 are `OK`/`Stable`, and `KNOWN_BUGGY_TOOLS` is now empty). Getting there needed three more fixes beyond the iframe one, each of which the capture could not have predicted — and two of them fail in ways that *look like* success, which is why they matter more than the selector work:
+
+- **The iframe is created and then replaced** during Copilot's own load, so resolving it once returns a corpse. `_async_copilot_open_pane` polls until the frame is *usable* (live, with a composer in it) rather than merely present, and `_async_copilot_frame` skips detached frames — a detached frame lingers in `page.frames` with a matching URL, so the grounding `page.goto()` left every second call reading the previous call's dead pane. It surfaced as `Locator.wait_for: Frame was detached` on one tool and "no textbox to type into" on another; one race, two unrelated-looking bugs.
+- **`pane.inner_text()` is the whole panel, not the answer**, and the pane's pre-answer chrome is already non-empty *and* already stable — so the completion heuristic returned Copilot's UI as `{"status": "ok"}` about three seconds in, before Copilot had answered at all. `_async_copilot_wait_and_read` therefore takes a `baseline` (the pane's text from before submitting) and will not call anything settled until the text has changed from it; if nothing ever changes it returns `status: "no_response"` with a content-free `pane_structure`, never a fake partial. `_copilot_answer_text` then isolates the reply: everything after the last `Copilot said:` marker, minus baseline lines (which is what removes the composer's own placeholder), minus the pane's button labels (which is what removes the follow-up suggestion chips — their wording is generated per answer, so no hint table can cover them, but "it is a button" always holds).
+- **Opening an item does not ground the prompt.** The chat pane is a standalone conversation that does not inherit what is on screen: asked to summarise an open Inbox thread, Copilot answered "non vedo alcun thread email allegato o identificato nel tuo messaggio" and ran a generic mailbox search. `_ask` in `copilot.py` now pastes the item's subject and body *into the prompt* (narrow `IdOnly` + `Subject`/`Body` shape, never `AllProperties`, so a meeting invite doesn't break grounding) and reports `grounded` / `grounding_warning`. Note which tool worked first: `coach_draft`, the one that already put its content in the prompt.
+
+Two of the capture's open questions are now settled: the pane **does** have a free-text composer, and **no** Coaching affordance is needed (#904 is just a prompt). Still open: whether generation rides a WebSocket — the recorder can see them now but no capture has exercised it.
 
 **Capability discovery (`tools/discovery.py`, module 11)**: the only tool module that doesn't
 touch a mailbox. It exists because every gap closed in this codebase so far was found the same

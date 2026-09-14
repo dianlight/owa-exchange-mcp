@@ -118,6 +118,117 @@ _COPILOT_STOP_HINTS = (
     "parar",        # pt
 )
 
+# Interactive roles whose aria-label is an affordance name ("Send", "Interrompi
+# la generazione") rather than content. Only these get their label recorded by
+# _async_copilot_pane_structure - a label on a message bubble can *be* the
+# generated answer, and a structural diagnostic must not carry mailbox content.
+_COPILOT_LABEL_SAFE_ROLES = frozenset({
+    "button", "textbox", "tab", "menuitem", "link", "combobox", "searchbox",
+})
+
+
+# Role markers Copilot's chat transcript prints before each turn. Observed live
+# on 2026-09-11 (it-IT tenant) as literal English "You said:" / "Copilot said:"
+# next to a *localised* disclaimer, so these appear not to be translated - but
+# that is one tenant's evidence, not a guarantee, hence a table rather than a
+# literal. Everything after the last answer marker is the newest reply.
+_COPILOT_ANSWER_MARKERS = (
+    "copilot said:",
+    "copilot ha detto:",   # it
+    "copilot a dit :",     # fr
+    "copilot dijo:",       # es
+    "copilot sagte:",      # de
+)
+
+# Trailing "AI-generated content may be incorrect"-style disclaimer. This one *is*
+# localised (observed: "Il contenuto generato dall'IA potrebbe...").
+_COPILOT_DISCLAIMER_HINTS = (
+    "ai-generated content",
+    "ai generated content",
+    "contenuto generato dall",   # it
+    "contenu généré par l",      # fr
+    "contenido generado por",    # es
+    "ki-generierte inhalte",     # de
+)
+
+# Lines that are pure transcript furniture rather than message text: the bare
+# product name printed next to the avatar, the "You said:" marker, and date
+# separators. Matched exactly (case-insensitively) so a message that merely
+# mentions Copilot is untouched.
+_COPILOT_CHROME_LINES = frozenset({
+    "copilot", "you said:", "you said", "oggi", "today", "aujourd'hui",
+    "hoy", "heute", "hoje",
+})
+
+
+def _copilot_answer_text(
+    baseline: str, text: str, prompt: str = "", chrome_lines: set[str] | None = None
+) -> str:
+    """Isolate Copilot's answer from the pane's full text.
+
+    `pane.inner_text()` is the whole iframe: date separator, role markers, the
+    echoed prompt, the answer, and a footer disclaimer. Returning all of that as
+    a tool's `text` reports Copilot's own UI as its answer - the first live run
+    produced exactly that:
+
+        "Oggi\\nYou said:\\nCopilot said:\\nCopilot\\nPONG\\nIl contenuto generato..."
+
+    when the answer was the single word "PONG".
+
+    Two strategies, in order. The transcript's own role marker is preferred:
+    everything after the *last* "Copilot said:" is the newest reply, which is
+    exactly what a caller wants and survives a multi-turn pane. If no marker is
+    recognised (unlisted localisation, or a redesigned pane), fall back to
+    diffing against `baseline` - the pane's text from before submitting - which
+    needs no knowledge of the transcript's wording.
+
+    Either way the result is stripped of transcript furniture and the trailing
+    disclaimer, and falls back to the full text rather than "" if that leaves
+    nothing: an empty string would read as a successful empty answer, whereas
+    the full text is at least inspectable.
+
+    `chrome_lines` is for furniture that can only be identified structurally -
+    in practice the pane's button labels, gathered by the caller. Copilot renders
+    follow-up suggestion chips *after* the answer ("Start a new question",
+    "Summarize a topic", "Draft a message" - observed live 2026-09-11), so they
+    are neither in `baseline` nor before the answer marker, and their wording is
+    generated per answer rather than fixed. They are buttons, though, which is a
+    property no hint table can go stale on.
+    """
+    raw_lines = [line.strip() for line in text.splitlines()]
+    prompt_lines = {line.strip() for line in prompt.splitlines() if line.strip()}
+    extra_chrome = {line.strip() for line in (chrome_lines or set()) if line.strip()}
+
+    marker_at = None
+    for i, line in enumerate(raw_lines):
+        lowered = line.lower()
+        if any(lowered.startswith(m) for m in _COPILOT_ANSWER_MARKERS):
+            marker_at = i
+
+    # Lines already on screen before submitting are furniture by definition.
+    # This is what removes the composer's own placeholder ("Invia un messaggio a
+    # Copilot" on an it-IT tenant), which sits *below* the transcript and so
+    # survives the marker cut - and it removes it without a table of localised
+    # placeholder strings, because the placeholder was in `baseline` already.
+    seen = {line.strip() for line in baseline.splitlines() if line.strip()}
+
+    if marker_at is not None:
+        candidate = raw_lines[marker_at + 1:]
+    else:
+        candidate = raw_lines
+
+    answer = [
+        line for line in candidate
+        if line
+        and line not in seen
+        and line not in extra_chrome
+        and line.lower() not in _COPILOT_CHROME_LINES
+        and line not in prompt_lines
+        and not any(hint in line.lower() for hint in _COPILOT_DISCLAIMER_HINTS)
+    ]
+
+    return "\n".join(answer).strip() or text.strip()
+
 
 class SessionExpiredError(Exception):
     """Raised when the OWA session has expired (HTTP 401/440 or HTML redirect)."""
@@ -867,18 +978,34 @@ class BrowserSession:
     # localised - see _COPILOT_STOP_HINTS.
 
     async def _async_copilot_frame(self, page, timeout: float):
-        """Return the Copilot iframe's Frame, or None if it hasn't appeared yet.
+        """Return a *live* Copilot iframe Frame, or None if none has appeared yet.
 
         Polls instead of matching once: the iframe is created after the
         launcher click and its document load is a separate navigation, so it
         can be attached-but-blank for a moment.
+
+        The `is_detached()` check is not defensive padding - it is the fix for
+        the second live failure mode this module hit. Every grounded tool calls
+        `page.goto(nav_url)` first, which tears down the previous call's Copilot
+        iframe, but a detached Frame stays in `page.frames` for a while and its
+        `.url` still matches. Matching on URL alone therefore handed back the
+        dead frame from the *previous* tool call, and the run failed with
+        "Locator.wait_for: Frame was detached" on every second call - or, when
+        the corpse still had a body element, with "no textbox to type into",
+        which looks like a completely different (and much more alarming) bug.
         """
         deadline = time.time() + timeout
         while time.time() < deadline:
             for frame in page.frames:
                 url = (frame.url or "").lower()
-                if any(hint in url for hint in _COPILOT_FRAME_HOST_HINTS):
-                    return frame
+                if not any(hint in url for hint in _COPILOT_FRAME_HOST_HINTS):
+                    continue
+                try:
+                    if frame.is_detached():
+                        continue
+                except Exception:
+                    continue
+                return frame
             await asyncio.sleep(0.5)
         return None
 
@@ -896,9 +1023,39 @@ class BrowserSession:
             return None
         return frame.locator("body")
 
+    @staticmethod
+    async def _async_copilot_pane_usable(pane) -> bool:
+        """Is this pane locator backed by a live frame with a composer in it?
+
+        The fast path below skips the launcher click when a pane is already
+        open, and it used to accept any pane whose body existed. That is not
+        enough: a frame torn down by the grounding navigation can still answer
+        `count()` while being useless, so the skip has to be justified by the
+        one thing the caller actually needs next - somewhere to type.
+        """
+        try:
+            if not await pane.count():
+                return False
+            return await pane.get_by_role("textbox").count() > 0
+        except Exception:
+            return False
+
     async def _async_copilot_open_pane(self, page, timeout: float):
+        """Open the Copilot pane and return a locator rooted in a *usable* frame.
+
+        "Usable" (a live frame containing a composer) rather than merely
+        "present", and reached by polling rather than one resolve, because
+        Copilot's pane is created and then **replaced** during its own load: the
+        iframe that exists a moment after the launcher click is not the one that
+        ends up serving the chat. Resolving once and trusting it produced two
+        different-looking live failures from that single race - a
+        `Locator.wait_for: Frame was detached` when the first frame died while
+        being waited on, and a "no textbox to type into" when the replacement
+        had not rendered its composer yet. Neither was a selector problem, which
+        is why guessing at better selectors could not have fixed them.
+        """
         pane = await self._async_copilot_locate_pane(page, timeout=1)
-        if pane is not None and await pane.count():
+        if pane is not None and await self._async_copilot_pane_usable(pane):
             return pane
 
         launcher = page.get_by_role("button", name=re.compile("copilot", re.I))
@@ -911,17 +1068,38 @@ class BrowserSession:
             )
         await launcher.first.click(timeout=timeout * 1000)
 
-        pane = await self._async_copilot_locate_pane(page, timeout=timeout)
-        if pane is None:
+        deadline = time.time() + timeout
+        last_pane = None
+        while time.time() < deadline:
+            pane = await self._async_copilot_locate_pane(page, timeout=2)
+            if pane is not None:
+                last_pane = pane
+                if await self._async_copilot_pane_usable(pane):
+                    return pane
+            await asyncio.sleep(0.5)
+
+        if last_pane is None:
             hosts = ", ".join(_COPILOT_FRAME_HOST_HINTS)
             raise RuntimeError(
                 "Clicked the Copilot launcher but no Copilot iframe appeared "
-                f"within {timeout}s (looked for a frame whose URL contains one "
-                f"of: {hosts}). Either the pane host changed - update "
+                f"within {timeout}s (looked for a live frame whose URL contains "
+                f"one of: {hosts}). Either the pane host changed - update "
                 "_COPILOT_FRAME_HOST_HINTS - or the pane failed to load."
             )
-        await pane.wait_for(state="attached", timeout=timeout * 1000)
-        return pane
+
+        # A frame kept appearing but never offered anywhere to type. That is the
+        # one case where "the side panel only has preset prompt chips on this
+        # tenant" is a real possibility rather than a race, so hand back the
+        # structure needed to write a chip-clicking path instead of a bare
+        # timeout.
+        structure = await self._async_copilot_pane_structure(last_pane)
+        raise RuntimeError(
+            f"A Copilot iframe was present on {page.url} but never offered a "
+            f"textbox within {timeout}s. If this is reproducible the pane may "
+            f"only offer preset prompt chips here, and a chip-clicking path "
+            f"belongs in _async_copilot_submit. Pane structure "
+            f"(content-free): {structure}"
+        )
 
     async def _async_copilot_submit(self, pane, prompt: str, timeout: float) -> None:
         """Type a free-text prompt into the pane's input box and send it.
@@ -943,20 +1121,102 @@ class BrowserSession:
         await input_box.fill(prompt)
         await input_box.press("Enter")
 
-    async def _async_copilot_wait_and_read(self, pane, timeout: float) -> dict:
+    async def _async_copilot_pane_structure(self, pane, limit: int = 40) -> list[dict]:
+        """A content-free structural sketch of the pane, for a no-response run.
+
+        Records tag / role / test-id / class and text *length* - never text. A
+        Copilot answer is mailbox-derived content and this ends up in a
+        smoke-test log; the discovery recorder draws exactly the same line
+        (tag/role/label, never values). aria-label is recorded only for the
+        interactive roles in _COPILOT_LABEL_SAFE_ROLES, where it is an
+        affordance name rather than a message.
+
+        This exists because every remaining unknown in this module - is there a
+        free-text box, is there a Coaching affordance, which node holds the
+        answer - is a question about the pane's DOM that guessing has already
+        failed to answer once.
+        """
+        script = """
+        (root, args) => {
+          const out = [];
+          const safe = new Set(args.safeRoles);
+          const walk = (el, depth) => {
+            if (out.length >= args.limit) return;
+            const role = el.getAttribute('role');
+            const tid = el.getAttribute('data-testid') || el.getAttribute('data-test-id');
+            const label = el.getAttribute('aria-label');
+            const tag = el.tagName.toLowerCase();
+            const interactive = tag === 'textarea' || tag === 'input' || tag === 'button';
+            if (role || tid || label || interactive) {
+              const entry = {
+                depth: depth,
+                tag: tag,
+                role: role || null,
+                testid: tid || null,
+                text_len: (el.innerText || '').trim().length,
+                cls: (el.className || '').toString().slice(0, 60) || null,
+              };
+              if (label) {
+                entry.label = safe.has(role || '') || interactive
+                  ? label.slice(0, 60)
+                  : '<omitted: non-interactive role>';
+              }
+              out.push(entry);
+            }
+            for (const child of el.children) walk(child, depth + 1);
+          };
+          walk(root, 0);
+          return out;
+        }
+        """
+        try:
+            return await pane.evaluate(
+                script,
+                {"limit": limit, "safeRoles": sorted(_COPILOT_LABEL_SAFE_ROLES)},
+            )
+        except Exception as exc:
+            return [{"error": f"could not read pane structure: {exc}"}]
+
+    @staticmethod
+    async def _async_copilot_button_labels(pane) -> set[str]:
+        """Visible button labels in the pane, as chrome for _copilot_answer_text.
+
+        Read *after* generation settles, because the follow-up suggestion chips
+        Copilot appends to an answer only exist by then - and they are the reason
+        this is needed: their wording is generated per answer, so no hint table
+        can cover them, but "it is a button" always holds.
+        """
+        try:
+            return {t.strip() for t in await pane.get_by_role("button").all_inner_texts() if t.strip()}
+        except Exception:
+            return set()
+
+    async def _async_copilot_wait_and_read(
+        self, pane, timeout: float, baseline: str = "", prompt: str = ""
+    ) -> dict:
         """Poll the pane until generation settles, a rate-limit banner appears, or timeout.
 
-        "Settled" is approximated as: no visible "Stop generating"-style
-        control, and the pane's text has been unchanged for two consecutive
-        polls. Two rather than one because the stop-button signal is not
-        reliable - its accessible name is localised (_COPILOT_STOP_HINTS is a
-        best-effort table), and on a language we haven't listed the check
-        silently degrades to text-stability alone, where a single mid-stream
-        pause would otherwise be read as completion.
+        "Settled" is approximated as: the pane's text differs from `baseline`,
+        no visible "Stop generating"-style control, and the text has been
+        unchanged for two consecutive polls. Two rather than one because the
+        stop-button signal is not reliable - its accessible name is localised
+        (_COPILOT_STOP_HINTS is a best-effort table), and on a language we
+        haven't listed the check degrades to text-stability alone, where a single
+        mid-stream pause would otherwise be read as completion.
+
+        `baseline` - the pane's text from *before* the prompt was submitted - is
+        what makes this verdict trustworthy, and it was missing. The pane's own
+        greeting and prompt chips are already non-empty and already stable, so
+        with no visible stop button (generation takes a moment to start) the
+        third poll returned that chrome as {"status": "ok"} about three seconds
+        in. That is worse than a failure: it would have marked #901-905 verified
+        while Copilot had not answered at all.
         """
         deadline = time.time() + timeout
+        baseline = (baseline or "").strip()
         last_text = ""
         stable_polls = 0
+        saw_change = False
         stop_button = pane.get_by_role(
             "button", name=re.compile("|".join(_COPILOT_STOP_HINTS), re.I)
         )
@@ -970,18 +1230,53 @@ class BrowserSession:
             if any(hint in lowered for hint in _COPILOT_SIGNIN_HINTS):
                 raise SessionExpiredError("Copilot pane shows a sign-in prompt; session likely expired.")
 
+            if text and text != baseline:
+                saw_change = True
+
             still_generating = await stop_button.count() > 0
-            if not still_generating and text and text == last_text:
+            if saw_change and not still_generating and text and text == last_text:
                 stable_polls += 1
                 if stable_polls >= 2:
-                    return {"status": "ok", "text": text}
+                    return {
+                        "status": "ok",
+                        "text": _copilot_answer_text(
+                            baseline, text, prompt,
+                            await self._async_copilot_button_labels(pane),
+                        ),
+                    }
             else:
                 stable_polls = 0
 
             last_text = text
             await asyncio.sleep(1)
 
-        return {"status": "timeout", "partial_text": last_text}
+        if not saw_change:
+            # The pane never changed, so there is no partial answer to hand back.
+            # Reporting one as {"status": "timeout", "partial_text": <chrome>}
+            # would return Copilot's UI as a result - and the smoke test counts
+            # a non-empty partial_text as a pass, so this has to be its own
+            # status, with the structure needed to fix it.
+            return {
+                "status": "no_response",
+                "error": (
+                    f"The Copilot pane was reached and the prompt was submitted, but "
+                    f"nothing in the pane changed within {timeout:.0f}s. Either the "
+                    f"prompt never actually reached Copilot (the textbox found by "
+                    f"_async_copilot_submit may not be the composer) or the answer "
+                    f"renders somewhere pane.inner_text() does not see. "
+                    f"pane_structure below is a content-free sketch for writing a "
+                    f"real selector."
+                ),
+                "pane_structure": await self._async_copilot_pane_structure(pane),
+            }
+
+        return {
+            "status": "timeout",
+            "partial_text": _copilot_answer_text(
+                baseline, last_text, prompt,
+                await self._async_copilot_button_labels(pane),
+            ),
+        }
 
     async def _async_copilot_ask(
         self, prompt: str, nav_url: str | None, timeout: float, launcher_fallback_url: str | None = None
@@ -1019,8 +1314,20 @@ class BrowserSession:
                 await page.goto(launcher_fallback_url, wait_until="networkidle", timeout=15000)
                 pane = await self._async_copilot_open_pane(page, timeout=10)
 
+            # Snapshot the pane *before* submitting: this is what tells
+            # _async_copilot_wait_and_read the difference between Copilot's
+            # answer and Copilot's own UI, and between a real timeout and a
+            # prompt that never landed. Read it here rather than inside the
+            # wait, which by then cannot distinguish the two.
+            try:
+                baseline = (await pane.inner_text()).strip()
+            except Exception:
+                baseline = ""
+
             await self._async_copilot_submit(pane, prompt, timeout=10)
-            return await self._async_copilot_wait_and_read(pane, timeout=timeout)
+            return await self._async_copilot_wait_and_read(
+                pane, timeout=timeout, baseline=baseline, prompt=prompt
+            )
 
     def copilot_ask(
         self,
