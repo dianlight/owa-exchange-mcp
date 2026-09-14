@@ -188,18 +188,34 @@ def get_folders(
 def create_folder(
     name: str,
     parent_folder_id: str = "msgfolderroot",
+    folder_class: str = "IPF.Note",
     ctx: Context = None,
 ) -> str:
-    """Create a new mail folder.
+    """Create a new folder (mail folder by default, or a task / To Do list).
 
     Args:
         name: Display name for the new folder.
         parent_folder_id: Parent folder to create under.
             Defaults to "msgfolderroot" (top-level). Can be a
             distinguished folder name or a raw folder ID.
+        folder_class: Exchange folder class, which decides what kind of
+            folder this is. Defaults to "IPF.Note" (a mail folder). Use
+            "IPF.Task" together with `parent_folder_id="tasks"` to create a
+            **Microsoft To Do list** — the task tools can then address it by
+            name (`get_tasks`/`create_task`'s `task_folder`). Other Exchange
+            classes ("IPF.Appointment", "IPF.Contact", "IPF.StickyNote") are
+            passed through untouched; this server has no tools for their
+            contents. Two things Exchange will not warn about: a class is
+            immutable once set (there is no `update` for it — delete and
+            recreate instead), and a value whose prefix isn't one of the
+            predefined classes is silently treated as "IPF.Note", so a typo
+            yields a working *mail* folder rather than an error. Suffixed
+            values are fine and keep their prefix's behaviour
+            ("IPF.Task.Todo" is a task folder), which is why both spellings
+            work here — prefer the plain "IPF.Task".
 
     Returns:
-        JSON object with the created folder's id and name.
+        JSON object with the created folder's id, name and folder_class.
     """
     client = _get_client(ctx)
 
@@ -216,7 +232,7 @@ def create_folder(
                 {
                     "__type": "Folder:#Exchange",
                     "DisplayName": name,
-                    "FolderClass": "IPF.Note",
+                    "FolderClass": folder_class,
                 }
             ],
         },
@@ -234,6 +250,11 @@ def create_folder(
                 "success": True,
                 "name": name,
                 "id": folder.get("FolderId", {}).get("Id", ""),
+                # Echo what the server stored, not what was asked for: a
+                # CreateFolder response carries the folder it actually made,
+                # so a silently-coerced class shows up here rather than
+                # being discovered later by a tool that can't see the folder.
+                "folder_class": folder.get("FolderClass", folder_class),
             })
 
     return json.dumps({"error": "Unexpected response", "raw": str(data)})

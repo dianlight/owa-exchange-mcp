@@ -140,8 +140,13 @@ so a live-test correction is one line, and task `DueDate`/`StartDate` are writte
 day off. `Status`, `PercentComplete` and `CompleteDate` are three spellings of the same state and
 the last one Exchange processes wins, so never send two in one request. There is no task-list
 (folder) CRUD here: a To Do list is a plain folder, so `get_folders(parent_folder_id="tasks")`
-and the `*_folder` tools cover it — except *creating* one, since `create_folder` hardcodes
-`FolderClass: "IPF.Note"` (see PROJECT_STATUS.md §4).
+and the `*_folder` tools cover it, *including* creating one — `create_folder(name=…,
+parent_folder_id="tasks", folder_class="IPF.Task")`. Note what that argument has to defend
+against: EWS reads a `FolderClass` as a **prefix** and silently treats any unrecognised one as
+`IPF.Note` instead of erroring, and the class is immutable afterwards, so a typo produces a
+working *mail* folder whose only symptom is `get_tasks` finding nothing in a folder that
+plainly exists. `create_folder` therefore returns the class read back from the server's own
+`CreateFolder` response rather than echoing the argument.
 
 **Copilot tools (`tools/copilot.py`)**: unlike every other tool module, Copilot has no documented API to call — there is no EWS action, no REST endpoint, nothing to POST. These tools instead drive Copilot's own chat pane inside the modern Outlook web client directly via Playwright UI automation (`BrowserSession`'s Copilot section: `_async_copilot_locate_pane`/`_open_pane`/`_submit`/`_wait_and_read`/`_async_copilot_ask`/`copilot_ask()`), the same "automate OWA's own web UI" escape hatch already used for the calendar category write-path (`_set_event_categories`, see PROJECT_STATUS.md #208/#209) when no API exists. Only available in `bearer` auth mode (modern Outlook) — raises `BearerModeRequiredError` on classic canary-cookie OWA, the same exception `find_people`/`post_substrate` use for their own modern-backend-only surfaces. **The one thing to know before touching this module: the chat pane is a cross-origin iframe.** OWA runs on the mailbox host; the pane is served from `m365copilotapp.svc.cloud.microsoft` (`_COPILOT_FRAME_HOST_HINTS`). A Playwright `page.locator(...)` only ever searches the main frame, so *any* selector written against the page — however well guessed — cannot match a node in the pane. That is what made all five tools fail their first live run, and it's why `_async_copilot_frame` resolves the frame before anything else and every other helper takes a locator already rooted inside it. The launch button is the one exception: it's genuine main-frame OWA chrome, matched on the accessible name "Copilot" (which Microsoft doesn't translate — the prompts inside the pane *are* localised, hence `_COPILOT_STOP_HINTS`).
 

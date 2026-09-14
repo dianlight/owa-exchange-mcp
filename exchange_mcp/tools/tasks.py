@@ -18,6 +18,11 @@ Two things it deliberately does *not* do:
   `get_folders(parent_folder_id="tasks")` already enumerates them and the
   `*_folder` tools in [folders.py](folders.py) already create/rename/
   delete them. `task_folder` below accepts whatever those return.
+  Creating one means `create_folder(name=..., parent_folder_id="tasks",
+  folder_class="IPF.Task")` — the class argument is not optional in
+  practice, because `create_folder` defaults to `IPF.Note` and a mail
+  folder under the tasks root holds no Task items at all (`get_tasks`
+  reports whatever it finds there as `skipped_non_task_items`).
 - **No flagged-email tasks.** To Do's "Flagged Email" list is a *view*
   over flagged messages, not Task items in the Tasks folder, so it isn't
   visible to `FindItem` here. Use `set_email_flag` (#115) for those.
