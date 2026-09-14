@@ -35,6 +35,7 @@ Any variable above can also be placed in a gitignored `.env.local` next to `pypr
   - `capability_classify.py` — Verdicts and implementation proposals for a recorded capture. Pure logic; the domain knowledge lives in two keyword tables, correctable in one place like `auth_errors.py`'s.
   - `tools/` — Tool modules: email, calendar, categories, people, folders, availability, analytics, auth, copilot, tasks, discovery
 - `tests/unit/` — Pure-logic tests, no live mailbox / browser / `EXCHANGE_OWA_URL` needed. Run them all with `python -m tests.unit` (`tests/unit/__main__.py` **discovers** every `test_*.py` and calls its `main()`, so a new suite is picked up with no list to update — that's what CI runs), or one at a time as `python -m tests.unit.<suite>`. Every suite must expose `main() -> bool`; one that doesn't is reported as a failure, not skipped. Separate from `tests/smoke/`, which is live-mailbox end-to-end and can't run unattended.
+- `tests/smoke/` — Live-mailbox end-to-end suites, one module per tool group, run individually (see "Running" below). Shared helpers: `server_manager.py` (start/reuse the HTTP server, and say loudly which it did), `mcp_client.py` (`session()`/`call()`), `results.py` (`record()` → `.state/results.jsonl`), and `config.py` — the **one** place the mailbox's own address is resolved, from `EXCHANGE_SMOKE_SELF_EMAIL`. No test module may hardcode a real address: this repository is public.
 - `.github/workflows/ci.yml` — CI: `pip install -e .` then `python -m tests.unit`, on every push and PR, across Python 3.10-3.14 plus one Windows job. No secrets, no mailbox, and deliberately **no** `playwright install chromium` — Playwright's Python package is needed to *import* the tool modules, but no unit test launches a browser. `tests/smoke/` is intentionally not in CI.
 - `.claude/skills/owa-capability-discovery/` — Interactive skill driving the discovery tools: scope → record → classify → propose → implement. Its `references/implementation-checklist.md` is the "turn a proposal into a tool" procedure.
 
@@ -78,11 +79,29 @@ python -m tests.unit.test_folder_resolution
 python -m tests.smoke.tests.test_copilot
 EXCHANGE_SMOKE_PORT=8767 python -m tests.smoke.tests.test_copilot
 
+# Any suite that mails/invites/queries the mailbox itself needs its own SMTP
+# address in EXCHANGE_SMOKE_SELF_EMAIL — it is deliberately not in the source
+# (public repo; see tests/smoke/config.py). Unset, those suites stop before
+# their first tool call with a recorded TOOL_ERROR naming the variable, rather
+# than guessing an address and mailing a stranger. Export it once per shell:
+export EXCHANGE_SMOKE_SELF_EMAIL=you@example.com
+python -m tests.smoke.tests.test_email_lifecycle
+EXCHANGE_SMOKE_SELF_EMAIL=you@example.com python -m tests.smoke.tests.test_find_person
 # A suite that mails the mailbox itself takes its address from the
 # environment instead of a constant (this repo is public):
 EXCHANGE_SMOKE_SELF_EMAIL=you@example.com \
     python -m tests.smoke.tests.test_move_email_custom_folder
 ```
+
+The suites that require `EXCHANGE_SMOKE_SELF_EMAIL` are `test_email_lifecycle`,
+`test_email_category_tagging`, `test_calendar_lifecycle`, `test_calendar_category_tagging`,
+`test_folder_lifecycle`, `test_move_email_nested_folder`, `test_find_person`,
+`test_find_meeting_time` and `test_get_meeting_stats`. `test_email_flag` prefers it too but
+can fall back to reading the address off Sent Items. The lookup lives in exactly one place —
+`tests/smoke/config.py` (`require_self_email()` / `discover_self_email()`) — so a new suite
+that needs the address imports it from there rather than adding another `os.environ.get`,
+and **never** reintroduces a literal address: that is how one got committed to a public
+repository in the first place.
 
 **Never start the server with `python -m exchange_mcp.server`** — it registers *zero* tools and
 every call fails `Unknown tool`. `-m` loads `server.py` under the name `__main__`, so when each

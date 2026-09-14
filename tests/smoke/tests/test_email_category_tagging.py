@@ -11,18 +11,22 @@ they never touch the master category list (see categories.py).
 Repeatable: the subject/category tags include a timestamp, so re-runs
 never collide with a leftover message from a prior run.
 
+Needs the mailbox's own address in $EXCHANGE_SMOKE_SELF_EMAIL (see
+tests/smoke/config.py for why it isn't written down here).
+
 Run standalone:
-    python -m tests.smoke.tests.test_email_category_tagging
+    EXCHANGE_SMOKE_SELF_EMAIL=you@example.com \
+        python -m tests.smoke.tests.test_email_category_tagging
 """
 
 import asyncio
 import sys
 import time
 
+from tests.smoke.config import require_self_email
 from tests.smoke.mcp_client import call, run, session
 from tests.smoke.results import is_error_payload, record
 
-SELF_EMAIL = "lucio.tarantino@unipol.it"
 TAG = f"[email-cat-smoke-{int(time.time())}]"
 SUBJECT = f"{TAG} Exchange MCP category smoke test"
 CAT_A = f"SmokeTestCatA-{int(time.time())}"
@@ -45,10 +49,14 @@ async def _find_item_id(s, folder: str, subject_substr: str):
 
 
 async def main() -> bool:
+    self_email = require_self_email("send_email (setup)")
+    if not self_email:
+        return False
+
     async with session() as s:
         # --- setup: send a disposable tagged email to self ---
         send_args = {
-            "to": SELF_EMAIL,
+            "to": self_email,
             "subject": SUBJECT,
             "body": "Automated smoke-test message for category tagging. Safe to ignore/delete.",
         }

@@ -392,7 +392,7 @@ isn't broken, is unaffected. `get_meeting_stats`'s `_resolve_to_email()`
 ([analytics.py](exchange_mcp/tools/analytics.py)) got the same fallback.
 
 Verified live end-to-end through the actual MCP tool call (dev server on :8765,
-`test_find_person.py`/`test_get_meeting_stats.py`): `find_person("lucio.tarantino@unipol.it")`
+`test_find_person.py`/`test_get_meeting_stats.py`): `find_person(<the mailbox's own address>)`
 now returns real directory data (name, email, job title, department, company, office,
 phone, alias) instead of a guaranteed 500, and `get_meeting_stats` now resolves the
 name/email correctly (the `GetUserAvailability` 500 it also reports is the
@@ -986,6 +986,50 @@ port — on a machine running production plus several worktree sessions, that ma
 Announced once per process, and every lookup is best-effort: pointed at a listening non-MCP
 port it reports "could not determine" instead of raising.
 
+**Update 2026-09-14 — the smoke suite no longer carries a mailbox address in source.** Eight
+modules opened with a literal `SELF_EMAIL = "<a real person>@<a real company>"`, and this
+repository is public on GitHub — so one personal address was committed to a public
+destination eight times over, and every one of those modules also only worked against that
+one mailbox. `test_find_person.py` carried the same address a ninth time, as its
+`ARGS["query"]`.
+
+All nine now resolve it at runtime through one shared place,
+[tests/smoke/config.py](tests/smoke/config.py): `require_self_email(label)` reads
+`$EXCHANGE_SMOKE_SELF_EMAIL` and, when it is unset, `record()`s a `TOOL_ERROR` row naming the
+variable so `main()` can `return False` — a *recorded, non-zero-exit* failure rather than an
+exception, because the suite's contract is that every outcome lands in
+`.state/results.jsonl`. `discover_self_email()` is the same lookup plus the Sent-Items
+read-back fallback that `test_email_flag.py` (the module that already did this correctly, and
+the pattern the rest was migrated onto) had written locally; it moved into `config.py` and
+that module now imports it. Nothing about what any suite *asserts* changed.
+
+Three details are worth keeping, because each is a way this could have been done wrong:
+
+- **Strict is the default, discovery is opt-in.** These suites send mail and create calendar
+  items. An address inferred wrongly isn't a failed test, it's a message delivered to a
+  stranger — so no default value, and no silent fallback except in the one module that
+  already had a *sound* one (Sent Items' `from` is by definition this mailbox).
+- **`ARGS` had to move inside `main()`** in `test_find_person.py`, `test_find_meeting_time.py`
+  and `test_get_meeting_stats.py`: they built their argument dict at *import* time, where a
+  missing-config failure cannot be recorded at all (the module fails before `record()` is
+  reachable, and an import-time `raise` writes no row).
+- **The check runs before the first mutation, not where the address is first used.**
+  `test_folder_lifecycle.py` and `test_move_email_nested_folder.py` need it only after
+  creating disposable folders; bailing out there would leave those folders behind for manual
+  cleanup, so both check up front.
+
+Verified without a mailbox: with `EXCHANGE_SMOKE_SELF_EMAIL` unset, all nine `main()`s return
+`False` after recording the missing-config row and **before** `ensure_server()` is ever
+called (no server, no network); a `symtable` pass confirms `self_email` is function-local
+everywhere it is used; `python -m tests.unit` still passes 8/8. A live re-run of the migrated
+suites is still owed — the manual QA cells below are unchanged by this refactor, since it
+changes only where the address comes from.
+
+**What this does not fix:** the address is already in past commits, so this only stops new
+occurrences. Removing it from history would need a rewrite of the public repository's
+history, which is deliberately out of scope here. The one live-file occurrence outside
+`tests/` — the `find_person(...)` example in the 2026-09-09 substrate-search update above —
+was redacted in the same change, so the *current* tree carries the address nowhere.
 **Update 2026-09-14 — `move_email` couldn't reach a custom folder by name *or* by ID.**
 Reported from the unattended `inbox-maintenance-hourly` task, which was falling back to
 Outlook COM (an exclusive global lock, slower, riskier unattended) because of it:

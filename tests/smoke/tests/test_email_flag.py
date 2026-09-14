@@ -13,22 +13,24 @@ Sends one disposable, uniquely-tagged message to the mailbox's own address,
 cycles it through Flagged -> Complete -> NotFlagged, then hard-deletes every
 item carrying the tag.
 
+Prefers the mailbox's own address from $EXCHANGE_SMOKE_SELF_EMAIL and falls back
+to reading it off a message in Sent Items (see tests/smoke/config.py's
+discover_self_email, which this test's own resolver became when the rest of the
+suite adopted the same mechanism).
+
 Run standalone:
-    python -m tests.smoke.tests.test_email_flag
+    EXCHANGE_SMOKE_SELF_EMAIL=you@example.com \
+        python -m tests.smoke.tests.test_email_flag
 """
 
 import asyncio
-import os
 import sys
 import time
 
+from tests.smoke.config import discover_self_email
 from tests.smoke.mcp_client import call, run, session
 from tests.smoke.results import is_error_payload, record
 
-# The mailbox's own address is resolved at runtime rather than written down here
-# (see _resolve_self_email): this is a public repository and the address is
-# personal data, so it should not be added to it as a literal.
-SELF_EMAIL_ENV = "EXCHANGE_SMOKE_SELF_EMAIL"
 TAG = f"[flag-smoke-{int(time.time())}]"
 SUBJECT = f"{TAG} Exchange MCP set_email_flag smoke test"
 BODY = "Automated smoke-test message from the exchange-mcp test suite. Safe to ignore/delete."
@@ -60,26 +62,6 @@ async def _find_all_tagged(s, folders: list[str], subject_substr: str) -> list[s
     return ids
 
 
-async def _resolve_self_email(s):
-    """This mailbox's own SMTP address, discovered rather than hardcoded.
-
-    Prefers $EXCHANGE_SMOKE_SELF_EMAIL; otherwise reads it back off a message in
-    Sent Items, whose `from` is by definition this mailbox. Keeping it out of the
-    source means this test carries no personal data into a public repo and works
-    against any mailbox without editing.
-    """
-    configured = os.environ.get(SELF_EMAIL_ENV, "").strip()
-    if configured:
-        return configured
-    listing = await call(s, "get_emails", folder="Sent", limit=3, include_body=True)
-    if isinstance(listing, dict):
-        for row in listing.get("emails", []):
-            address = (row.get("from") or "").strip()
-            if "@" in address:
-                return address
-    return None
-
-
 async def _read_flag(s, item_id: str):
     """Return (flag_status, error_note) as reported by get_email."""
     info = await call(s, "get_email", item_id=item_id)
@@ -107,11 +89,8 @@ async def main() -> bool:
             ok = False
 
         # 2. Create a disposable message, addressed to this mailbox itself.
-        self_email = await _resolve_self_email(s)
+        self_email = await discover_self_email(s, "send_email (self address)")
         if not self_email:
-            record("send_email (self address)", {"env": SELF_EMAIL_ENV}, "TOOL_ERROR",
-                   f"could not determine this mailbox's own address from Sent Items; "
-                   f"set {SELF_EMAIL_ENV} to run this test")
             return False
 
         send_args = {"to": self_email, "subject": SUBJECT, "body": BODY}
