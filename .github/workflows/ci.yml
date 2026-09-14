@@ -1,0 +1,83 @@
+name: CI
+
+# Runs the mailbox-free half of the test suite (tests/unit) on every push and
+# PR. tests/smoke/ deliberately stays out: it drives a real Chromium against a
+# real signed-in mailbox, so it needs an interactive sign-in and would leak
+# mailbox content into logs -- it is run by hand, per tool, against a live OWA.
+#
+# That split is what makes this workflow cheap enough to run on every commit:
+# no secrets, no mailbox, no EXCHANGE_OWA_URL, and no browser download.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One in-flight run per ref. PR pushes supersede their predecessor; pushes to
+# main are not cancelled, so every commit there keeps its own result.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  unit:
+    name: Unit tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # A version-specific failure is information, so let the other jobs finish.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        # requires-python is >=3.10; the top of the range is what development
+        # actually runs on.
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          # One Windows job: the project is developed on Windows, and
+          # test_auth_errors covers profile-directory *path* resolution, which
+          # is precisely the kind of logic that passes on Linux and breaks on
+          # a backslash.
+          - os: windows-latest
+            python-version: "3.14"
+    env:
+      # Test output contains non-ASCII (the Russian folder aliases, em dashes in
+      # diagnostics). GitHub captures stdout through a pipe, which on Windows
+      # falls back to the locale codepage -- without this, a *failing* check can
+      # raise UnicodeEncodeError and hide its own message.
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install the package
+        # Editable install, exactly as documented in CLAUDE.md's "Running"
+        # section. This pulls in playwright's *Python* package (needed to import
+        # exchange_mcp.server, which every tool module imports) but deliberately
+        # does NOT run `playwright install chromium`: no unit test launches a
+        # browser, and downloading one would cost more than the tests do.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Report the installed version
+        # The banner reads exchange_mcp.__version__, which pyproject.toml's
+        # dynamic version also reads -- a mismatch here means the install is
+        # stale, and that is worth seeing before a test failure is blamed on it.
+        run: python -c "import exchange_mcp; print('exchange_mcp', exchange_mcp.__version__)"
+
+      - name: Run pure-logic test suites
+        # Discovers and runs every tests/unit/test_*.py (see
+        # tests/unit/__main__.py). Discovery rather than an enumerated list of
+        # steps is the point: a new suite is covered the moment it lands, and
+        # cannot be forgotten here.
+        run: python -m tests.unit

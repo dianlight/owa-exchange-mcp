@@ -986,7 +986,12 @@ port it reports "could not determine" instead of raising.
   renumbering a module digit is forbidden, so the module part gained a digit instead.
 - **Automated test** — the test module(s) covering the row, or `None`. Coverage is
   `tests/smoke/` (live-mailbox, end-to-end, one module per tool) plus `tests/unit/`
-  (pure logic, no mailbox). There is still no CI config — everything is run by hand.
+  (pure logic, no mailbox). Only the `tests/unit/` half runs in CI
+  ([.github/workflows/ci.yml](.github/workflows/ci.yml), added 2026-09-14 for issue #16):
+  it needs no mailbox, no browser and no `EXCHANGE_OWA_URL`, so it runs on every push and
+  PR. Everything in `tests/smoke/` is still run by hand, per tool, against a live mailbox —
+  it can't be otherwise, since it signs in interactively and its output is real mailbox
+  content.
 - **Manual QA / Status** — whether the tool has actually been exercised against a real
   OWA mailbox since the browser-session rewrite, and the observed result. I have not run
   any of these tools myself in this session (that would require a live `EXCHANGE_OWA_URL`,
@@ -1019,11 +1024,11 @@ port it reports "could not determine" instead of raising.
 |---|---|---|---|---|---|
 | 101 | `get_emails` | List emails from a folder, grouped by conversation/thread, with unread/pagination filters; each row includes `flag_status`, and `body_error` when `include_body=True` could not fetch that row. `offset` is a real folder position at any depth, and every response carries a `pagination` block (`has_more`/`next_offset`/`reached_end_of_folder`, plus `error_code` when paging stopped early) so an empty page is never ambiguous | `tests/smoke/tests/test_get_emails.py`, `tests/smoke/tests/test_email_flag.py`, `tests/smoke/tests/test_unfetchable_item_resilience.py`, `tests/smoke/tests/test_get_emails_pagination.py`, `tests/unit/test_conversation_paging.py` | OK (2026-09-11) — deep-offset pagination rewritten and verified live: server-side `Offset` honoured and aligned with a from-zero enumeration, offsets 0/60/100/120/140/240 all return full pages with monotonically older dates, `ids_only limit=500` no longer capped at 200, empty pages self-describing (see §4). Earlier OK (2026-09-10) for `flag_status` on every row and per-row `include_body` degradation still holds | Stable |
 | 102 | `get_email` | Get a single email's full body, recipients, attachments, and `flag_status` (follow-up flag) | `tests/smoke/tests/test_get_email_detail.py`, `tests/smoke/tests/test_email_flag.py`, `tests/smoke/tests/test_unfetchable_item_resilience.py`, `tests/unit/test_item_errors.py` | OK (2026-09-11) — `flag_status` verified round-tripping all three states. Still fails on the messages OWA cannot serialise at full property shape (this tool asks for all of them by design); now returns `error_code: "item_not_serializable"` plus a `hint` naming the narrow reads that *do* work on the same item, see §4. `test_get_email_detail` is flaky when it happens to pick one. | Stable |
-| 103 | `send_email` | Send a new email (to/cc/bcc, HTML or plain text) | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
-| 104 | `reply_email` | Reply (or reply-all) to an email | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
-| 105 | `forward_email` | Forward an email to new recipients | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
+| 103 | `send_email` | Send a new email (to/cc/bcc, HTML or plain text) | `tests/smoke/tests/test_email_lifecycle.py`, `tests/unit/test_recipient_list.py` | OK (2026-09-07) | Stable |
+| 104 | `reply_email` | Reply (or reply-all) to an email | `tests/smoke/tests/test_email_lifecycle.py`, `tests/unit/test_recipient_list.py` | OK (2026-09-07) | Stable |
+| 105 | `forward_email` | Forward an email to new recipients | `tests/smoke/tests/test_email_lifecycle.py`, `tests/unit/test_recipient_list.py` | OK (2026-09-07) | Stable |
 | 106 | `mark_email_read` | Mark one or more emails read/unread | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
-| 107 | `move_email` | Move one or more emails to another folder; `target_folder` accepts a bare name (direct child of `msgfolderroot`/a distinguished folder) or a `/`-delimited path for folders nested deeper (e.g. `Projects/ClientFolder`, `Inbox/Triage`) | `tests/smoke/tests/test_email_lifecycle.py`, `tests/smoke/tests/test_move_email_nested_folder.py` | OK (2026-09-09, re-verified) — see "Update 2026-09-09 — move_email couldn't resolve nested destination folders" below | Stable |
+| 107 | `move_email` | Move one or more emails to another folder; `target_folder` accepts a bare name (direct child of `msgfolderroot`/a distinguished folder) or a `/`-delimited path for folders nested deeper (e.g. `Projects/ClientFolder`, `Inbox/Triage`) | `tests/smoke/tests/test_email_lifecycle.py`, `tests/smoke/tests/test_move_email_nested_folder.py`, `tests/unit/test_folder_id_dict.py` | OK (2026-09-09, re-verified) — see "Update 2026-09-09 — move_email couldn't resolve nested destination folders" below | Stable |
 | 108 | `delete_email` | Delete (soft or permanent) one or more emails | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
 | 109 | `download_attachments` | Download all file attachments from an email to disk | `tests/smoke/tests/test_email_lifecycle.py` | OK (2026-09-07) | Stable |
 | 110 | `get_email_links` | Extract hyperlinks from an email's HTML body | `tests/smoke/tests/test_get_email_detail.py` | OK (2026-09-07) | Stable |
@@ -1069,12 +1074,12 @@ port it reports "could not determine" instead of raising.
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
 | 501 | `check_session` | Lightweight auth check (`FindFolder` on inbox) — reports mailbox name + unread count when the backend's response includes them (omitted on the modern OAuth/Bearer backend, which never returns `ParentFolder`). An unauthenticated profile now comes back as `authorization_required` + `reason` + `remediation` rather than a generic error string, pointing the caller at the `login` tool (see the 2026-09-10 update below) | `tests/smoke/tests/test_check_session.py`, `tests/smoke/tests/test_mcp_session_lifecycle.py` (transport-session reuse / dead-session-id 404, issue #18) | OK (2026-09-07) for the authenticated/generic-error paths, re-confirmed live 2026-09-14 while triaging issue #18 (whose "Session not found" is the MCP transport's 404, not this tool — see the 2026-09-14 update above); the new `authorization_required` branch is `Pending` | Stable |
-| 502 | `get_folders` | List mail folders (shallow or recursive) with counts | `tests/smoke/tests/test_get_folders.py` | OK (2026-09-08) | Stable |
-| 503 | `create_folder` | Create a new folder — mail folder by default, or any Exchange folder class via `folder_class` (`IPF.Task` under `parent_folder_id="tasks"` makes a **Microsoft To Do list**). Echoes the class the server actually stored, because an unrecognised prefix is silently downgraded to `IPF.Note` rather than rejected | `tests/smoke/tests/test_folder_lifecycle.py` (default `IPF.Note` path), `tests/smoke/tests/test_task_folder_targeting.py` (`IPF.Task` To Do list) | OK (2026-09-14) — `folder_class` added and re-verified live on both paths: the mail-folder default is unchanged (folder-lifecycle test still green) and `folder_class="IPF.Task"` under the `tasks` root produces a real To Do list that the task tools can address by name, by path and by raw ID. Both `IPF.Task` and `IPF.Task.Todo` are accepted and stored verbatim — the latter only because folder classes are *prefixes* (EWS treats `IPF.Task.*` as a task folder), so the plain `IPF.Task` is what the docstring recommends | Stable |
+| 502 | `get_folders` | List mail folders (shallow or recursive) with counts | `tests/smoke/tests/test_get_folders.py`, `tests/unit/test_folder_id_dict.py` | OK (2026-09-08) | Stable |
+| 503 | `create_folder` | Create a new folder — mail folder by default, or any Exchange folder class via `folder_class` (`IPF.Task` under `parent_folder_id="tasks"` makes a **Microsoft To Do list**). Echoes the class the server actually stored, because an unrecognised prefix is silently downgraded to `IPF.Note` rather than rejected | `tests/smoke/tests/test_folder_lifecycle.py` (default `IPF.Note` path), `tests/smoke/tests/test_task_folder_targeting.py` (`IPF.Task` To Do list), `tests/unit/test_folder_id_dict.py` | OK (2026-09-14) — `folder_class` added and re-verified live on both paths: the mail-folder default is unchanged (folder-lifecycle test still green) and `folder_class="IPF.Task"` under the `tasks` root produces a real To Do list that the task tools can address by name, by path and by raw ID. Both `IPF.Task` and `IPF.Task.Todo` are accepted and stored verbatim — the latter only because folder classes are *prefixes* (EWS treats `IPF.Task.*` as a task folder), so the plain `IPF.Task` is what the docstring recommends | Stable |
 | 504 | `rename_folder` | Rename an existing folder | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) | Stable |
 | 505 | `empty_folder` | Empty all items from a folder | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) | Stable |
 | 506 | `delete_folder` | Delete a mail folder | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) | Stable |
-| 507 | `move_folder` | Move a folder under a different parent | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) | Stable |
+| 507 | `move_folder` | Move a folder under a different parent | `tests/smoke/tests/test_folder_lifecycle.py`, `tests/unit/test_folder_id_dict.py` | OK (2026-09-08) | Stable |
 
 ### Availability — [exchange_mcp/tools/availability.py](exchange_mcp/tools/availability.py) (2)
 
@@ -1129,9 +1134,9 @@ visible to these tools — use `set_email_flag` (#115).
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 1001 | `get_tasks` | List tasks from a To Do list / task folder, due-date ascending with undated last; filters completed client-side (`include_completed`), skips non-`Task` items (a mail folder would otherwise yield subject-only pseudo-tasks — reported as `skipped_non_task_items`), optional per-task body with per-item `body_error` degradation, reports `scanned` so "no matches" is distinguishable from the 500-item scan ceiling | `tests/smoke/tests/test_task_lifecycle.py`, `tests/smoke/tests/test_task_folder_targeting.py` | OK (2026-09-14) — 14 tasks listed from the default list, completed-filter verified both ways; non-task filter verified by pointing it at `deleteditems` (500 scanned, 499 skipped, the 1 real task found). **`task_folder` resolution is now covered too** (2026-09-14): all three non-default spellings — bare list name, `tasks/<list>` path, raw opaque folder ID — plus the negative "a child-list task must not show up in the default list" case, against a To Do list the test creates for itself now that #503 can make one | Stable |
+| 1001 | `get_tasks` | List tasks from a To Do list / task folder, due-date ascending with undated last; filters completed client-side (`include_completed`), skips non-`Task` items (a mail folder would otherwise yield subject-only pseudo-tasks — reported as `skipped_non_task_items`), optional per-task body with per-item `body_error` degradation, reports `scanned` so "no matches" is distinguishable from the 500-item scan ceiling | `tests/smoke/tests/test_task_lifecycle.py`, `tests/smoke/tests/test_task_folder_targeting.py`, `tests/unit/test_folder_id_dict.py` | OK (2026-09-14) — 14 tasks listed from the default list, completed-filter verified both ways; non-task filter verified by pointing it at `deleteditems` (500 scanned, 499 skipped, the 1 real task found). **`task_folder` resolution is now covered too** (2026-09-14): all three non-default spellings — bare list name, `tasks/<list>` path, raw opaque folder ID — plus the negative "a child-list task must not show up in the default list" case, against a To Do list the test creates for itself now that #503 can make one | Stable |
 | 1002 | `get_task` | Get one task's full detail (status, dates, reminder, importance, categories, owner, body, change_key) | `tests/smoke/tests/test_task_lifecycle.py` | OK (2026-09-11) — subject, UTC-midnight due date, status, body, categories, importance and reminder all verified round-tripping. `PercentComplete` arrives as a *string* (`"100"`) from this backend and is coerced to int | Stable |
-| 1003 | `create_task` | Create a task with due/start dates, note body, status, importance, categories and reminder, in any To Do list | `tests/smoke/tests/test_task_lifecycle.py`, `tests/smoke/tests/test_task_folder_targeting.py` | OK (2026-09-14) — created in the default list with every optional field set, and (2026-09-14) into a named child To Do list addressed by bare name, which is the `task_folder` path that used to be untestable (see #1001) | Stable |
+| 1003 | `create_task` | Create a task with due/start dates, note body, status, importance, categories and reminder, in any To Do list | `tests/smoke/tests/test_task_lifecycle.py`, `tests/smoke/tests/test_task_folder_targeting.py`, `tests/unit/test_folder_id_dict.py` | OK (2026-09-14) — created in the default list with every optional field set, and (2026-09-14) into a named child To Do list addressed by bare name, which is the `task_folder` path that used to be untestable (see #1001) | Stable |
 | 1004 | `update_task` | Partial update — only the arguments passed are written; `clear_due_date`/`clear_start_date`/`clear_reminder` erase a field (`DeleteItemField`), and `status`+`percent_complete` together is rejected client-side (Exchange resolves the two against each other by whichever it processes last) | `tests/smoke/tests/test_task_lifecycle.py` | OK (2026-09-11) — subject + due date + `Status` + `clear_reminder` written in one request and verified by re-read, i.e. every `_FIELD` spelling exercised there is confirmed accepted (`item:Subject`, `item:ReminderIsSet`, `task:DueDate`, `task:Status`) | Stable |
 | 1005 | `complete_task` | Mark tasks complete / reopen them, writing `Status` only; returns per-item results including the *new* ItemId Exchange mints when a recurring occurrence is completed | `tests/smoke/tests/test_task_lifecycle.py` | OK (2026-09-11) — `Status=Completed` verified on the item (`is_complete`, `complete_date` = today, `percent_complete` 100 set by the server from `Status` alone) and through both listing filters. The recurring-task ID-split path is untested (no recurring task to hand) | Stable |
 | 1006 | `delete_task` | Delete tasks (soft to Deleted Items, or `permanent` HardDelete), `AffectedTaskOccurrences: AllOccurrences` | `tests/smoke/tests/test_task_lifecycle.py`, `tests/smoke/tests/test_task_folder_targeting.py` | OK (2026-09-11) — verified by absence from the folder listing. A deleted task's **ItemId stays resolvable**, so `get_task` keeps returning the item afterwards with a bumped ChangeKey; the first test run failed on exactly that wrong post-condition before the tool was cleared | Stable |
@@ -1375,20 +1380,43 @@ hold a request open for.
     `python -c "from exchange_mcp.server import main; main()"` when you need a checkout other
     than the editable install (an editable install resolves to its original path regardless of
     cwd, so a worktree's code is *not* what runs unless you force it this way).
-- **Automated tests are almost entirely live-mailbox smoke tests.** `tests/smoke/`
-  exercises each MCP tool end-to-end against a real mailbox, one module per tool, so it
-  cannot run in CI and cannot cover pure logic in isolation. `tests/unit/` is the
-  exception and now holds five suites: `test_auth_errors` (sign-in failure diagnosis and
-  profile-directory resolution), `test_recurrence_expansion` (occurrence arithmetic for
-  every pattern/range variant, exact dates, real captured payloads, malformed-payload
-  degradation), `test_capability_classify` (discovery verdicts and redaction),
-  `test_item_errors` (per-item failure codes and the payload shape bulk tools return) and
-  `test_conversation_paging` (FindConversation offset paging, both of its
+- **Automated tests are still mostly live-mailbox smoke tests, but the pure-logic half now
+  runs in CI** (issue #16, 2026-09-14). `tests/smoke/` exercises each MCP tool end-to-end
+  against a real mailbox, one module per tool, so it cannot run unattended and cannot cover
+  pure logic in isolation. `tests/unit/` is the exception and now holds eight suites, none
+  of which need a mailbox, a browser or `EXCHANGE_OWA_URL`: `test_auth_errors` (sign-in
+  failure diagnosis and profile-directory resolution), `test_recurrence_expansion`
+  (occurrence arithmetic for every pattern/range variant, exact dates, real captured
+  payloads, malformed-payload degradation), `test_capability_classify` (discovery verdicts
+  and redaction), `test_item_errors` (per-item failure codes and the payload shape bulk
+  tools return), `test_conversation_paging` (FindConversation offset paging, both of its
   can't-reach-that-page failure modes, and both client-side-filtered scans — `unread_only`
-  and `find_emails_by_category`'s category match).
-  Other cheap pure-logic targets remain uncovered: e.g.
-  `_build_recipient_list` handling empty/whitespace addresses, or `folder_id_dict()`
-  picking the right `__type` for a distinguished vs. opaque folder ID.
+  and `find_emails_by_category`'s category match), `test_copilot_answer_text` (isolating
+  Copilot's reply from the whole chat pane), and the two cheap targets this bullet used to
+  list as gaps: `test_recipient_list` (`_build_recipient_list` dropping empty/whitespace
+  addresses instead of sending an empty recipient, and carrying no `__type`) and
+  `test_folder_id_dict` (`folder_id_dict()` choosing `DistinguishedFolderId` vs. `FolderId`,
+  including the invariant that every `DISTINGUISHED_FOLDERS` *value* resolves as
+  distinguished while a user-facing *name* like "sent" does not).
+  [.github/workflows/ci.yml](.github/workflows/ci.yml) runs them on every push and PR
+  across Python 3.10–3.14 plus one Windows job (`test_auth_errors` covers path resolution,
+  which is exactly the logic that passes on Linux and breaks on a backslash). It runs
+  `python -m tests.unit`, which **discovers** `tests/unit/test_*.py` rather than listing the
+  suites: issue #16 itself described "five suites" when six were already on disk, so an
+  enumerated CI step would silently skip the next one. Note that `folder_id_dict()` is
+  shared by ~12 tools; its unit suite is credited in the Automated test column only for the
+  rows where the distinguished-vs-opaque choice is the row's own subject (#107, #502, #503,
+  #507, #1001, #1003), not for every caller.
+  **CI paid for itself before it ever ran on GitHub**: the first clean-environment run of
+  `pip install -e .` + `python -m tests.unit` (in a throwaway venv, 2026-09-14) failed three
+  suites on `ModuleNotFoundError: No module named 'mcp.server.fastmcp'`. `pyproject.toml`
+  asked for `mcp>=1.0.0`, and mcp **2.x** renamed `FastMCP` to `MCPServer` — so a fresh
+  install of this package today (new contributor, new machine, CI runner) resolved to 2.2.0
+  and neither `server.py` nor any of the 11 tool modules could be imported at all. Every
+  existing dev environment was on 1.29 from an earlier install and therefore silent about it.
+  Fixed by pinning `mcp>=1.0.0,<2`; lifting that pin is a v2 migration, not a version bump.
+  This is exactly the class of breakage no amount of live smoke testing can find, because
+  smoke tests run against the environment that already works.
 - **No live/manual QA log.** There's no record (changelog, issue tracker, etc.) of which
   of the 54 tools have actually been run against a real OWA mailbox since the
   browser-session rewrite. This document's "Manual QA / Status" column is a template for
