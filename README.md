@@ -209,7 +209,7 @@ accidentally denied push is something you just retry there.
 | `reply_email` | Reply to an email |
 | `forward_email` | Forward an email |
 | `delete_email` | Delete an email |
-| `move_email` | Move email to another folder |
+| `move_email` | Move email to another folder (by folder id, `/`-path, or display name) |
 | `mark_email_read` | Mark email as read/unread |
 | `set_email_flag` | Set the follow-up flag on one or more emails |
 | `download_attachments` | Download file attachments from an email |
