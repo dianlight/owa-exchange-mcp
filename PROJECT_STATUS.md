@@ -891,6 +891,89 @@ raw `call_tool` plumbing to work around it. That workaround is now
 `tests/smoke/mcp_client.call_args(s, tool, args)` — one implementation with the retry logic,
 used by both tests rather than duplicated into a second one.
 
+**Update 2026-09-14 — issue #18 (`check_session` fails with "Session not found") is a
+transport-session report, not a `check_session` bug.** The reported text is not this
+codebase's: `"Session not found"` is emitted verbatim by the MCP SDK's
+`mcp/server/streamable_http_manager.py` as an HTTP **404** whenever a request arrives with
+an `Mcp-Session-Id` the manager doesn't hold in `_server_instances` at all — never issued, or
+cleaned up after that session's task crashed ("Cleaning up crashed session … from active
+instances"). We run stateful streamable-HTTP (`stateless_http` is left at its default
+`False`), so a session id is mandatory on every post-`initialize` request.
+
+The wording is load-bearing, and testing it live is what established that. The SDK has
+**three** distinct dead-session 404s: `"Session not found"` (above), `"Not Found: Session has
+been terminated"` (`streamable_http.py`'s `_terminated` check — the transport is still
+registered, the client just DELETEd it) and `"Not Found: Invalid or expired session ID"` (a
+mismatched id on an `initialize`). So #18's wording specifically rules out a client that
+tidied up after itself and points at the session *instance* having gone away: the server
+restarted between the two calls, or that session's task crashed and was swept.
+
+Two things make the tool-level reading impossible. That lookup happens in the *manager*,
+before the request is dispatched to any tool, so the 404 cannot depend on which tool was
+named — and `check_session` is an ordinary sync tool with no transport behaviour of its own
+(`login` is the only auth tool that touches session state, and it wasn't involved). The
+reported "`check_session` fails but `get_tasks` works perfectly" is therefore the signature
+of the two calls riding *different* transport sessions: a client holding an id from before a
+server restart, or after its own session was terminated, 404s on whatever it calls next and
+then re-initializes transparently, so the following call succeeds and appears to exonerate
+everything but the first tool.
+
+Live check via the configured connector on the same day returned
+`{"authenticated": true, "cookie_file": "…/.browser-profile"}` — the tool is healthy, and
+row #501 stays `OK`/`Stable`.
+
+The gap this exposed was in the tests, not the server: `test_check_session.py` opens a fresh
+session per run and so can never exercise session *reuse*, which is the whole of #18. New
+[test_mcp_session_lifecycle.py](tests/smoke/tests/test_mcp_session_lifecycle.py) covers it in
+three phases — `check_session` twice plus once after a 20s idle gap on one live session (the
+symptom, as a regression guard); the same dead session id posted raw (bypassing
+`ClientSession`, which can only ever send an id the server issued) for `check_session` **and**
+`get_tasks`, asserting both get the identical 404 (the discriminator that clears the tool, and
+it fails loudly if the two ever diverge); then a fresh `initialize`, which is the remediation
+a client should apply. Both a terminated id and a never-issued one are exercised, and each
+asserts its *own* expected wording rather than "some 404" — so the run also fails if a future
+SDK stops distinguishing the two causes, which would invalidate the reasoning above.
+
+Verified live 2026-09-14: all 8 checks `OK`, exit 0 — including the never-issued id
+reproducing #18's exact `"Session not found"` **identically** for `check_session` and
+`get_tasks`, which is the direct evidence that the tool named in the report is irrelevant to
+the error. `test_check_session.py` re-run alongside it: `OK`.
+
+Re-verified afterwards on a server launched from **this** worktree (port 8767,
+`EXCHANGE_BROWSER_PROFILE_DIR=.browser-profile-dev`, identity probe confirming
+`exchange 1.29.0, 60 tools`; production on 8766 untouched): 8/8 `OK` again, so the result is
+attributed to this checkout's code and not merely to a server that happened to be up.
+`test_check_session.py` and `test_get_folders.py` both `OK` on it too.
+
+That re-run was needed because the *first* one silently wasn't ours, and the harness gave no
+way to tell — which turned out to be the more generally useful finding of this triage.
+`ensure_server()` reuses anything already listening on the target port, so
+`EXCHANGE_SMOKE_PORT=8767` attached to a dev instance a *concurrent worktree session* had
+started four minutes earlier (`_wt_launcher.py`, holding the lock on `.browser-profile-dev`).
+No server was launched here, the `EXCHANGE_BROWSER_PROFILE_DIR` passed alongside it had no
+effect whatsoever, and the tests exercised that worktree's code — a green run that was nearly
+written up as "verified on an independently launched server with an isolated profile". (It
+happened to be harmless: that tree's only uncommitted `exchange_mcp/` change is
+`create_folder`'s new `folder_class` argument, leaving `check_session`, `tasks.py` and
+`server.py` byte-identical to this branch, and the dead-session 404s are SDK-level anyway.)
+
+[server_manager.py](tests/smoke/server_manager.py) no longer allows that to be silent. The
+reuse behaviour is unchanged — it is correct, since two servers cannot share one Chromium
+profile directory — but it is now announced: `ensure_server()` states whether it LAUNCHED or
+is REUSING, and on the foreign path says explicitly that this environment's
+`EXCHANGE_BROWSER_PROFILE_DIR`/`--show-browser` are **not** in effect, names the listening PID
+and its command line, and points at `check_session`'s `cookie_file` for the profile actually
+in use. Because a command line need not reveal the server's cwd (the near-miss ran
+`python _wt_launcher.py --port 8767`, naming no tree at all), it also runs a cheap identity
+probe — `initialize` + `tools/list`, no mailbox traffic — reporting server name, version and
+tool count, and flagging any count that isn't 60, which finally automates the "verify a
+`list_tools` count of 60 before trusting a run" rule from CLAUDE.md. `status()` distinguishes
+harness-started from foreign (including a PID file that disagrees with whoever holds the
+port), and `stop` now refuses to kill a server it didn't start rather than shooting at the
+port — on a machine running production plus several worktree sessions, that mattered.
+Announced once per process, and every lookup is best-effort: pointed at a listening non-MCP
+port it reports "could not determine" instead of raising.
+
 ## 2. How to read the table
 
 - **ID** — a permanent identifier, `<module number><2-digit sequence within that module>`:
@@ -985,7 +1068,7 @@ used by both tests rather than duplicated into a second one.
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 501 | `check_session` | Lightweight auth check (`FindFolder` on inbox) — reports mailbox name + unread count when the backend's response includes them (omitted on the modern OAuth/Bearer backend, which never returns `ParentFolder`). An unauthenticated profile now comes back as `authorization_required` + `reason` + `remediation` rather than a generic error string, pointing the caller at the `login` tool (see the 2026-09-10 update below) | `tests/smoke/tests/test_check_session.py` | OK (2026-09-07) for the authenticated/generic-error paths; the new `authorization_required` branch is `Pending` | Stable |
+| 501 | `check_session` | Lightweight auth check (`FindFolder` on inbox) — reports mailbox name + unread count when the backend's response includes them (omitted on the modern OAuth/Bearer backend, which never returns `ParentFolder`). An unauthenticated profile now comes back as `authorization_required` + `reason` + `remediation` rather than a generic error string, pointing the caller at the `login` tool (see the 2026-09-10 update below) | `tests/smoke/tests/test_check_session.py`, `tests/smoke/tests/test_mcp_session_lifecycle.py` (transport-session reuse / dead-session-id 404, issue #18) | OK (2026-09-07) for the authenticated/generic-error paths, re-confirmed live 2026-09-14 while triaging issue #18 (whose "Session not found" is the MCP transport's 404, not this tool — see the 2026-09-14 update above); the new `authorization_required` branch is `Pending` | Stable |
 | 502 | `get_folders` | List mail folders (shallow or recursive) with counts | `tests/smoke/tests/test_get_folders.py` | OK (2026-09-08) | Stable |
 | 503 | `create_folder` | Create a new folder — mail folder by default, or any Exchange folder class via `folder_class` (`IPF.Task` under `parent_folder_id="tasks"` makes a **Microsoft To Do list**). Echoes the class the server actually stored, because an unrecognised prefix is silently downgraded to `IPF.Note` rather than rejected | `tests/smoke/tests/test_folder_lifecycle.py` (default `IPF.Note` path), `tests/smoke/tests/test_task_folder_targeting.py` (`IPF.Task` To Do list) | OK (2026-09-14) — `folder_class` added and re-verified live on both paths: the mail-folder default is unchanged (folder-lifecycle test still green) and `folder_class="IPF.Task"` under the `tasks` root produces a real To Do list that the task tools can address by name, by path and by raw ID. Both `IPF.Task` and `IPF.Task.Todo` are accepted and stored verbatim — the latter only because folder classes are *prefixes* (EWS treats `IPF.Task.*` as a task folder), so the plain `IPF.Task` is what the docstring recommends | Stable |
 | 504 | `rename_folder` | Rename an existing folder | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) | Stable |
