@@ -1,4 +1,6 @@
-"""Pure-logic tests for `_page_conversations` — no mailbox, no browser.
+"""Pure-logic tests for the FindConversation paging helpers — no mailbox, no
+browser. Covers `_page_conversations` (get_emails, #101) and
+`_page_conversations_by_category` (find_emails_by_category, #113).
 
 get_emails used to apply the caller's `offset` by slicing a *single*
 FindConversation response whose server-side Offset was hardcoded to 0 and whose
@@ -8,6 +10,11 @@ folder — and the cutoff moved with `limit` rather than with the mailbox, so th
 same `offset` denoted different positions for different `limit`s. Verified on a
 live Inbox on 2026-09-11: limit=20 worked at offset=79 and went empty at 80,
 limit=5 worked at offset=45 and went empty at 50.
+
+find_emails_by_category had the same shape with the offset part removed: one
+FindConversation at Offset 0, MaxEntriesReturned 200, filtered client-side, so
+a category applied to anything older than the newest 200 conversations could
+never match and nothing said so (issue #5).
 
 These cases pin the replacement's two guarantees, neither of which a live smoke
 test can provoke on demand: any offset resolves to a real folder position, and
@@ -24,6 +31,7 @@ from exchange_mcp.tools.email import (
     _PAGINATION_OFFSET_UNSUPPORTED,
     _PAGINATION_SCAN_LIMIT,
     _page_conversations,
+    _page_conversations_by_category,
 )
 
 FAILURES: list[str] = []
@@ -34,15 +42,18 @@ def check(label: str, actual, expected) -> None:
         FAILURES.append(f"{label}: expected {expected!r}, got {actual!r}")
 
 
-def conv(index: int, unread: int = 0) -> dict:
+def conv(index: int, unread: int = 0, categories=None) -> dict:
     """A FindConversation row, identified by its position in the folder."""
-    return {
+    row = {
         "ConversationId": {"Id": f"conv-{index}"},
         "ConversationTopic": f"Subject {index}",
         "LastDeliveryTime": f"2026-01-01T00:{index:02d}:00Z",
         "UnreadCount": unread,
         "ItemIds": [{"Id": f"item-{index}"}],
     }
+    if categories is not None:
+        row["Categories"] = categories
+    return row
 
 
 class FakeClient:
@@ -266,6 +277,143 @@ def test_unread_end_of_folder():
     check("few unread ended", meta["reached_end_of_folder"], True)
 
 
+# ------------------------------------------------------------------
+# find_emails_by_category: the category filter is client-side too
+# ------------------------------------------------------------------
+
+CAT = "Progetto/Alpha"
+
+
+def tagged_folder(size: int, tagged_at, category: str = CAT) -> list[dict]:
+    """A folder where only the positions in `tagged_at` carry `category`."""
+    tagged = set(tagged_at)
+    return [
+        conv(i, categories=[category] if i in tagged else None)
+        for i in range(size)
+    ]
+
+
+def test_category_beyond_the_first_window_is_found():
+    """The reported bug: a tag on conversation 250 was unreachable at all."""
+    client = FakeClient(tagged_folder(300, [250, 251]))
+    page, meta = _page_conversations_by_category(client, "inbox", CAT,
+                                                 offset=0, limit=10)
+    check("deep tag ids", ids(page), ["conv-250", "conv-251"])
+    check("deep tag count", meta["returned"], 2)
+    check("deep tag has_more", meta["has_more"], False)
+    check("deep tag ended", meta["reached_end_of_folder"], True)
+    check("deep tag error", meta.get("error_code"), None)
+    check("deep tag scanned past 200", meta["conversations_scanned"] > 200, True)
+
+
+def test_category_absent_is_the_end_not_an_error():
+    """Zero matches after a full sweep is a real answer, not a failure."""
+    client = FakeClient(tagged_folder(300, []))
+    page, meta = _page_conversations_by_category(client, "inbox", CAT,
+                                                 offset=0, limit=10)
+    check("no-match page", page, [])
+    check("no-match ended", meta["reached_end_of_folder"], True)
+    check("no-match has_more", meta["has_more"], False)
+    check("no-match error", meta.get("error_code"), None)
+
+
+def test_category_match_is_case_insensitive():
+    folder = tagged_folder(250, [240], category="progetto/ALPHA")
+    page, _ = _page_conversations_by_category(FakeClient(folder), "inbox",
+                                              "Progetto/alpha",
+                                              offset=0, limit=10)
+    check("case-insensitive ids", ids(page), ["conv-240"])
+
+
+def test_category_stops_as_soon_as_the_page_is_full():
+    """A common tag must not cost a full-folder sweep."""
+    client = FakeClient(tagged_folder(2000, range(0, 2000)))
+    page, meta = _page_conversations_by_category(client, "inbox", CAT,
+                                                 offset=0, limit=10)
+    check("full page", len(page), 10)
+    check("full page has_more", meta["has_more"], True)
+    check("full page next_offset", meta["next_offset"], 10)
+    check("full page one request", len(client.calls), 1)
+
+
+def test_category_offset_counts_matches_not_folder_rows():
+    """offset=2 means the 3rd *matching* conversation, wherever it sits."""
+    client = FakeClient(tagged_folder(400, [10, 120, 230, 340, 350]))
+    page, meta = _page_conversations_by_category(client, "inbox", CAT,
+                                                 offset=2, limit=2)
+    check("offset ids", ids(page), ["conv-230", "conv-340"])
+    check("offset has_more", meta["has_more"], True)
+    check("offset next_offset", meta["next_offset"], 4)
+    check("offset echoed", meta["offset"], 2)
+
+    tail, tail_meta = _page_conversations_by_category(client, "inbox", CAT,
+                                                      offset=4, limit=2)
+    check("offset tail ids", ids(tail), ["conv-350"])
+    check("offset tail has_more", tail_meta["has_more"], False)
+    check("offset tail ended", tail_meta["reached_end_of_folder"], True)
+
+
+def test_category_short_page_does_not_end_the_folder():
+    """MaxEntriesReturned is unreliable here, so only an *empty* page ends it.
+
+    A backend that caps every response at 50 rows must still find a tag at
+    conversation 250 - reading the first short page as the end of the folder is
+    precisely the silent truncation this replaces.
+    """
+    client = FakeClient(tagged_folder(300, [250]), max_per_call=50)
+    page, meta = _page_conversations_by_category(client, "inbox", CAT,
+                                                 offset=0, limit=10)
+    check("short-page tag ids", ids(page), ["conv-250"])
+    check("short-page tag error", meta.get("error_code"), None)
+    check("short-page tag ended", meta["reached_end_of_folder"], True)
+
+
+def test_category_scan_limit_is_reported_not_silently_truncated():
+    """Stopping at the cap must never read as "no more matches"."""
+    folder = tagged_folder(_CONV_MAX_SCAN + 500, [_CONV_MAX_SCAN + 100])
+    client = FakeClient(folder)
+    page, meta = _page_conversations_by_category(client, "inbox", CAT,
+                                                 offset=0, limit=10)
+    check("scan-cap tag page", page, [])
+    check("scan-cap tag code", meta.get("error_code"), _PAGINATION_SCAN_LIMIT)
+    check("scan-cap tag not ended", meta["reached_end_of_folder"], False)
+    check("scan-cap tag has_more", meta["has_more"], True)
+    check("scan-cap tag next_offset", meta["next_offset"], None)
+    check("scan-cap tag remediation", bool(meta.get("error")), True)
+    check("scan-cap tag bounded",
+          meta["conversations_scanned"] <= _CONV_MAX_SCAN, True)
+
+
+def test_category_server_ignoring_offset_is_reported_not_a_spin():
+    """A backend that re-serves page 1 must be named, not scanned into the cap.
+
+    Without the repeat check this loop would re-filter the same 200 rows until
+    the scan cap and blame the cap - a different, misleading diagnosis.
+    """
+    client = FakeClient(tagged_folder(300, [250]), honour_offset=False)
+    page, meta = _page_conversations_by_category(client, "inbox", CAT,
+                                                 offset=0, limit=10)
+    check("ignored-offset tag page", page, [])
+    check("ignored-offset tag code", meta.get("error_code"),
+          _PAGINATION_OFFSET_UNSUPPORTED)
+    check("ignored-offset tag not ended", meta["reached_end_of_folder"], False)
+    check("ignored-offset tag has_more", meta["has_more"], True)
+
+
+def test_category_diagnostics_stay_nested():
+    """A top-level `error` means the whole tool call failed - keep it inside.
+
+    tests/smoke/results.py's is_error_payload reads a top-level `error` that
+    way, so hoisting these would make a partial success look like a failure.
+    """
+    folder = tagged_folder(_CONV_MAX_SCAN + 500, [_CONV_MAX_SCAN + 100])
+    page, meta = _page_conversations_by_category(FakeClient(folder), "inbox",
+                                                 CAT, offset=0, limit=10)
+    check("nested returns a page", page, [])
+    check("nested error keys", sorted(k for k in meta if "error" in k),
+          ["error", "error_code"])
+
+
 TESTS = [
     test_deep_offset_returns_that_position,
     test_offset_is_a_position_not_a_window_index,
@@ -281,6 +429,15 @@ TESTS = [
     test_unread_offset_starts_scan_at_zero,
     test_paging_never_asks_the_server_to_filter,
     test_unread_end_of_folder,
+    test_category_beyond_the_first_window_is_found,
+    test_category_absent_is_the_end_not_an_error,
+    test_category_match_is_case_insensitive,
+    test_category_stops_as_soon_as_the_page_is_full,
+    test_category_offset_counts_matches_not_folder_rows,
+    test_category_short_page_does_not_end_the_folder,
+    test_category_scan_limit_is_reported_not_silently_truncated,
+    test_category_server_ignoring_offset_is_reported_not_a_spin,
+    test_category_diagnostics_stay_nested,
 ]
 
 
