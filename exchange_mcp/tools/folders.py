@@ -132,6 +132,18 @@ def get_folders(
     Returns:
         JSON array of folder objects with: name, id, total_count,
         unread_count, child_folder_count.
+
+        With recursive=True the tree is flattened, so a folder's position in
+        the array says nothing about where it lives: a name that appears in
+        `get_folders(recursive=True)` on "msgfolderroot" is not necessarily a
+        top-level folder. Pass the `id` to tools that take a folder (e.g.
+        `move_email`'s `target_folder`) rather than the name - a name has to
+        be resolved and can be ambiguous, an id can't.
+
+        Pages through the whole listing rather than returning one request's
+        worth: this backend doesn't honour MaxEntriesReturned reliably, so a
+        single request silently truncated large mailboxes (see
+        `OWAClient.iter_child_folders`).
     """
     client = _get_client(ctx)
 
@@ -141,45 +153,19 @@ def get_folders(
     # Distinguished folder names are short lowercase strings
     parent_folder = OWAClient.folder_id_dict(parent_folder_id)
 
-    payload = {
-        "__type": "FindFolderJsonRequest:#Exchange",
-        "Header": {
-            "__type": "JsonRequestHeaders:#Exchange",
-            "RequestServerVersion": "Exchange2013",
-        },
-        "Body": {
-            "__type": "FindFolderRequest:#Exchange",
-            "FolderShape": {
-                "__type": "FolderResponseShape:#Exchange",
-                "BaseShape": "Default",
-            },
-            "ParentFolderIds": [parent_folder],
-            "Traversal": traversal,
-            "Paging": {
-                "__type": "IndexedPageView:#Exchange",
-                "BasePoint": "Beginning",
-                "Offset": 0,
-                "MaxEntriesReturned": 200,
-            },
-        },
-    }
-
     try:
-        data = client.request("FindFolder", payload)
+        folders = [
+            {
+                "name": f.get("DisplayName", "Unknown"),
+                "id": f.get("FolderId", {}).get("Id", ""),
+                "total_count": f.get("TotalCount", 0),
+                "unread_count": f.get("UnreadCount", 0),
+                "child_folder_count": f.get("ChildFolderCount", 0),
+            }
+            for f in client.iter_child_folders(parent_folder, traversal=traversal)
+        ]
     except Exception as e:
         return json.dumps({"error": str(e)})
-
-    folders = []
-    for msg in client.extract_items(data):
-        if "RootFolder" in msg and "Folders" in msg["RootFolder"]:
-            for f in msg["RootFolder"]["Folders"]:
-                folders.append({
-                    "name": f.get("DisplayName", "Unknown"),
-                    "id": f.get("FolderId", {}).get("Id", ""),
-                    "total_count": f.get("TotalCount", 0),
-                    "unread_count": f.get("UnreadCount", 0),
-                    "child_folder_count": f.get("ChildFolderCount", 0),
-                })
 
     return json.dumps(folders, ensure_ascii=False)
 

@@ -27,6 +27,49 @@ def _get_client(ctx: Context) -> OWAClient:
     return app_ctx.client
 
 
+def _resolve_folder_or_error(
+    client: OWAClient, folder_spec: str, arg_name: str
+) -> tuple[str | None, str | None, str]:
+    """Resolve a folder argument, or build the JSON error to return verbatim.
+
+    Returns (folder_id, error_json, matched_by): exactly one of folder_id /
+    error_json is set.
+
+    Every folder-taking tool routes through this so the two failure modes
+    stay distinguishable at the API boundary. Before, all of them collapsed
+    into one bare `{"error": "Folder 'X' not found."}` string, which left a
+    caller no way to tell "typo / wrong mailbox" from "this name matches
+    three folders and I refuse to guess" - and no way to recover from the
+    latter without a human. `candidates` makes the ambiguous case
+    self-service: re-issue the call with one of the ids.
+    """
+    resolution = client.resolve_folder(folder_spec)
+    if resolution.folder_id:
+        return resolution.folder_id, None, resolution.matched_by
+
+    if resolution.error_code == "folder_name_ambiguous":
+        payload = {
+            "error": (
+                f"{arg_name} '{folder_spec}' is ambiguous: "
+                f"{len(resolution.candidates)} folders share that name. Retry with one of "
+                f"the candidate ids below, or with a '/'-delimited path."
+            ),
+            "error_code": resolution.error_code,
+            "candidates": list(resolution.candidates),
+        }
+    else:
+        payload = {
+            "error": (
+                f"Folder '{folder_spec}' not found. {arg_name} accepts a folder id from "
+                f"get_folders (always unambiguous), a '/'-delimited path "
+                f"(e.g. 'Inbox/Quarantena'), or a display name."
+            ),
+            "error_code": resolution.error_code or "folder_not_found",
+        }
+
+    return None, json.dumps(payload, ensure_ascii=False), resolution.matched_by
+
+
 def _get_change_key(client: OWAClient, item_id: str) -> str | None:
     """Fetch the ChangeKey for an item via GetItem (IdOnly).
 
@@ -954,10 +997,10 @@ def get_emails(
             limit = 1
         offset = max(0, offset)
 
-        # Resolve folder name to ID
-        folder_id = client.get_folder_id(folder)
-        if not folder_id:
-            return json.dumps({"error": f"Folder '{folder}' not found."})
+        # Resolve folder name/path/id to ID
+        folder_id, error_json, _ = _resolve_folder_or_error(client, folder, "folder")
+        if error_json:
+            return error_json
 
         conversations, pagination = _page_conversations(
             client, folder_id, offset, limit, unread_only
@@ -1069,9 +1112,9 @@ def search_emails(
             # expensive - cap each folder's fallback scan depth accordingly.
             fallback_max_scan = 200
         else:
-            folder_id = client.get_folder_id(folder)
-            if not folder_id:
-                return json.dumps({"error": f"Folder '{folder}' not found."})
+            folder_id, error_json, _ = _resolve_folder_or_error(client, folder, "folder")
+            if error_json:
+                return error_json
             folder_ids = [folder_id]
             fallback_max_scan = 1000
 
@@ -1580,14 +1623,36 @@ def move_email(
 
     Args:
         item_ids: List of Exchange ItemIds to move.
-        target_folder: Destination folder name (e.g. Inbox, Sent, Deleted, or custom).
+        target_folder: Destination folder, in any of these forms:
+
+            - **A folder id from `get_folders`** - the authoritative form.
+              It needs no lookup, so it always resolves, whatever the
+              folder's name or nesting. Prefer it for unattended runs, and
+              use it whenever similar short names are in play
+              (e.g. several "Prj-*" folders).
+            - **A "/"-delimited path** ("Inbox/Quarantena",
+              "Progetti/Cliente"), which also disambiguates a shared name.
+            - **A display name**, resolved in this order: distinguished
+              folder ("Inbox", "Sent", "Deleted", "Junk", ...) -> top-level
+              folder -> direct child of the Inbox -> anywhere in the mailbox
+              if *exactly one* folder has that name. Several matches is
+              refused rather than guessed: the response then carries
+              `error_code: "folder_name_ambiguous"` plus `candidates`, each
+              with the id to retry with.
+
+    Returns:
+        On success, `resolved_folder_id` and `matched_by` report which folder
+        was actually written to, so an unattended run can log it instead of
+        inferring it from the name it asked for.
     """
     try:
         client = _get_client(ctx)
 
-        folder_id = client.get_folder_id(target_folder)
-        if not folder_id:
-            return json.dumps({"error": f"Folder '{target_folder}' not found."})
+        folder_id, error_json, matched_by = _resolve_folder_or_error(
+            client, target_folder, "target_folder"
+        )
+        if error_json:
+            return error_json
 
         items = [
             {"__type": "ItemId:#Exchange", "Id": iid} for iid in item_ids
@@ -1623,6 +1688,8 @@ def move_email(
             {
                 "success": True,
                 "message": f"Moved {len(item_ids)} email(s) to '{target_folder}'.",
+                "resolved_folder_id": folder_id,
+                "matched_by": matched_by,
             }
         )
 
@@ -2038,9 +2105,9 @@ def find_emails_by_category(
             limit = 1
         offset = max(0, offset)
 
-        folder_id = client.get_folder_id(folder)
-        if not folder_id:
-            return json.dumps({"error": f"Folder '{folder}' not found."})
+        folder_id, error_json, _ = _resolve_folder_or_error(client, folder, "folder")
+        if error_json:
+            return error_json
 
         matches, pagination = _page_conversations_by_category(
             client, folder_id, category, offset, limit
