@@ -36,8 +36,16 @@ from tests.smoke.mcp_client import call, run, session
 from tests.smoke.results import is_error_payload, record
 
 # Per-call ceiling. Five calls at the tools' 90s default would make the suite
-# crawl; a healthy pane answers a trivial prompt well inside this.
-TIMEOUT = 45
+# crawl, but 45s was too tight and that cost real coverage: on 2026-09-15
+# `summarize_email_thread` did not finish inside it, and because a `timeout`
+# carrying partial text counts as a pass below, the suite would have gone on
+# reporting OK while never once checking that the tool produces a summary. The
+# same item answered fully in ~70s, so the ceiling sits above that.
+#
+# Note what this does *not* guard against: a tool that never finishes still
+# passes here as a timeout-with-partial-text, by the tools' documented contract.
+# The ceiling is what decides whether that contract is exercised or leaned on.
+TIMEOUT = 80
 CALENDAR_WINDOW_DAYS = 14
 
 # Substring of the classic-OWA message in tools/copilot.py's _ask(). Matching

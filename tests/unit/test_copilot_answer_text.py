@@ -22,9 +22,17 @@ Run:
     python -m tests.unit.test_copilot_answer_text
 """
 
+import asyncio
 import sys
 
-from exchange_mcp.browser_session import _copilot_answer_text
+from exchange_mcp.browser_session import (
+    BrowserSession,
+    _COPILOT_SETTLE_POLLS,
+    _COPILOT_SETTLE_POLLS_NO_MARKER,
+    _copilot_answer_marker_index,
+    _copilot_answer_text,
+    _copilot_has_progress_line,
+)
 
 FAILURES: list[str] = []
 
@@ -280,7 +288,180 @@ def test_answer_identical_to_a_button_label_falls_back_not_empty():
     check("non-empty on collision", bool(result.strip()), True)
 
 
+# ----------------------------------------------------------------------
+# Settle-rule helpers: "has Copilot actually finished?"
+# ----------------------------------------------------------------------
+#
+# The 2026-09-15 smoke re-run returned {"status": "ok"} carrying this exact
+# text. It is *new* relative to the baseline and *stable* for seconds, so
+# neither baseline-diffing nor waiting for stability could reject it.
+IN_FLIGHT_PANE = """Copilot
+In corso…
+Scarica l'app per dispositivi mobili Copilot
+Ottieni risposte, analizza documenti e crea contenuti in mobilità."""
+
+# The answer that was hiding behind it, abridged. Note the action-item table:
+# inner_text() renders cells tab-separated, so "In corso" here is a *status
+# value* inside a line, never a line of its own.
+FINISHED_PANE = """Oggi
+You said:
+Copilot said:
+Copilot
+Riassunto del thread
+Contesto Il thread riguarda la revisione della documentazione tecnica.
+Responsabile\tAzione\tStato
+Giuseppe Colosimo\tRiesaminare la documentazione\tIn corso
+Giuseppe Colosimo\tVerificare i commenti aperti\tDa fare"""
+
+
+def test_progress_line_is_detected():
+    """The literal state that caused the false success must read as in-flight."""
+    check("in-flight pane", _copilot_has_progress_line(IN_FLIGHT_PANE), True)
+    check("bare marker", _copilot_has_progress_line("In corso"), True)
+
+
+def test_progress_hint_normalises_trailing_ellipsis():
+    """Copilot writes "In corso…"; the ASCII spelling must match too."""
+    for variant in ("In corso…", "In corso...", "IN CORSO", "  in corso  ", "Thinking…"):
+        check(f"variant {variant!r}", _copilot_has_progress_line(variant), True)
+
+
+def test_progress_hint_must_be_a_whole_line():
+    """A status *value* inside a line is not a progress marker.
+
+    This is the regression that matters most: a substring test would reject
+    the correct summary in FINISHED_PANE, whose action-item table legitimately
+    contains "In corso" as a cell.
+    """
+    check("table cell is not progress",
+          _copilot_has_progress_line(FINISHED_PANE), False)
+    check("prose mentioning it is not progress",
+          _copilot_has_progress_line("Il lavoro e' in corso di revisione."), False)
+    check("finished answer with no progress text",
+          _copilot_has_progress_line("Riassunto del thread\nTutto completato."), False)
+
+
+def test_progress_line_ignores_empty_and_blank_input():
+    check("empty", _copilot_has_progress_line(""), False)
+    check("blank lines", _copilot_has_progress_line("\n\n   \n"), False)
+
+
+def test_answer_marker_index_finds_the_last_turn():
+    """Shared by the extractor and the settle check, so pin both behaviours."""
+    lines = ["Oggi", "Copilot said:", "first", "You said:", "Copilot said:", "second"]
+    check("last marker wins", _copilot_answer_marker_index(lines), 4)
+    check("absent marker is None",
+          _copilot_answer_marker_index(["Oggi", "In corso…"]), None)
+    check("localised marker found",
+          _copilot_answer_marker_index(["Copilot ha detto:", "ciao"]), 0)
+
+
+def test_in_flight_pane_has_no_answer_marker():
+    """Why the marker is the discriminator: mid-flight there is no turn yet.
+
+    Together with the previous test this is the whole fix in miniature - the
+    in-flight pane has no marker *and* has a progress line, so the settle rule
+    refuses it; the finished pane has a marker, so it settles on the short path.
+    """
+    check("in-flight has no marker",
+          _copilot_answer_marker_index(IN_FLIGHT_PANE.splitlines()), None)
+    check("finished pane has a marker",
+          _copilot_answer_marker_index(FINISHED_PANE.splitlines()) is not None, True)
+
+
+def test_no_marker_path_demands_more_stability():
+    """The weaker evidence path must never be the more trusting one."""
+    check("no-marker threshold is stricter",
+          _COPILOT_SETTLE_POLLS_NO_MARKER > _COPILOT_SETTLE_POLLS, True)
+    check("marker threshold still requires repetition",
+          _COPILOT_SETTLE_POLLS >= 2, True)
+
+
+def test_extractor_still_returns_chrome_when_that_is_all_there_is():
+    """The extractor is unchanged: refusing to settle is the polling loop's job.
+
+    Documented so nobody "fixes" this by making the extractor return "" -
+    an empty string would read as a successful empty answer, which is exactly
+    the failure mode `_copilot_answer_text` already falls back to avoid.
+    """
+    result = _copilot_answer_text("Copilot", IN_FLIGHT_PANE, PROMPT)
+    check("extractor yields something inspectable", bool(result.strip()), True)
+
+
+def _settle(script, timeout):
+    """Drive the real polling loop against a scripted pane, with no browser.
+
+    The helpers above can all pass while the *composition* in
+    `_async_copilot_wait_and_read` still settles on chrome - that loop is where
+    the marker, progress and stability conditions actually meet, so it gets
+    exercised directly. A stub `self` and a fake locator are enough: the only
+    things the loop asks of the pane are `inner_text()` and a stop-button count.
+    """
+    class FakeLocator:
+        async def count(self):
+            return 0  # no stop control matched - as observed live on 2026-09-15
+
+    class FakePane:
+        def __init__(self, frames):
+            self.frames = list(frames)
+            self.reads = 0
+
+        async def inner_text(self):
+            value = self.frames[min(self.reads, len(self.frames) - 1)]
+            self.reads += 1
+            return value
+
+        def get_by_role(self, *args, **kwargs):
+            return FakeLocator()
+
+    class Stub:
+        async def _async_copilot_button_labels(self, pane):
+            return set()
+
+    return asyncio.run(
+        BrowserSession._async_copilot_wait_and_read(
+            Stub(), FakePane(script), timeout=timeout,
+            baseline="Copilot\nCiao! Come posso aiutarti?",
+            prompt="Summarize this thread.",
+        )
+    )
+
+
+def test_loop_refuses_to_settle_on_progress_chrome():
+    """The 2026-09-15 regression, end to end: no confident answer from chrome."""
+    # Short deadline on purpose: the loop polls at ~1s and this suite runs in
+    # CI. With a progress line always present `stable_polls` never increments,
+    # so 4s proves the same thing 30s would.
+    result = _settle([IN_FLIGHT_PANE], timeout=4)
+    check("not a success", result["status"] == "ok", False)
+    check("honest timeout instead", result["status"], "timeout")
+    # partial_text is still populated - a timeout that hands back nothing would
+    # lose the only evidence of what the pane was showing.
+    check("partial evidence kept", bool(result.get("partial_text", "").strip()), True)
+
+
+def test_loop_returns_the_answer_once_it_arrives():
+    """...and the stricter rule must not cost us the answer that follows it."""
+    # Two in-flight polls, then the answer, which the script then holds so the
+    # marker path can see its two consecutive identical reads.
+    result = _settle([IN_FLIGHT_PANE] * 2 + [FINISHED_PANE], timeout=12)
+    check("settles once answered", result["status"], "ok")
+    check("real answer returned", "Riassunto del thread" in result["text"], True)
+    check("promo block excluded", "Scarica l'app" in result["text"], False)
+    check("table status cell preserved", "In corso" in result["text"], True)
+
+
 TESTS = [
+    test_loop_refuses_to_settle_on_progress_chrome,
+    test_loop_returns_the_answer_once_it_arrives,
+    test_progress_line_is_detected,
+    test_progress_hint_normalises_trailing_ellipsis,
+    test_progress_hint_must_be_a_whole_line,
+    test_progress_line_ignores_empty_and_blank_input,
+    test_answer_marker_index_finds_the_last_turn,
+    test_in_flight_pane_has_no_answer_marker,
+    test_no_marker_path_demands_more_stability,
+    test_extractor_still_returns_chrome_when_that_is_all_there_is,
     test_appended_answer_is_isolated,
     test_prompt_echo_is_dropped,
     test_multiline_answer_preserves_order,

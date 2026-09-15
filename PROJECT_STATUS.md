@@ -1108,6 +1108,40 @@ or `expand_recurrences=True`), an empty list-mode `categories` now falls back to
 value — the read and write paths must never disagree about an event's tags, and that was the
 only way this could have gone wrong silently.
 
+**Update 2026-09-15 — Copilot's completion check settled on a progress indicator, and the fix
+is a marker requirement rather than a longer wait.** Re-running
+[tests/smoke/tests/test_copilot.py](tests/smoke/tests/test_copilot.py) scored 5/5, but #902's
+"pass" was 176 chars of pane chrome — `"In corso…"` above an app-promo block — returned as
+`{"status": "ok"}`. The same item answered fully in ~70s, so the tool was right and only the
+verdict was wrong.
+
+Worth recording *why both existing defences were blind to it*, because they were each built for
+an earlier version of this same failure and the reason is structural, not an oversight:
+`baseline` can only subtract text that was on screen *before* submitting, and the block appears
+after that snapshot; and waiting for the text to stop changing cannot help, because **a progress
+indicator is by construction both new and unchanging**. `_COPILOT_STOP_HINTS` was supposed to be
+the authoritative signal, but no stop control matched during that phase.
+
+The fix keys on the transcript's own role marker instead: absent a `"Copilot said:"` turn,
+Copilot has not answered, whatever the text is doing. That yields two deliberately asymmetric
+settle paths — marker present, two stable polls as before; marker absent, a longer run
+(`_COPILOT_SETTLE_POLLS_NO_MARKER`) *and* no line matching `_COPILOT_PROGRESS_HINTS`. The
+fallback path is kept so an unlisted localisation still works rather than always timing out, and
+a stale table in either direction now degrades to `status: "timeout"` with real `partial_text`,
+which is honest, instead of to a confident wrong answer.
+
+One detail in `_COPILOT_PROGRESS_HINTS` is load-bearing and easy to "simplify" into a bug: hints
+match a **whole line**, never a substring. The very summary this bug was hiding contains
+"In corso" as an action-item *status* inside a table row — `inner_text()` renders those cells
+tab-separated, so it never forms its own line, but a substring test would have rejected the
+correct answer as unfinished. `tests/unit/test_copilot_answer_text.py` pins that case, and also
+drives the real polling loop against scripted pane text (a stub `self` plus a fake locator; no
+browser, no mailbox), so both halves — refusing chrome, and still returning the answer that
+follows it — are covered without a live run. Suite total 34 checks; `TIMEOUT` raised to 80s
+because 45 was below what #902 needs, and a ceiling that low silently converts the check into
+the timeout-is-a-pass branch. Re-run live: 5/5, with #902 now returning 2062 chars of a real
+structured summary.
+
 ## 2. How to read the table
 
 - **ID** — a permanent identifier, `<module number><2-digit sequence within that module>`:
@@ -1239,11 +1273,11 @@ only way this could have gone wrong silently.
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 901 | `ask_copilot` | Generic delegator: sends a free-text prompt to Copilot's chat pane, optionally grounded against an email/event via a best-effort deep link | `tests/smoke/tests/test_copilot.py` | **OK (2026-09-11)** — verified live on an isolated bearer-mode profile: returned exactly `PONG` for a ping prompt. Confirms the pane has a real free-text composer, which the discovery capture could not (it only ever saw preset chips). Responses now also carry `grounded`. | Stable |
-| 902 | `summarize_email_thread` | Ask Copilot to summarize an email thread and list action items | `tests/smoke/tests/test_copilot.py` | **OK (2026-09-11)** — verified live: returns a real summary of the named thread ("promotional email from BeyondTrust inviting..."). Needed the grounding fix as well as the iframe/frame ones — before it Copilot answered "non vedo alcun thread email" and ran a generic mailbox search, because navigating to an item does *not* put it in the pane's context. | Stable |
+| 901 | `ask_copilot` | Generic delegator: sends a free-text prompt to Copilot's chat pane, optionally grounded against an email/event via a best-effort deep link | `tests/smoke/tests/test_copilot.py`, `tests/unit/test_copilot_answer_text.py` | **OK (2026-09-11)** — verified live on an isolated bearer-mode profile: returned exactly `PONG` for a ping prompt. Confirms the pane has a real free-text composer, which the discovery capture could not (it only ever saw preset chips). Responses now also carry `grounded`. | Stable |
+| 902 | `summarize_email_thread` | Ask Copilot to summarize an email thread and list action items | `tests/smoke/tests/test_copilot.py` | **OK (2026-09-11)** — verified live: returns a real summary of the named thread ("promotional email from BeyondTrust inviting..."). Needed the grounding fix as well as the iframe/frame ones — before it Copilot answered "non vedo alcun thread email" and ran a generic mailbox search, because navigating to an item does *not* put it in the pane's context. **Re-verified 2026-09-15, after fixing a false success it exposed.** At the suite's then-45s ceiling this returned `status: "ok"` carrying 176 chars of *pane chrome* — `"In corso…"` plus the `"Scarica l'app per dispositivi mobili Copilot"` promo — because a progress indicator is both new relative to `baseline` and unchanging, so neither baseline-diffing nor waiting for stability could reject it. `_async_copilot_wait_and_read` now also requires a `"Copilot said:"` turn marker (or, absent one, a longer stable run *and* no progress line), and the suite's `TIMEOUT` is 80s. Same call now returns 2062 chars of a genuine structured summary | Stable |
 | 903 | `draft_reply_with_copilot` | Ask Copilot to draft a reply to an email per free-text instructions/tone; returns text only, doesn't send | `tests/smoke/tests/test_copilot.py` | **OK (2026-09-11)** — verified live: returns several drafted reply options honouring `instructions` and `tone`. Free-text `instructions` are no longer an inference — the composer is real. Same grounding dependency as #902. | Stable |
 | 904 | `coach_draft` | Ask Copilot's compose coaching for feedback on a draft reply's tone/clarity | `tests/smoke/tests/test_copilot.py` | **OK (2026-09-11)** — verified live: returns substantive tone/clarity coaching. The capture's "no Coaching affordance at all" turned out not to matter: coaching is just a prompt. It was the *first* of the five to work, precisely because it already pasted its content (`draft_text`) into the prompt instead of relying on the pane to see the item. | Stable |
-| 905 | `meeting_prep` | Ask Copilot to prepare a briefing for an upcoming meeting (context, documents, action items) | `tests/smoke/tests/test_copilot.py` | **OK (2026-09-11)** — verified live: returns a briefing naming the actual event ("25 meeting correlati al tema «GECO | UnipolService...»"). The calendar-item page has no Copilot launcher, so the `launcher_fallback_url` path is exercised on every call and is confirmed working. | Stable |
+| 905 | `meeting_prep` | Ask Copilot to prepare a briefing for an upcoming meeting (context, documents, action items) | `tests/smoke/tests/test_copilot.py` | **OK (2026-09-11)** — verified live: returns a briefing naming the actual event ("25 meeting correlati al tema «GECO \| UnipolService...»"). The calendar-item page has no Copilot launcher, so the `launcher_fallback_url` path is exercised on every call and is confirmed working. | Stable |
 
 ### Tasks — [exchange_mcp/tools/tasks.py](exchange_mcp/tools/tasks.py) (6)
 
@@ -1308,6 +1342,21 @@ hold a request open for.
 
 ## 4. Gaps worth closing
 
+- **~~Copilot's generation-complete heuristic reports a slow answer as a finished one~~ —
+  fixed 2026-09-15, but the underlying signal is still a heuristic.** The bug and its fix are
+  recorded on row 902 and in §1; what remains worth knowing is the residual risk, because two
+  successive versions of this same failure have now shipped. Completion is still inferred from
+  the pane's *text*, not from any authoritative DOM state: `_COPILOT_STOP_HINTS`,
+  `_COPILOT_ANSWER_MARKERS` and `_COPILOT_PROGRESS_HINTS` are all localisation tables, and the
+  live evidence for the answer markers being untranslated is one it-IT tenant. A third variant
+  of this failure is therefore possible — a pane state that is new, stable, marker-less and
+  carries a progress word we haven't listed. The change that would end the category rather
+  than patch it is a **DOM state attribute on the message node** marking generation complete
+  (a `data-*` flag, `aria-busy`, or a streaming class), which would be language-independent;
+  nobody has yet looked for one, and a `--show-browser` inspection of a mid-generation pane is
+  all it would take. Until then, every new hint belongs in those tables, never in the polling
+  code, and `tests/unit/test_copilot_answer_text.py` drives the real loop against scripted
+  pane text so a regression is caught without a mailbox.
 - **`expand_recurrences`: all recurrence patterns in this mailbox now expand; the
   remaining limit is cost.** The `Recurrence` schema is confirmed (2026-09-10, across all 127
   series here) and documented in `_expand_recurrence_occurrences`: this backend nests the
@@ -1632,7 +1681,10 @@ hold a request open for.
     (which is what removes the composer placeholder), minus the pane's button labels (which is
     what removes the follow-up suggestion chips — generated per answer, so no hint table can
     cover them, but "it is a button" always holds). Covered by
-    `tests/unit/test_copilot_answer_text.py` (24 cases, no mailbox).
+    `tests/unit/test_copilot_answer_text.py` (34 cases, no mailbox) — which since 2026-09-15
+    also drives `_async_copilot_wait_and_read` itself against scripted pane text, because
+    `baseline` turned out not to be sufficient: a progress indicator is both new and stable,
+    so settling now additionally requires a turn marker. See the 2026-09-15 update in §1.
   - **Opening an item does not ground the prompt.** The chat pane is a standalone conversation
     and does not inherit what is on screen. Asked to summarise an open Inbox thread, Copilot
     answered *"non vedo alcun thread email allegato o identificato nel tuo messaggio"* and ran

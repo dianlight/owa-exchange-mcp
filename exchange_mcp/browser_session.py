@@ -160,6 +160,67 @@ _COPILOT_CHROME_LINES = frozenset({
     "hoy", "heute", "hoje",
 })
 
+# "Generation is in flight" status lines Copilot prints while working, before any
+# answer turn exists. Observed live 2026-09-15 on an it-IT tenant as "In corso…"
+# sitting above an app-promo block ("Scarica l'app per dispositivi mobili
+# Copilot"), a state that is both *new* relative to the baseline and *stable* for
+# seconds - so it satisfied the old settle rule and was returned as the answer.
+#
+# Matched as a whole line (normalised for case and trailing ellipsis), never as a
+# substring, and that restriction is load-bearing: the very summary this bug hid
+# contained "In corso" as an action-item *status* inside a table row. inner_text()
+# renders those cells tab-separated, so the status never forms its own line -
+# a substring test would have rejected the correct answer as unfinished.
+_COPILOT_PROGRESS_HINTS = frozenset({
+    "in corso",         # it
+    "working on it",
+    "thinking",
+    "generating",
+    "searching",
+    "sto cercando",     # it
+    "recherche",        # fr
+    "buscando",         # es
+    "suche",            # de
+})
+
+
+# Trailing punctuation a status line may carry: the ellipsis Copilot actually
+# uses ("In corso…"), its ASCII spelling, and a colon.
+_COPILOT_PROGRESS_TRAILERS = "….: \t"
+
+# Consecutive unchanged polls (~1s apart) required before calling generation
+# finished. Two numbers because the two settle paths rest on different evidence:
+# with a "Copilot said:" marker the extraction is anchored on a real turn, while
+# without one we are baseline-diffing - the weaker signal that produced the
+# 2026-09-15 false success - so it has to hold still for longer.
+_COPILOT_SETTLE_POLLS = 2
+_COPILOT_SETTLE_POLLS_NO_MARKER = 4
+
+
+def _copilot_answer_marker_index(lines: list[str]) -> int | None:
+    """Index of the *last* "Copilot said:"-style role marker, or None.
+
+    Shared by the answer extractor and the settle check so they can never
+    disagree about whether a turn exists - which matters, because "there is no
+    answer marker yet" is precisely how the settle check knows Copilot has not
+    answered.
+    """
+    marker_at = None
+    for i, line in enumerate(lines):
+        lowered = line.strip().lower()
+        if any(lowered.startswith(m) for m in _COPILOT_ANSWER_MARKERS):
+            marker_at = i
+    return marker_at
+
+
+def _copilot_has_progress_line(text: str) -> bool:
+    """True when any line of `text` is, on its own, an in-flight status marker."""
+    for line in text.splitlines():
+        normalised = line.strip().lower().rstrip(_COPILOT_PROGRESS_TRAILERS)
+        if normalised and normalised in _COPILOT_PROGRESS_HINTS:
+            return True
+    return False
+
 
 def _copilot_answer_text(
     baseline: str, text: str, prompt: str = "", chrome_lines: set[str] | None = None
@@ -199,11 +260,7 @@ def _copilot_answer_text(
     prompt_lines = {line.strip() for line in prompt.splitlines() if line.strip()}
     extra_chrome = {line.strip() for line in (chrome_lines or set()) if line.strip()}
 
-    marker_at = None
-    for i, line in enumerate(raw_lines):
-        lowered = line.lower()
-        if any(lowered.startswith(m) for m in _COPILOT_ANSWER_MARKERS):
-            marker_at = i
+    marker_at = _copilot_answer_marker_index(raw_lines)
 
     # Lines already on screen before submitting are furniture by definition.
     # This is what removes the composer's own placeholder ("Invia un messaggio a
@@ -1196,13 +1253,9 @@ class BrowserSession:
     ) -> dict:
         """Poll the pane until generation settles, a rate-limit banner appears, or timeout.
 
-        "Settled" is approximated as: the pane's text differs from `baseline`,
-        no visible "Stop generating"-style control, and the text has been
-        unchanged for two consecutive polls. Two rather than one because the
-        stop-button signal is not reliable - its accessible name is localised
-        (_COPILOT_STOP_HINTS is a best-effort table), and on a language we
-        haven't listed the check degrades to text-stability alone, where a single
-        mid-stream pause would otherwise be read as completion.
+        Settling requires all of: the pane's text differs from `baseline`, no
+        visible "Stop generating"-style control, the text unchanged for N
+        consecutive polls, and the pane not showing an in-flight status line.
 
         `baseline` - the pane's text from *before* the prompt was submitted - is
         what makes this verdict trustworthy, and it was missing. The pane's own
@@ -1211,6 +1264,33 @@ class BrowserSession:
         third poll returned that chrome as {"status": "ok"} about three seconds
         in. That is worse than a failure: it would have marked #901-905 verified
         while Copilot had not answered at all.
+
+        **`baseline` alone was not enough**, and the way it failed is the reason
+        for the marker/progress conditions below. Re-running the smoke suite on
+        2026-09-15 produced `{"status": "ok"}` whose text was
+        `"In corso…\\nScarica l'app per dispositivi mobili Copilot\\n…"` - a
+        progress line plus an app-promo block. Both defences were blind to it for
+        the same structural reason: the block appears *after* the baseline
+        snapshot, so subtracting the baseline cannot remove it, and **a progress
+        indicator is by construction both new and unchanging**, so waiting for
+        stability cannot reject it. `_COPILOT_STOP_HINTS` should have caught it,
+        but no stop control matched during that phase.
+
+        So stability is no longer sufficient on its own. The discriminator is the
+        transcript's own role marker: if there is no "Copilot said:" yet, Copilot
+        has not answered, whatever the pane's text is doing. That gives two paths,
+        deliberately asymmetric because they rest on different strength evidence:
+
+        - **Marker present** - the extraction in `_copilot_answer_text` is
+          anchored on a real turn, so two stable polls are enough (unchanged).
+        - **Marker absent** - we are relying on baseline-diffing, which is what
+          got this wrong. Demand a longer stable run *and* no progress line. This
+          path exists so an unlisted localisation or a redesigned transcript still
+          works rather than always timing out; it just has to work harder.
+
+        Both a stale marker table and a stale progress table therefore degrade to
+        `status: "timeout"` with real `partial_text`, which is honest, rather than
+        to a confident wrong answer.
         """
         deadline = time.time() + timeout
         baseline = (baseline or "").strip()
@@ -1233,10 +1313,14 @@ class BrowserSession:
             if text and text != baseline:
                 saw_change = True
 
+            has_marker = _copilot_answer_marker_index(text.splitlines()) is not None
+            settled_enough = _COPILOT_SETTLE_POLLS if has_marker else _COPILOT_SETTLE_POLLS_NO_MARKER
+            in_flight = not has_marker and _copilot_has_progress_line(text)
+
             still_generating = await stop_button.count() > 0
-            if saw_change and not still_generating and text and text == last_text:
+            if saw_change and not still_generating and not in_flight and text and text == last_text:
                 stable_polls += 1
-                if stable_polls >= 2:
+                if stable_polls >= settled_enough:
                     return {
                         "status": "ok",
                         "text": _copilot_answer_text(
