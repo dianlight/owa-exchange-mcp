@@ -72,6 +72,7 @@ python -m tests.unit.test_copilot_answer_text
 python -m tests.unit.test_recipient_list
 python -m tests.unit.test_folder_id_dict
 python -m tests.unit.test_folder_resolution
+python -m tests.unit.test_meeting_response
 
 # Live-mailbox smoke tests: one module per tool group, run individually.
 # The harness starts its own server on 127.0.0.1:8765 if nothing is listening
