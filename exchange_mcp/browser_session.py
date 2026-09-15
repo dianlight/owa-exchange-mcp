@@ -33,6 +33,14 @@ from exchange_mcp.auth_errors import (  # noqa: F401  (re-exported for callers)
     AuthenticationRequiredError,
     classify_login_failure,
 )
+from exchange_mcp.profile_lock import (  # noqa: F401  (re-exported for callers)
+    PROFILE_LOCKED,
+    ProfileLockedError,
+    ProfileLockState,
+    classify_launch_failure,
+    clear_stale_lock,
+    inspect_profile_lock,
+)
 
 # Where the persistent Chromium profile lives when EXCHANGE_BROWSER_PROFILE_DIR
 # isn't set. An installed package must not write into site-packages, so it uses
@@ -65,6 +73,30 @@ def default_profile_dir() -> Path:
         return Path(__file__).resolve().parent.parent / ".browser-profile"
     return _INSTALLED_PROFILE_DIR
 
+
+# How long a launch waits for the profile directory's lock to free before giving
+# up and reporting it as owned by someone else. Two budgets, because the two
+# callers know different things:
+#
+# - A relaunch (headless<->visible, or crash recovery) has *just* closed this
+#   process's own browser, and Chromium releases the profile lock as that process
+#   exits, trailing context.close(). Waiting out our own exit is normal, so the
+#   budget is generous.
+# - A cold launch has no such expectation: a lock that is held now is almost
+#   certainly another server's, and every extra second is added to every tool
+#   call that retries. Just enough to ride out a previous run that is still
+#   shutting down.
+#
+# Both budgets end in the same place - still held, so refuse to launch - and that
+# uniformity is deliberate even though a relaunch could instead shrug and share
+# the profile the way it used to. A machine slow enough to hold its own lock past
+# the relaunch budget would then get two browsers on one user-data-dir, silently;
+# the alternative is a self-describing PROFILE LOCKED line. Visible-and-wrong
+# beats invisible-and-wrong, and this budget is the knob if that ever fires
+# spuriously.
+_LOCK_WAIT_RELAUNCH_SECONDS = 15.0
+_LOCK_WAIT_LAUNCH_SECONDS = 3.0
+_LOCK_POLL_SECONDS = 0.5
 
 _CRASH_HINTS = (
     "target closed",
@@ -342,6 +374,16 @@ class BrowserSession:
         # "reusing an existing profile" vs. "created a new one".
         self.profile_existed = self.profile_dir.exists()
 
+        # Last lock verdict for this profile, and any stale singleton artifacts
+        # cleared on the way in. Diagnostics for the operator, not control flow:
+        # every launch re-inspects, because ownership changes the moment the other
+        # server exits and a verdict cached from startup would be worse than none.
+        # `profile_lock_cleared` is sticky on purpose -- it answers "did this
+        # process ever have to clean up after a dead browser", which a later
+        # uneventful relaunch shouldn't erase.
+        self.profile_lock_state: ProfileLockState | None = None
+        self.profile_lock_cleared: list[str] = []
+
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="owa-browser")
         self._thread.start()
@@ -392,14 +434,29 @@ class BrowserSession:
         return future.result(timeout=timeout)
 
     def _run_with_recovery(self, coro_factory, timeout: float):
-        """Run a coroutine; if the browser/context died, relaunch and retry once."""
+        """Run a coroutine; if the browser/context died, relaunch and retry once.
+
+        ProfileLockedError is re-raised untouched, ahead of the crash check, and
+        that ordering is the point of issue #11: a contended profile and a crashed
+        browser produce the *same* "has been closed" text, so the generic recovery
+        happily relaunched into the same lock and failed identically -- turning one
+        legible problem into two indistinguishable ones. A live lock cannot be
+        retried out of, so the error propagates with its own remediation instead.
+        """
         try:
             return self._run(coro_factory(), timeout=timeout)
+        except ProfileLockedError:
+            raise
         except Exception as exc:
             msg = str(exc).lower()
             if any(hint in msg for hint in _CRASH_HINTS):
                 self._context_closed = True
-                self._run(self._async_ensure_context(), timeout=120)
+                # Relaunch budget, not the launch one: our own browser has just
+                # died and its process tree may still be releasing the profile.
+                self._run(
+                    self._async_ensure_context(lock_wait=_LOCK_WAIT_RELAUNCH_SECONDS),
+                    timeout=120,
+                )
                 return self._run(coro_factory(), timeout=timeout)
             raise
 
@@ -420,7 +477,34 @@ class BrowserSession:
     # Context lifecycle
     # ------------------------------------------------------------------
 
-    async def _async_ensure_context(self) -> None:
+    async def _async_await_profile_lock(self, budget: float) -> ProfileLockState:
+        """Wait for the profile directory to stop being owned by another browser.
+
+        Polls rather than checking once, because the common held-lock case here is
+        entirely legitimate and transient: this process's own Chromium releasing
+        the profile as it exits, a beat behind context.close(). Waiting is also
+        what tells the two cases apart without any ownership bookkeeping -- our own
+        exit clears within a second or two, another running server never does.
+
+        A STALE verdict (a named owner that is gone) is cleared here; HELD and
+        UNKNOWN are returned as found. Only HELD blocks the caller, so a probe
+        that reached no verdict costs nothing.
+        """
+        state = inspect_profile_lock(self.profile_dir)
+        deadline = time.monotonic() + max(budget, 0.0)
+        while state.blocks_launch and time.monotonic() < deadline:
+            await asyncio.sleep(_LOCK_POLL_SECONDS)
+            state = inspect_profile_lock(self.profile_dir)
+
+        removed = clear_stale_lock(state)
+        if removed:
+            self.profile_lock_cleared = removed
+            state = inspect_profile_lock(self.profile_dir)
+
+        self.profile_lock_state = state
+        return state
+
+    async def _async_ensure_context(self, lock_wait: float = _LOCK_WAIT_LAUNCH_SECONDS) -> None:
         if self._launch_lock is None:
             self._launch_lock = asyncio.Lock()
 
@@ -433,13 +517,37 @@ class BrowserSession:
             if self._playwright is None:
                 self._playwright = await async_playwright().start()
 
+            # Before mkdir, so a profile that doesn't exist yet reads as free
+            # rather than as a directory with no recognizable lock files in it.
+            lock_state = await self._async_await_profile_lock(lock_wait)
+            if lock_state.blocks_launch:
+                # Fail fast and say why. Launching anyway is the tempting
+                # alternative and it is what happens today by accident -- verified
+                # 2026-09-15, Playwright's Chromium does *not* refuse a second
+                # launch on a contended profile, it just quietly shares it. Two
+                # browsers writing one user-data-dir is what Chromium's own
+                # ProcessSingleton exists to prevent.
+                raise ProfileLockedError(lock_state)
+
             self.profile_dir.mkdir(parents=True, exist_ok=True)
 
-            self._context = await self._playwright.chromium.launch_persistent_context(
-                str(self.profile_dir),
-                headless=self.headless,
-                viewport={"width": 1280, "height": 900},
-            )
+            try:
+                self._context = await self._playwright.chromium.launch_persistent_context(
+                    str(self.profile_dir),
+                    headless=self.headless,
+                    viewport={"width": 1280, "height": 900},
+                )
+            except Exception as exc:
+                # Second chance at the lock diagnosis, for the case the pre-check
+                # can't see: a browser that lost the race *during* launch, or a
+                # platform where the directory probe reached no verdict but
+                # Chromium itself said "profile in use".
+                after = inspect_profile_lock(self.profile_dir)
+                verdict = classify_launch_failure(str(exc), after)
+                if verdict:
+                    raise ProfileLockedError(after, message=verdict[1]) from exc
+                raise
+
             self._context_closed = False
             self._context.on("close", self._on_context_closed)
 
@@ -587,9 +695,16 @@ class BrowserSession:
         # which trails context.close() slightly. Relaunching into that gap fails
         # with a lock error that looks like an unrelated crash (PROJECT_STATUS.md
         # §4), so give it a moment.
+        #
+        # The sleep stays even though _async_ensure_context now waits on the lock
+        # *condition* rather than guessing: the wait can only help where the probe
+        # reaches a verdict (it reports UNKNOWN on a profile with no recognizable
+        # lock files), and this fixed floor is the mitigation that has been working.
+        # Belt and braces, cheap either way -- _LOCK_WAIT_RELAUNCH_SECONDS is what
+        # actually covers a slow exit.
         await asyncio.sleep(1)
         self.headless = headless
-        await self._async_ensure_context()
+        await self._async_ensure_context(lock_wait=_LOCK_WAIT_RELAUNCH_SECONDS)
 
     async def _async_interactive_login(self, timeout: float, poll_seconds: float) -> dict:
         """Open a visible sign-in window and wait for the user to complete it.

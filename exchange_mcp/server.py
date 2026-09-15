@@ -20,8 +20,9 @@ from pathlib import Path
 from mcp.server.mcpserver import MCPServer
 
 from exchange_mcp import auth_errors
+from exchange_mcp import profile_lock
 from exchange_mcp import __version__
-from exchange_mcp.browser_session import BrowserSession, is_source_checkout
+from exchange_mcp.browser_session import BrowserSession, ProfileLockedError, is_source_checkout
 from exchange_mcp.owa_client import OWAClient
 
 
@@ -128,6 +129,11 @@ def _log_startup_banner(browser: BrowserSession) -> None:
     _log(f"Profile dir: {browser.profile_dir}")
     _log(f"  source:    {_profile_dir_source()}")
     _log(f"  state:     {'exists, reusing it' if browser.profile_existed else 'does not exist, will be created'}")
+    # Read *before* the browser launches, so a profile another server already owns
+    # is named here rather than surfacing later as a generic closed-context error
+    # (issue #11). Diagnostic only - _async_ensure_context re-checks and is what
+    # actually refuses to launch.
+    _log(f"  lock:      {profile_lock.describe(profile_lock.inspect_profile_lock(browser.profile_dir))}")
     _log(f"Browser:     {'headless' if browser.headless else 'visible window'}")
 
 
@@ -162,6 +168,10 @@ def _startup(browser: BrowserSession) -> None:
         _log("Launching browser...")
         browser.start()
 
+        if browser.profile_lock_cleared:
+            _log("Profile lock: cleared stale singleton artifacts left by a dead browser "
+                 f"({', '.join(browser.profile_lock_cleared)}).")
+
         if browser.has_active_session():
             _log("Auth status: AUTHENTICATED (the profile's OWA session is still valid). Ready.")
             return
@@ -179,8 +189,23 @@ def _startup(browser: BrowserSession) -> None:
         _log(auth_errors.remediation(reason))
         _log("The server keeps serving; tools will report that authorization is required "
              "until someone signs in.")
+    except ProfileLockedError as exc:
+        # Not an auth problem, and not something a retry fixes - so it gets its own
+        # line rather than being folded into "startup failed". This is the whole
+        # point of issue #11: before this, the operator saw "Target page, context or
+        # browser has been closed" and had no way to know the answer was a stray
+        # Chromium tree owning their profile directory.
+        _log(f"Browser status: PROFILE LOCKED - {exc}")
+        _log("The server keeps serving, but every tool call will report the same until the "
+             "other process lets go; nothing here will ever kill it for you.")
     except Exception as exc:
-        _log(f"Auth status: UNKNOWN - startup failed: {exc}. The `login` tool remains available.")
+        # The class name, not just str(exc): several exceptions reachable from here
+        # stringify to nothing at all (concurrent.futures.TimeoutError is the one
+        # that actually shows up, when a slow/unreachable host outlasts _run()'s
+        # own budget), and "startup failed: ." told the operator strictly less than
+        # nothing about which.
+        _log(f"Auth status: UNKNOWN - startup failed: {type(exc).__name__}: {exc}. "
+             "The `login` tool remains available.")
 
 
 def _ensure_started() -> OWAClient:
