@@ -25,10 +25,12 @@ Run:
 import asyncio
 import sys
 
+from exchange_mcp import browser_session as bs
 from exchange_mcp.browser_session import (
     BrowserSession,
     _COPILOT_SETTLE_POLLS,
     _COPILOT_SETTLE_POLLS_NO_MARKER,
+    _copilot_answer_marker_count,
     _copilot_answer_marker_index,
     _copilot_answer_text,
     _copilot_has_progress_line,
@@ -388,43 +390,77 @@ def test_extractor_still_returns_chrome_when_that_is_all_there_is():
     check("extractor yields something inspectable", bool(result.strip()), True)
 
 
-def _settle(script, timeout):
+def _settle(script, timeout, busy=None, baseline="Copilot\nCiao! Come posso aiutarti?"):
     """Drive the real polling loop against a scripted pane, with no browser.
 
     The helpers above can all pass while the *composition* in
     `_async_copilot_wait_and_read` still settles on chrome - that loop is where
-    the marker, progress and stability conditions actually meet, so it gets
-    exercised directly. A stub `self` and a fake locator are enough: the only
-    things the loop asks of the pane are `inner_text()` and a stop-button count.
+    the aria-busy, marker, progress and stability conditions actually meet, so it
+    gets exercised directly. A stub `self` and two fake locators are enough: the
+    only things the loop asks of the pane are `inner_text()`, an `aria-busy`
+    count and a stop-button count.
+
+    `busy` is a per-poll sequence of aria-busy states parallel to `script`
+    (clamped to its last value, like `script` itself). Passing None means the
+    pane never exposes aria-busy, which is what exercises the *fallback* text
+    heuristics rather than the primary DOM path.
     """
-    class FakeLocator:
+    class NeverMatches:
         async def count(self):
-            return 0  # no stop control matched - as observed live on 2026-09-15
+            return 0  # the stop control is matched by localised name; assume a miss
+
+    class BusyLocator:
+        def __init__(self, pane):
+            self.pane = pane
+
+        async def count(self):
+            return 1 if self.pane.busy_now() else 0
 
     class FakePane:
-        def __init__(self, frames):
+        def __init__(self, frames, busy_states):
             self.frames = list(frames)
+            self.busy_states = list(busy_states) if busy_states else []
             self.reads = 0
+            self.idx = 0
 
         async def inner_text(self):
-            value = self.frames[min(self.reads, len(self.frames) - 1)]
+            # Record which frame this poll saw, so the aria-busy locator answers
+            # for the same instant rather than one poll out of step.
+            self.idx = min(self.reads, len(self.frames) - 1)
             self.reads += 1
-            return value
+            return self.frames[self.idx]
+
+        def busy_now(self):
+            if not self.busy_states:
+                return False
+            return bool(self.busy_states[min(self.idx, len(self.busy_states) - 1)])
+
+        def locator(self, selector):
+            return BusyLocator(self)
 
         def get_by_role(self, *args, **kwargs):
-            return FakeLocator()
+            return NeverMatches()
 
     class Stub:
         async def _async_copilot_button_labels(self, pane):
             return set()
 
-    return asyncio.run(
-        BrowserSession._async_copilot_wait_and_read(
-            Stub(), FakePane(script), timeout=timeout,
-            baseline="Copilot\nCiao! Come posso aiutarti?",
-            prompt="Summarize this thread.",
+    # Compress the poll interval so a test that needs N polls costs milliseconds
+    # instead of N seconds. `timeout` is expressed in the caller's real seconds
+    # and scaled by the same factor, so the *ratio* of polls to deadline - which
+    # is what the settle logic actually depends on - is preserved.
+    scale = 0.02 / bs._COPILOT_POLL_SECONDS
+    original = bs._COPILOT_POLL_SECONDS
+    bs._COPILOT_POLL_SECONDS = 0.02
+    try:
+        return asyncio.run(
+            BrowserSession._async_copilot_wait_and_read(
+                Stub(), FakePane(script, busy), timeout=timeout * scale,
+                baseline=baseline, prompt="Summarize this thread.",
+            )
         )
-    )
+    finally:
+        bs._COPILOT_POLL_SECONDS = original
 
 
 def test_loop_refuses_to_settle_on_progress_chrome():
@@ -451,7 +487,187 @@ def test_loop_returns_the_answer_once_it_arrives():
     check("table status cell preserved", "In corso" in result["text"], True)
 
 
+# A partial answer that has a turn marker and has stopped growing - the shape the
+# 2026-09-15 DOM probe measured holding still for 27 consecutive polls (~14s)
+# while generation was in flight and the real answer was 46 seconds away. Text
+# analysis cannot tell this from a finished reply; aria-busy can.
+PLATEAU_PANE = """Oggi
+You said:
+Copilot said:
+Copilot
+Sto raccogliendo le informazioni dalla tua casella di posta."""
+
+
+def test_aria_busy_beats_a_text_plateau():
+    """The measured failure: text flat for four polls, aria-busy still true.
+
+    The old rule settled after two stable polls and would have returned the
+    fragment. Here the flag holds it until the real answer lands.
+    """
+    frames = [PLATEAU_PANE] * 4 + [FINISHED_PANE]
+    busy = [1, 1, 1, 1, 0]
+    result = _settle(frames, timeout=20, busy=busy)
+    check("settles only once busy clears", result["status"], "ok")
+    check("returns the real answer", "Riassunto del thread" in result["text"], True)
+    check("not the plateau fragment", "Sto raccogliendo" in result["text"], False)
+
+
+def test_aria_busy_stuck_true_never_reports_success():
+    """A flag that never clears must time out, not settle.
+
+    Worth pinning explicitly: making aria-busy authoritative introduces the
+    opposite hazard to the bug it fixes, and a hang reported as an answer would
+    be the worst of both.
+    """
+    result = _settle([PLATEAU_PANE], timeout=4, busy=[1])
+    check("no false success", result["status"] == "ok", False)
+    check("honest timeout", result["status"], "timeout")
+
+
+def test_pane_without_aria_busy_falls_back_to_text():
+    """No aria-busy at all (a redesign) must still work, via the text path.
+
+    busy=None means the selector never matches, so this is the only thing
+    keeping such a pane from timing out on every call.
+    """
+    result = _settle([FINISHED_PANE], timeout=12, busy=None)
+    check("fallback still settles", result["status"], "ok")
+    check("fallback returns the answer",
+          "Riassunto del thread" in result["text"], True)
+
+
+def test_marker_count_ignores_history_from_a_previous_turn():
+    """The multi-turn hole the DOM probe exposed in the text fallback.
+
+    The pane is reused across calls and keeps its transcript, so a marker from a
+    previous answer is present before this prompt is even submitted. Counting
+    (not presence) is what distinguishes them - with presence, every call after
+    the first took the permissive path and switched the progress-line guard off.
+    """
+    prior = "Oggi\nYou said:\nCopilot said:\nCopilot\nPrevious answer."
+    check("history alone is one marker", _copilot_answer_marker_count(prior), 1)
+    check("a new turn raises the count",
+          _copilot_answer_marker_count(prior + "\nYou said:\nCopilot said:\nNew."), 2)
+    check("empty transcript has none", _copilot_answer_marker_count(""), 0)
+
+    # With a prior turn as baseline and only a progress line added, the fallback
+    # path must still refuse - this is what the old presence test got wrong.
+    result = _settle([prior + "\nIn corso…"], timeout=4, busy=None, baseline=prior)
+    check("no new turn means no success", result["status"] == "ok", False)
+
+
+# ----------------------------------------------------------------------
+# Surviving the iframe swap during submit
+# ----------------------------------------------------------------------
+
+
+def test_frame_swap_is_told_apart_from_a_real_fault():
+    """Only a dead-frame error may be retried; anything else must propagate."""
+    for message in ("Locator.press: Frame was detached",
+                    "Execution context was destroyed, most likely because of a navigation",
+                    "Target page, context or browser has been closed",
+                    "Copilot's iframe was found but it has no textbox to type into.",
+                    "A Copilot iframe was present but never offered a textbox within 10s"):
+        check(f"retryable: {message[:34]!r}",
+              bs._copilot_is_frame_swap(RuntimeError(message)), True)
+
+    for message in ("Copilot requires the modern Outlook backend",
+                    "Could not find a Copilot launch button on the current page",
+                    "Copilot reported a capacity/rate-limit condition."):
+        check(f"not retryable: {message[:34]!r}",
+              bs._copilot_is_frame_swap(RuntimeError(message)), False)
+
+
+def _submit_run(fail_times, transcript_after_fail=None):
+    """Drive _async_copilot_open_and_submit against a pane that dies `fail_times`.
+
+    Records what actually happened rather than asserting inside the fake, so a
+    test can check the retry *and* that the prompt was not typed twice.
+    """
+    log = {"acquires": 0, "submits": 0}
+
+    class FakePane:
+        def __init__(self, text):
+            self.text = text
+
+        async def inner_text(self):
+            return self.text
+
+    class Stub:
+        async def _async_copilot_acquire_pane(self, page, launcher_fallback_url):
+            log["acquires"] += 1
+            # After a failed submit, the transcript may or may not show a new
+            # turn - that is exactly what the double-submit guard reads.
+            if log["acquires"] > 1 and transcript_after_fail is not None:
+                return FakePane(transcript_after_fail)
+            return FakePane("Copilot\nCiao!")
+
+        async def _async_copilot_submit(self, pane, prompt, timeout):
+            log["submits"] += 1
+            if log["submits"] <= fail_times:
+                raise RuntimeError("Locator.press: Frame was detached")
+
+    original = bs._COPILOT_FRAME_SWAP_PAUSE
+    bs._COPILOT_FRAME_SWAP_PAUSE = 0.0
+    try:
+        pane, baseline = asyncio.run(
+            BrowserSession._async_copilot_open_and_submit(
+                Stub(), object(), "Summarize this thread.", None)
+        )
+    finally:
+        bs._COPILOT_FRAME_SWAP_PAUSE = original
+    return log, baseline
+
+
+def test_submit_retries_a_detached_frame():
+    """The measured flake: one call in five died here. It must now recover."""
+    log, _ = _submit_run(fail_times=1)
+    check("re-acquired the pane", log["acquires"], 2)
+    check("submitted again", log["submits"], 2)
+
+
+def test_submit_gives_up_after_the_attempt_limit():
+    """A frame that dies every time is a real failure, not an infinite retry."""
+    raised = None
+    try:
+        _submit_run(fail_times=bs._COPILOT_SUBMIT_ATTEMPTS)
+    except Exception as exc:
+        raised = exc
+    check("propagates once out of attempts", isinstance(raised, RuntimeError), True)
+    check("kept the underlying reason", "detached" in str(raised).lower(), True)
+
+
+def test_submit_does_not_ask_copilot_twice():
+    """If the lost Enter actually landed, retrying would duplicate the question.
+
+    Detected by the transcript having gained a turn since the one we typed into.
+    The baseline handed back must be the *pre-submit* one: the fresh transcript
+    already holds the answer being generated, and using it as baseline would make
+    the extractor treat that answer as pre-existing furniture and subtract it.
+    """
+    landed = "Copilot\nCiao!\nYou said:\nCopilot said:\nGenerating the answer..."
+    log, baseline = _submit_run(fail_times=1, transcript_after_fail=landed)
+    check("re-acquired the pane", log["acquires"], 2)
+    check("did NOT submit a second time", log["submits"], 1)
+    check("kept the pre-submit baseline", baseline, "Copilot\nCiao!")
+
+
+def test_acquire_budget_is_added_to_the_generation_timeout():
+    """A retried submit must not eat the caller's answer time."""
+    check("budget covers the worst case",
+          bs._COPILOT_ACQUIRE_BUDGET >= bs._COPILOT_SUBMIT_ATTEMPTS * 20, True)
+
+
 TESTS = [
+    test_frame_swap_is_told_apart_from_a_real_fault,
+    test_submit_retries_a_detached_frame,
+    test_submit_gives_up_after_the_attempt_limit,
+    test_submit_does_not_ask_copilot_twice,
+    test_acquire_budget_is_added_to_the_generation_timeout,
+    test_aria_busy_beats_a_text_plateau,
+    test_aria_busy_stuck_true_never_reports_success,
+    test_pane_without_aria_busy_falls_back_to_text,
+    test_marker_count_ignores_history_from_a_previous_turn,
     test_loop_refuses_to_settle_on_progress_chrome,
     test_loop_returns_the_answer_once_it_arrives,
     test_progress_line_is_detected,
