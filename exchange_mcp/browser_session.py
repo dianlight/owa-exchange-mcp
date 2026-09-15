@@ -220,13 +220,70 @@ _COPILOT_PROGRESS_HINTS = frozenset({
 # uses ("In corso…"), its ASCII spelling, and a colon.
 _COPILOT_PROGRESS_TRAILERS = "….: \t"
 
-# Consecutive unchanged polls (~1s apart) required before calling generation
-# finished. Two numbers because the two settle paths rest on different evidence:
-# with a "Copilot said:" marker the extraction is anchored on a real turn, while
-# without one we are baseline-diffing - the weaker signal that produced the
-# 2026-09-15 false success - so it has to hold still for longer.
+# The authoritative "still generating" signal, and the only one here that is not
+# a localisation table. Established by a 444-sample DOM probe of a live pane on
+# 2026-09-15 (PROJECT_STATUS.md §4), which is worth stating precisely because two
+# text-based versions of the same false-success bug had already shipped:
+#
+#   aria-busy="true"        present samples 0-87, t=0.0-48.0s   <- exact window
+#   stop control visible    present samples 0-87, t=0.0-48.0s   <- tracks it
+#   data-testid=loading-message   visible 444/444               <- useless
+#   final answer text       first seen t=49.4s
+#
+# So aria-busy covered the generating window exactly: zero false positives and
+# zero false negatives over the whole run, where the *text* went flat at 377
+# chars for 27 consecutive polls (~14s) while generation was very much in flight
+# and the real answer (8836 chars) was still 46 seconds away. `loading-message`
+# reads like the obvious candidate and is a trap - it is a permanent element, not
+# a state flag.
+#
+# The ~1.4s lag between the flag clearing and the last text landing is why text
+# stability is still required *after* it clears, rather than replaced by it.
+_COPILOT_BUSY_SELECTOR = '[aria-busy="true"]'
+
+# How long the settle loop waits between polls, and how many consecutive
+# unchanged polls it needs. Named rather than inlined because the two counts are
+# meaningless without the interval - and because a test driving the real loop
+# would otherwise have to sleep for real seconds to exercise it.
+_COPILOT_POLL_SECONDS = 1.0
+# Two numbers because the two settle paths rest on different evidence: with
+# aria-busy, or a new "Copilot said:" turn, we know a real answer exists; without
+# either we are baseline-diffing, the weaker signal that produced the 2026-09-15
+# false success, so it has to hold still for longer.
 _COPILOT_SETTLE_POLLS = 2
 _COPILOT_SETTLE_POLLS_NO_MARKER = 4
+
+# Copilot replaces its own iframe during load, and no amount of checking the
+# frame *before* typing keeps it alive while we type: two smoke runs on
+# 2026-09-15 each lost one call in five to "Frame was detached" raised from
+# inside the composer, with the failing tool rotating between them. So the
+# acquire-and-submit step retries as a unit instead - the pane locator and the
+# baseline read both belong to the dead frame and have to be redone together.
+_COPILOT_SUBMIT_ATTEMPTS = 3
+_COPILOT_FRAME_SWAP_PAUSE = 1.5
+# Worst-case seconds acquire-and-submit can burn before generation even starts,
+# added to copilot_ask's own budget so a retried submit can't eat the caller's
+# generation timeout.
+_COPILOT_ACQUIRE_BUDGET = 75
+
+# Playwright's wording for "the thing you were holding no longer exists". All of
+# these mean the same thing here - re-resolve the pane and try again - and none
+# of them means the prompt was rejected.
+_COPILOT_FRAME_SWAP_HINTS = (
+    "frame was detached",
+    "frame got detached",
+    "execution context was destroyed",
+    "target closed",
+    "target page, context or browser has been closed",
+    "no textbox to type into",       # our own message for a half-built replacement
+    "never offered a textbox",       # ditto, from _async_copilot_open_pane
+)
+
+
+def _copilot_is_frame_swap(exc: Exception) -> bool:
+    """Is this exception the iframe being replaced under us, rather than a real fault?"""
+    message = str(exc).lower()
+    return any(hint in message for hint in _COPILOT_FRAME_SWAP_HINTS)
 
 
 def _copilot_answer_marker_index(lines: list[str]) -> int | None:
@@ -243,6 +300,25 @@ def _copilot_answer_marker_index(lines: list[str]) -> int | None:
         if any(lowered.startswith(m) for m in _COPILOT_ANSWER_MARKERS):
             marker_at = i
     return marker_at
+
+
+def _copilot_answer_marker_count(text: str) -> int:
+    """How many "Copilot said:"-style turns the transcript shows.
+
+    A *count*, not a presence test, because the pane is reused across calls and
+    keeps its history: after the first tool call there is always a marker from a
+    previous turn. Presence therefore answers "has Copilot ever answered in this
+    conversation", when the question is "has it answered *this* prompt" - and the
+    settle rule that asked the former took its permissive path on every call
+    after the first, disabling the progress-line guard exactly when a long
+    multi-turn session makes it most necessary.
+    """
+    count = 0
+    for line in text.splitlines():
+        lowered = line.strip().lower()
+        if any(lowered.startswith(m) for m in _COPILOT_ANSWER_MARKERS):
+            count += 1
+    return count
 
 
 def _copilot_has_progress_line(text: str) -> bool:
@@ -1293,6 +1369,81 @@ class BrowserSession:
         await input_box.fill(prompt)
         await input_box.press("Enter")
 
+    async def _async_copilot_acquire_pane(self, page, launcher_fallback_url: str | None):
+        """Open the pane, retrying the launcher elsewhere if this page has none.
+
+        Not every page that can *display* an item also offers a Copilot
+        launcher: the discovery capture showed a calendar item page with no
+        launcher at all, and the user reaching meeting prep from the calendar
+        view instead. Navigating to the item is still what selects it, so the
+        grounding navigation stands and only the launcher hunt moves.
+        """
+        try:
+            return await self._async_copilot_open_pane(page, timeout=10)
+        except RuntimeError:
+            if not launcher_fallback_url:
+                raise
+            await page.goto(launcher_fallback_url, wait_until="networkidle", timeout=15000)
+            return await self._async_copilot_open_pane(page, timeout=10)
+
+    async def _async_copilot_open_and_submit(self, page, prompt: str, launcher_fallback_url):
+        """Get the pane and the prompt into it, surviving an iframe swap.
+
+        Returns `(pane, baseline)`. These three steps retry as one unit because
+        they are one unit: when the frame is replaced, the pane locator *and*
+        the baseline text both belonged to the frame that just died, so keeping
+        either across a retry is how you end up diffing an answer against a
+        stale snapshot.
+
+        The interesting case is the last one guarded here. If a previous
+        attempt's `Enter` actually landed and the frame died immediately after,
+        retrying would ask Copilot the same question twice - visible to the user
+        as a duplicated turn, and wasteful of a slow generation. Comparing the
+        fresh transcript's turn count against the one we typed into detects
+        that, and in that case we keep the *earlier* baseline: the new one
+        already contains the answer being generated, and using it would make
+        `_copilot_answer_text` treat the answer as pre-existing furniture and
+        subtract it.
+        """
+        submitted_markers: int | None = None
+        submitted_baseline = ""
+
+        for attempt in range(1, _COPILOT_SUBMIT_ATTEMPTS + 1):
+            try:
+                pane = await self._async_copilot_acquire_pane(page, launcher_fallback_url)
+
+                # Snapshot before submitting: this is what tells
+                # _async_copilot_wait_and_read the difference between Copilot's
+                # answer and Copilot's own UI, and between a real timeout and a
+                # prompt that never landed.
+                try:
+                    baseline = (await pane.inner_text()).strip()
+                except Exception:
+                    baseline = ""
+
+                if (
+                    submitted_markers is not None
+                    and _copilot_answer_marker_count(baseline) > submitted_markers
+                ):
+                    return pane, submitted_baseline
+
+                submitted_markers = _copilot_answer_marker_count(baseline)
+                submitted_baseline = baseline
+                await self._async_copilot_submit(pane, prompt, timeout=10)
+                return pane, baseline
+
+            except Exception as exc:
+                if attempt >= _COPILOT_SUBMIT_ATTEMPTS or not _copilot_is_frame_swap(exc):
+                    raise
+                # Let the replacement frame render before resolving it again;
+                # retrying instantly just finds the same half-built pane.
+                await asyncio.sleep(_COPILOT_FRAME_SWAP_PAUSE)
+
+        raise RuntimeError(  # pragma: no cover - loop either returns or raises
+            "Copilot's iframe was replaced on every attempt to submit the prompt "
+            f"({_COPILOT_SUBMIT_ATTEMPTS} tries)."
+        )
+
     async def _async_copilot_pane_structure(self, pane, limit: int = 40) -> list[dict]:
         """A content-free structural sketch of the pane, for a no-response run.
 
@@ -1391,30 +1542,46 @@ class BrowserSession:
         stability cannot reject it. `_COPILOT_STOP_HINTS` should have caught it,
         but no stop control matched during that phase.
 
-        So stability is no longer sufficient on its own. The discriminator is the
-        transcript's own role marker: if there is no "Copilot said:" yet, Copilot
-        has not answered, whatever the pane's text is doing. That gives two paths,
-        deliberately asymmetric because they rest on different strength evidence:
+        **The primary signal is now `aria-busy`, not text at all**, because a
+        third version of this bug was found the same way as the first two and no
+        amount of text analysis was going to end that sequence. A 444-sample DOM
+        probe of a live generation (see `_COPILOT_BUSY_SELECTOR`) showed
+        `aria-busy="true"` covering the generating window *exactly*, while the
+        text went flat at 377 chars for 27 consecutive polls (~14s) with the real
+        8836-char answer still 46 seconds away. Text stability would have
+        returned that fragment confidently; `aria-busy` would not have.
 
-        - **Marker present** - the extraction in `_copilot_answer_text` is
-          anchored on a real turn, so two stable polls are enough (unchanged).
-        - **Marker absent** - we are relying on baseline-diffing, which is what
-          got this wrong. Demand a longer stable run *and* no progress line. This
-          path exists so an unlisted localisation or a redesigned transcript still
-          works rather than always timing out; it just has to work harder.
+        So the rule is: **once we have seen `aria-busy` in this call, its
+        clearing is what "finished" means.** Text stability is still required
+        afterwards, because the probe measured a ~1.4s lag between the flag
+        clearing and the final text landing - the flag says "stopped
+        generating", not "the DOM has caught up".
 
-        Both a stale marker table and a stale progress table therefore degrade to
-        `status: "timeout"` with real `partial_text`, which is honest, rather than
-        to a confident wrong answer.
+        The text heuristics remain as a *fallback* for a pane that never exposes
+        `aria-busy` at all (an unlisted redesign), and only then. They are, in
+        order of trust:
+
+        - **A new turn marker appeared** (count, not presence - `saw_busy` aside,
+          the pane is reused across calls and keeps its history, so presence is
+          true from a previous answer before this one starts) and no progress
+          line: settle after `_COPILOT_SETTLE_POLLS`.
+        - **Neither** - demand `_COPILOT_SETTLE_POLLS_NO_MARKER`, the weakest
+          evidence getting the longest wait.
+
+        Every stale table therefore degrades to `status: "timeout"` with real
+        `partial_text`, which is honest, rather than to a confident wrong answer.
         """
         deadline = time.time() + timeout
         baseline = (baseline or "").strip()
+        base_markers = _copilot_answer_marker_count(baseline)
         last_text = ""
         stable_polls = 0
         saw_change = False
+        saw_busy = False
         stop_button = pane.get_by_role(
             "button", name=re.compile("|".join(_COPILOT_STOP_HINTS), re.I)
         )
+        busy_flag = pane.locator(_COPILOT_BUSY_SELECTOR)
 
         while time.time() < deadline:
             text = (await pane.inner_text()).strip()
@@ -1428,12 +1595,25 @@ class BrowserSession:
             if text and text != baseline:
                 saw_change = True
 
-            has_marker = _copilot_answer_marker_index(text.splitlines()) is not None
-            settled_enough = _COPILOT_SETTLE_POLLS if has_marker else _COPILOT_SETTLE_POLLS_NO_MARKER
-            in_flight = not has_marker and _copilot_has_progress_line(text)
+            busy = await busy_flag.count() > 0
+            if busy:
+                saw_busy = True
 
-            still_generating = await stop_button.count() > 0
-            if saw_change and not still_generating and not in_flight and text and text == last_text:
+            if saw_busy:
+                # The DOM told us generation started, so its clearing is the
+                # verdict; `still_generating` below is what holds us until then.
+                ready = True
+                settled_enough = _COPILOT_SETTLE_POLLS
+            else:
+                # No aria-busy on this pane - fall back to reading the text.
+                new_turn = _copilot_answer_marker_count(text) > base_markers
+                ready = new_turn and not _copilot_has_progress_line(text)
+                settled_enough = (
+                    _COPILOT_SETTLE_POLLS if new_turn else _COPILOT_SETTLE_POLLS_NO_MARKER
+                )
+
+            still_generating = busy or await stop_button.count() > 0
+            if saw_change and ready and not still_generating and text and text == last_text:
                 stable_polls += 1
                 if stable_polls >= settled_enough:
                     return {
@@ -1447,7 +1627,7 @@ class BrowserSession:
                 stable_polls = 0
 
             last_text = text
-            await asyncio.sleep(1)
+            await asyncio.sleep(_COPILOT_POLL_SECONDS)
 
         if not saw_change:
             # The pane never changed, so there is no partial answer to hand back.
@@ -1499,31 +1679,9 @@ class BrowserSession:
                 except Exception:
                     pass  # grounding is best-effort - fall through and ask ungrounded
 
-            try:
-                pane = await self._async_copilot_open_pane(page, timeout=10)
-            except RuntimeError:
-                # Not every page that can *display* an item also offers a
-                # Copilot launcher: the discovery capture showed a calendar
-                # item page with no launcher at all, and the user reaching
-                # meeting prep from the calendar view instead. Navigating on
-                # to the item first is still what selects it, so we keep the
-                # grounding navigation and only retry the launcher elsewhere.
-                if not launcher_fallback_url:
-                    raise
-                await page.goto(launcher_fallback_url, wait_until="networkidle", timeout=15000)
-                pane = await self._async_copilot_open_pane(page, timeout=10)
-
-            # Snapshot the pane *before* submitting: this is what tells
-            # _async_copilot_wait_and_read the difference between Copilot's
-            # answer and Copilot's own UI, and between a real timeout and a
-            # prompt that never landed. Read it here rather than inside the
-            # wait, which by then cannot distinguish the two.
-            try:
-                baseline = (await pane.inner_text()).strip()
-            except Exception:
-                baseline = ""
-
-            await self._async_copilot_submit(pane, prompt, timeout=10)
+            pane, baseline = await self._async_copilot_open_and_submit(
+                page, prompt, launcher_fallback_url
+            )
             return await self._async_copilot_wait_and_read(
                 pane, timeout=timeout, baseline=baseline, prompt=prompt
             )
@@ -1541,12 +1699,17 @@ class BrowserSession:
         `launcher_fallback_url` is where to retry if `nav_url` turns out to be a
         page with no Copilot launcher (calendar item pages are one such).
 
+        `timeout` budgets the *generation*; getting the prompt in can itself cost
+        time when the iframe swaps mid-submit (see
+        `_async_copilot_open_and_submit`), so `_COPILOT_ACQUIRE_BUDGET` is added
+        on top rather than letting a retried submit eat the caller's answer time.
+
         Returns {"status": "ok", "text": ...} or {"status": "timeout", "partial_text": ...}.
         Raises BearerModeRequiredError, SessionExpiredError, or CopilotUnavailableError.
         """
         return self._run_with_recovery(
             lambda: self._async_copilot_ask(prompt, nav_url, timeout, launcher_fallback_url),
-            timeout=timeout + 30,
+            timeout=timeout + 30 + _COPILOT_ACQUIRE_BUDGET,
         )
 
     # ------------------------------------------------------------------

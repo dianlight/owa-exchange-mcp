@@ -1142,6 +1142,78 @@ because 45 was below what #902 needs, and a ceiling that low silently converts t
 the timeout-is-a-pass branch. Re-run live: 5/5, with #902 now returning 2062 chars of a real
 structured summary.
 
+**Update 2026-09-15 (later) — the completion check now keys on `aria-busy`, because the text
+rule failed a third time and a DOM probe found the signal §4 had been asking for.** Probing the
+live pane was meant to be a small investigation and instead reproduced the bug at ten times the
+severity, which is the reason to record the numbers rather than just the conclusion. Across 444
+samples of one generation:
+
+- `aria-busy="true"` was present for samples 0-87 (t=0.0-48.0s) and absent after — covering the
+  generating window *exactly*, with no false positive or false negative in the run.
+- The visible stop control tracked it precisely, same first and last sample.
+- `data-testid="loading-message"` was visible in **444/444** samples. It is a permanent element,
+  not a state flag, and it is the candidate anyone inspecting that DOM would reach for first.
+- The final answer text (8836 chars) first appeared at t=49.4s — **1.4s after** the flag cleared.
+- Most damning: the text sat at **377 chars for 27 consecutive polls (~14s)** with `aria-busy=true`
+  the whole time, while the real answer was still 46 seconds away. The rule shipped earlier that
+  day settles after 2 stable polls on the marker path, so it would have returned that 377-char
+  fragment as a confident answer. Then, once genuinely done, 356 polls at the final length with
+  `aria-busy=true` in *none* of them.
+
+So `saw_busy` is now latching: once the DOM has told us generation started, its clearing is what
+"finished" means, and the text heuristics remain only as a fallback for a pane that never exposes
+the attribute — a redesign degrades to the old behaviour rather than timing out on every call.
+The 1.4s lag is why stability is still required after the flag clears.
+
+The probe also exposed a second, quieter defect in that morning's fix: `in_flight` was computed as
+`not has_marker and _copilot_has_progress_line(text)`, and the pane is **reused across calls with
+its transcript intact** — so a `Copilot said:` marker from a previous answer is present before the
+next prompt is even submitted. Marker *presence* therefore answered "has Copilot ever answered
+here", not "has it answered this", and every call after the first took the permissive 2-poll path
+with the progress-line guard switched off. `_copilot_answer_marker_count` compares against the
+baseline's count instead. Note that this was invisible to both the unit tests (which start from a
+clean transcript) and the smoke run (which passed anyway, because the answers happened to arrive).
+
+`_COPILOT_POLL_SECONDS` was extracted at the same time so the tests that drive the real loop can
+compress the interval: the suite went from 24.6s to **1.1s** for 38 checks, which matters because
+`python -m tests.unit` runs on every push.
+
+Live re-run: two consecutive smoke runs, 4/5 each, with every tool that reached the settle loop
+returning a substantive answer (including a 1947-char summary for #902). The one failure per run is
+a *different* bug in pane acquisition, rotating between tools — it fails in
+`_async_copilot_submit` before the settle loop is entered, so it is not caused by this change. See
+the next update.
+
+**Update 2026-09-15 (last) — the pane-acquisition race is fixed too, and the module is green:
+3 consecutive smoke runs, 15/15 calls.** The race cost ~1 call in 5, always as
+`Locator.press: Frame was detached` from inside the composer. What makes it unfixable by checking
+harder up front: the frame is replaced *between* `fill()` and `press()`, and
+`_async_copilot_open_pane` already polls until the frame is usable — that check is simply made once
+and then trusted for the rest of the submit. No amount of pre-verification keeps a frame alive.
+
+So `_async_copilot_open_and_submit` retries **acquire-and-submit as one unit**, because they are
+one unit: a dead frame invalidates the pane locator *and* the baseline text, and carrying either
+across a retry means diffing an answer against a stale snapshot. `_copilot_is_frame_swap` decides
+what may be retried, deliberately narrow — a launcher that isn't there, a classic-OWA tenant, or a
+rate-limit banner all still fail immediately, because retrying those just wastes a minute.
+
+The subtle part is the double-submit guard, and it is the reason this is not a bare retry loop: if
+the lost `Enter` actually landed and the frame died right after, retrying asks Copilot the same
+question twice. Comparing the fresh transcript's turn count against the one we typed into detects
+it, and then the *pre-submit* baseline is kept rather than the fresh one — the fresh transcript
+already contains the answer being generated, so using it as baseline would make
+`_copilot_answer_text` treat that answer as pre-existing furniture and subtract it. That is a bug
+the tests would not have caught by accident, so `test_submit_does_not_ask_copilot_twice` asserts
+both halves.
+
+One result in those runs is worth reading correctly rather than as a blemish: run 3's
+`meeting_prep` returned `status: "timeout"` with real `partial_text`. The suite counts that as a
+pass by the tools' documented contract, and it is the `aria-busy` rule behaving exactly as
+intended — it declined to call a plateau finished and reported an honest timeout. Under the text
+rule that shipped the same morning, that identical state came back as `{"status": "ok"}`.
+
+Suite total 43 checks, still ~1.3s.
+
 **Update 2026-09-15 — a profile directory another browser owns is now detected and named
 (#11), and two long-standing claims in this document turned out to be wrong.** The gap in §4
 is closed: `BrowserSession` inspects the profile directory before launching, waits out a lock
@@ -1336,11 +1408,11 @@ stringifies to nothing and printed `startup failed: .`
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 901 | `ask_copilot` | Generic delegator: sends a free-text prompt to Copilot's chat pane, optionally grounded against an email/event via a best-effort deep link | `tests/smoke/tests/test_copilot.py`, `tests/unit/test_copilot_answer_text.py` | **OK (2026-09-11)** — verified live on an isolated bearer-mode profile: returned exactly `PONG` for a ping prompt. Confirms the pane has a real free-text composer, which the discovery capture could not (it only ever saw preset chips). Responses now also carry `grounded`. | Stable |
-| 902 | `summarize_email_thread` | Ask Copilot to summarize an email thread and list action items | `tests/smoke/tests/test_copilot.py` | **OK (2026-09-11)** — verified live: returns a real summary of the named thread ("promotional email from BeyondTrust inviting..."). Needed the grounding fix as well as the iframe/frame ones — before it Copilot answered "non vedo alcun thread email" and ran a generic mailbox search, because navigating to an item does *not* put it in the pane's context. **Re-verified 2026-09-15, after fixing a false success it exposed.** At the suite's then-45s ceiling this returned `status: "ok"` carrying 176 chars of *pane chrome* — `"In corso…"` plus the `"Scarica l'app per dispositivi mobili Copilot"` promo — because a progress indicator is both new relative to `baseline` and unchanging, so neither baseline-diffing nor waiting for stability could reject it. `_async_copilot_wait_and_read` now also requires a `"Copilot said:"` turn marker (or, absent one, a longer stable run *and* no progress line), and the suite's `TIMEOUT` is 80s. Same call now returns 2062 chars of a genuine structured summary | Stable |
-| 903 | `draft_reply_with_copilot` | Ask Copilot to draft a reply to an email per free-text instructions/tone; returns text only, doesn't send | `tests/smoke/tests/test_copilot.py` | **OK (2026-09-11)** — verified live: returns several drafted reply options honouring `instructions` and `tone`. Free-text `instructions` are no longer an inference — the composer is real. Same grounding dependency as #902. | Stable |
-| 904 | `coach_draft` | Ask Copilot's compose coaching for feedback on a draft reply's tone/clarity | `tests/smoke/tests/test_copilot.py` | **OK (2026-09-11)** — verified live: returns substantive tone/clarity coaching. The capture's "no Coaching affordance at all" turned out not to matter: coaching is just a prompt. It was the *first* of the five to work, precisely because it already pasted its content (`draft_text`) into the prompt instead of relying on the pane to see the item. | Stable |
-| 905 | `meeting_prep` | Ask Copilot to prepare a briefing for an upcoming meeting (context, documents, action items) | `tests/smoke/tests/test_copilot.py` | **OK (2026-09-11)** — verified live: returns a briefing naming the actual event ("25 meeting correlati al tema «GECO \| UnipolService...»"). The calendar-item page has no Copilot launcher, so the `launcher_fallback_url` path is exercised on every call and is confirmed working. | Stable |
+| 901 | `ask_copilot` | Generic delegator: sends a free-text prompt to Copilot's chat pane, optionally grounded against an email/event via a best-effort deep link | `tests/smoke/tests/test_copilot.py`, `tests/unit/test_copilot_answer_text.py` | **OK (2026-09-11)** — verified live on an isolated bearer-mode profile: returned exactly `PONG` for a ping prompt. Confirms the pane has a real free-text composer, which the discovery capture could not (it only ever saw preset chips). Responses now also carry `grounded`. **Re-verified 2026-09-15 (later), now green: 3 consecutive smoke runs, 15/15 calls.** Needed two fixes that day beyond the morning's: completion detection keys on `aria-busy` rather than pane text, and `_async_copilot_open_and_submit` retries acquire-and-submit as a unit when the iframe is replaced mid-typing (that race was costing ~1 call in 5 with the failing tool rotating between runs). See the two 2026-09-15 updates in §1 | Stable |
+| 902 | `summarize_email_thread` | Ask Copilot to summarize an email thread and list action items | `tests/smoke/tests/test_copilot.py` | **OK (2026-09-11)** — verified live: returns a real summary of the named thread ("promotional email from BeyondTrust inviting..."). Needed the grounding fix as well as the iframe/frame ones — before it Copilot answered "non vedo alcun thread email" and ran a generic mailbox search, because navigating to an item does *not* put it in the pane's context. **Re-verified 2026-09-15, after fixing a false success it exposed.** At the suite's then-45s ceiling this returned `status: "ok"` carrying 176 chars of *pane chrome* — `"In corso…"` plus the `"Scarica l'app per dispositivi mobili Copilot"` promo — because a progress indicator is both new relative to `baseline` and unchanging, so neither baseline-diffing nor waiting for stability could reject it. `_async_copilot_wait_and_read` now also requires a `"Copilot said:"` turn marker (or, absent one, a longer stable run *and* no progress line), and the suite's `TIMEOUT` is 80s. Same call now returns 2062 chars of a genuine structured summary **Re-verified 2026-09-15 (later), now green: 3 consecutive smoke runs, 15/15 calls.** Needed two fixes that day beyond the morning's: completion detection keys on `aria-busy` rather than pane text, and `_async_copilot_open_and_submit` retries acquire-and-submit as a unit when the iframe is replaced mid-typing (that race was costing ~1 call in 5 with the failing tool rotating between runs). See the two 2026-09-15 updates in §1 | Stable |
+| 903 | `draft_reply_with_copilot` | Ask Copilot to draft a reply to an email per free-text instructions/tone; returns text only, doesn't send | `tests/smoke/tests/test_copilot.py` | **OK (2026-09-11)** — verified live: returns several drafted reply options honouring `instructions` and `tone`. Free-text `instructions` are no longer an inference — the composer is real. Same grounding dependency as #902. **Re-verified 2026-09-15 (later), now green: 3 consecutive smoke runs, 15/15 calls.** Needed two fixes that day beyond the morning's: completion detection keys on `aria-busy` rather than pane text, and `_async_copilot_open_and_submit` retries acquire-and-submit as a unit when the iframe is replaced mid-typing (that race was costing ~1 call in 5 with the failing tool rotating between runs). See the two 2026-09-15 updates in §1 | Stable |
+| 904 | `coach_draft` | Ask Copilot's compose coaching for feedback on a draft reply's tone/clarity | `tests/smoke/tests/test_copilot.py` | **OK (2026-09-11)** — verified live: returns substantive tone/clarity coaching. The capture's "no Coaching affordance at all" turned out not to matter: coaching is just a prompt. It was the *first* of the five to work, precisely because it already pasted its content (`draft_text`) into the prompt instead of relying on the pane to see the item. **Re-verified 2026-09-15 (later), now green: 3 consecutive smoke runs, 15/15 calls.** Needed two fixes that day beyond the morning's: completion detection keys on `aria-busy` rather than pane text, and `_async_copilot_open_and_submit` retries acquire-and-submit as a unit when the iframe is replaced mid-typing (that race was costing ~1 call in 5 with the failing tool rotating between runs). See the two 2026-09-15 updates in §1 | Stable |
+| 905 | `meeting_prep` | Ask Copilot to prepare a briefing for an upcoming meeting (context, documents, action items) | `tests/smoke/tests/test_copilot.py` | **OK (2026-09-11)** — verified live: returns a briefing naming the actual event ("25 meeting correlati al tema «GECO \| UnipolService...»"). The calendar-item page has no Copilot launcher, so the `launcher_fallback_url` path is exercised on every call and is confirmed working. **Re-verified 2026-09-15 (later), now green: 3 consecutive smoke runs, 15/15 calls.** Needed two fixes that day beyond the morning's: completion detection keys on `aria-busy` rather than pane text, and `_async_copilot_open_and_submit` retries acquire-and-submit as a unit when the iframe is replaced mid-typing (that race was costing ~1 call in 5 with the failing tool rotating between runs). See the two 2026-09-15 updates in §1 | Stable |
 
 ### Tasks — [exchange_mcp/tools/tasks.py](exchange_mcp/tools/tasks.py) (6)
 
@@ -1406,20 +1478,53 @@ hold a request open for.
 ## 4. Gaps worth closing
 
 - **~~Copilot's generation-complete heuristic reports a slow answer as a finished one~~ —
-  fixed 2026-09-15, but the underlying signal is still a heuristic.** The bug and its fix are
-  recorded on row 902 and in §1; what remains worth knowing is the residual risk, because two
-  successive versions of this same failure have now shipped. Completion is still inferred from
-  the pane's *text*, not from any authoritative DOM state: `_COPILOT_STOP_HINTS`,
-  `_COPILOT_ANSWER_MARKERS` and `_COPILOT_PROGRESS_HINTS` are all localisation tables, and the
-  live evidence for the answer markers being untranslated is one it-IT tenant. A third variant
-  of this failure is therefore possible — a pane state that is new, stable, marker-less and
-  carries a progress word we haven't listed. The change that would end the category rather
-  than patch it is a **DOM state attribute on the message node** marking generation complete
-  (a `data-*` flag, `aria-busy`, or a streaming class), which would be language-independent;
-  nobody has yet looked for one, and a `--show-browser` inspection of a mid-generation pane is
-  all it would take. Until then, every new hint belongs in those tables, never in the polling
-  code, and `tests/unit/test_copilot_answer_text.py` drives the real loop against scripted
-  pane text so a regression is caught without a mailbox.
+  **closed 2026-09-15: the language-independent signal this entry asked for exists, and is now
+  the primary one.** It is `aria-busy`, not a `data-*` flag. A 444-sample DOM probe of a live
+  generation settled it beyond argument:
+
+  | Signal | Generating window | Verdict |
+  |---|---|---|
+  | `aria-busy="true"` | samples 0-87, t=0.0-**48.0s** | clears exactly at completion |
+  | stop control visible | samples 0-87, t=0.0-**48.0s** | tracks `aria-busy` precisely |
+  | `data-testid="loading-message"` | visible **444/444** | a permanent element, not a flag |
+
+  Final answer text first appeared at t=49.4s, 1.4s after the flag cleared — which is why text
+  stability is still required *after* it clears rather than replaced by it. In the same run the
+  text went flat at 377 chars for **27 consecutive polls (~14s)** with `aria-busy=true`
+  throughout and the real 8836-char answer still 46 seconds away: the shipped text rule would
+  have returned that fragment confidently, so this was the same bug a third time, an order of
+  magnitude worse than the 176-char case. Once genuinely finished, 356 polls at the final length
+  with `aria-busy=true` in **zero** of them.
+  `loading-message` is the trap worth naming: it reads like the obvious candidate and is useless.
+  The text heuristics survive only as a fallback for a pane that never exposes `aria-busy`, so a
+  redesign degrades to the old behaviour instead of timing out on every call. Probes kept under
+  `.discovery-sessions/copilot-dom-probe/` (gitignored).
+- **~~Copilot's pane acquisition races the iframe swap~~ — fixed 2026-09-15.** The failure was
+  `Locator.press: Frame was detached` raised from inside the composer: the frame is replaced
+  between `fill()` and `press()`, so checking that it is "usable" beforehand cannot help —
+  `_async_copilot_open_pane` already did that, and the check is made once and then trusted for the
+  whole submit. Cost ~1 call in 5 across two smoke runs, with the failing tool rotating (run 1:
+  #902 and #903; run 2: #904), which is what marked it a race rather than a tool-specific bug.
+  Fixed by retrying **acquire-and-submit as one unit** (`_async_copilot_open_and_submit`): a dead
+  frame invalidates the pane locator *and* the baseline text, so keeping either across a retry
+  would diff an answer against a stale snapshot. Verified by 3 consecutive runs, 15/15 calls.
+  The non-obvious hazard the retry introduces, and the reason it is not a bare loop: if the lost
+  `Enter` actually *landed* and the frame died immediately after, retrying asks Copilot the same
+  question twice. `_copilot_answer_marker_count` against the transcript we typed into detects
+  that, and in that case the *pre-submit* baseline is kept — the fresh transcript already holds
+  the answer being generated, so using it would make the extractor subtract the answer as
+  furniture.
+- **The Copilot deep links are confirmed for `outlook.office365.com` only, and this tenant has
+  moved (noticed 2026-09-15).** After a fresh sign-in the SPA came up on
+  **`outlook.cloud.microsoft`**, and one grounding navigation landed on
+  `outlook.cloud.microsoft/host/<app-guid>/entity1-<guid>` — a hosted-app shell, not a mail item.
+  `bearer_origin` follows whatever host the bearer token was captured on, so
+  `_copilot_item_url`'s `/mail/<folder>/id/<id>` and `/calendar/item/<id>` shapes are being
+  applied to a host they were never verified against. Nothing is known to be broken by this — the
+  three green runs above were on the new host — but "confirmed live" in those docstrings means
+  one host, and grounding failure is silent by design (a failed navigation falls through to an
+  ungrounded ask), so this would degrade answers rather than error. Worth a capture on the new
+  host to confirm or correct the shapes.
 - **`expand_recurrences`: all recurrence patterns in this mailbox now expand; the
   remaining limit is cost.** The `Recurrence` schema is confirmed (2026-09-10, across all 127
   series here) and documented in `_expand_recurrence_occurrences`: this backend nests the
@@ -1744,7 +1849,7 @@ hold a request open for.
     (which is what removes the composer placeholder), minus the pane's button labels (which is
     what removes the follow-up suggestion chips — generated per answer, so no hint table can
     cover them, but "it is a button" always holds). Covered by
-    `tests/unit/test_copilot_answer_text.py` (34 cases, no mailbox) — which since 2026-09-15
+    `tests/unit/test_copilot_answer_text.py` (43 cases, no mailbox) — which since 2026-09-15
     also drives `_async_copilot_wait_and_read` itself against scripted pane text, because
     `baseline` turned out not to be sufficient: a progress indicator is both new and stable,
     so settling now additionally requires a turn marker. See the 2026-09-15 update in §1.
