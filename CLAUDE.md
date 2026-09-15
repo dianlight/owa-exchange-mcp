@@ -30,6 +30,7 @@ Any variable above can also be placed in a gitignored `.env.local` next to `pypr
   - `browser_session.py` — `BrowserSession`: one persistent Chromium context for the process's lifetime, reused by every OWA call
   - `owa_client.py` — OWA API client; delegates transport to `BrowserSession`, keeps the request/response/folder-resolution logic
   - `auth_errors.py` — Pure diagnosis of a *timed-out* interactive sign-in: reason codes, the AADSTS/page-text/URL hint tables, per-reason remediation text, and `AuthenticationRequiredError`. Imports nothing else from the package (no Playwright) so it stays unit-testable — see "Authentication" below.
+  - `profile_lock.py` — Pure diagnosis of a profile directory that another browser already owns: lock-state probes, stale-vs-live judgement, the launch-error hint table, and `ProfileLockedError`. No Playwright, unit-testable — see "Recovery" below.
   - `discovery_session.py` — `DiscoveryRecorder`: a *second*, independent Chromium on a throwaway profile, visible and driven by the user, recording every API call and UI action. Shares nothing with `BrowserSession` but the OWA URL — see "Capability discovery" below.
   - `capability_inventory.py` — What this server already implements, derived by `ast`-scanning `tools/*.py` and `owa_client.py` for transport call sites, plus PROJECT_STATUS.md for the ID-numbering state. No Playwright, unit-testable.
   - `capability_classify.py` — Verdicts and implementation proposals for a recorded capture. Pure logic; the domain knowledge lives in two keyword tables, correctable in one place like `auth_errors.py`'s.
@@ -62,6 +63,7 @@ python -m tests.unit
 
 # ...or one suite at a time, while working on it
 python -m tests.unit.test_auth_errors
+python -m tests.unit.test_profile_lock
 python -m tests.unit.test_recurrence_expansion
 python -m tests.unit.test_capability_classify
 python -m tests.unit.test_item_errors
@@ -75,7 +77,10 @@ python -m tests.unit.test_folder_resolution
 # The harness starts its own server on 127.0.0.1:8765 if nothing is listening
 # there; set EXCHANGE_SMOKE_HOST/EXCHANGE_SMOKE_PORT to reuse a server that is
 # already running instead — two servers can't share one browser profile
-# directory (Chromium holds an exclusive lock on it).
+# directory. Since 2026-09-15 the second one says so (`ProfileLockedError`,
+# issue #11); note it is this server that refuses, not Chromium — Playwright's
+# Chromium will happily launch a second browser on a profile the first is
+# holding, which is the silent corruption risk that check exists to prevent.
 python -m tests.smoke.tests.test_copilot
 EXCHANGE_SMOKE_PORT=8767 python -m tests.smoke.tests.test_copilot
 
@@ -167,6 +172,13 @@ Deliberate design points, each of which has a wrong-looking-but-tempting alterna
 **RequestServerVersion**: `Exchange2013` for reads, `V2017_08_18` for writes.
 
 **Recovery**: if the browser process/context crashes, `BrowserSession` relaunches on the same profile directory and retries the call once. If the OWA session expires, `OWAClient` retries once after a silent re-auth attempt — see "Authentication" above for what happens when that can't succeed.
+
+**A profile another browser already owns is refused, not retried (`profile_lock.py`, issue #11)**. One profile directory has exactly one owner, and the failure mode that gap produced was pathological: an orphaned Chromium tree holding `.browser-profile` made every launch — *including the crash recovery's own one-retry* — report only `Target page, context or browser has been closed`, which named neither the profile nor the real cause. So `_async_ensure_context` now inspects the directory *before* launching, waits out a lock that is merely transient, and raises `ProfileLockedError` (naming the directory, the owner PID where knowable, and the remediation) if it is genuinely held; `_run_with_recovery` re-raises that ahead of its `_CRASH_HINTS` check, because relaunching into a live lock is the exact non-recovery this issue is about. Four things are load-bearing:
+
+- **The error text alone cannot decide it**, which is the structural difference from `auth_errors.py`: a crashed browser and a contended profile produce the *same* closed-context message. `classify_launch_failure()` therefore takes the launch error *plus* a live look at the directory, and returns `None` (i.e. "keep your generic crash handling") for a bare "has been closed" — guessing `profile_locked` from that would relabel every ordinary crash as an operator error.
+- **Detection has to happen before the launch, because the launch does not fail.** Verified 2026-09-15: Playwright's Chromium does **not** refuse a second `launch_persistent_context` on a profile a live browser holds — it launches, is usable, and quietly shares the `user-data-dir` that Chromium's own ProcessSingleton exists to keep single. So "two servers can't share one profile" is a hazard here, not an enforced error, and waiting for a lock error would wait forever.
+- **`SingletonLock` is POSIX-only.** Windows Chromium uses a named mutex and writes no such file, so the documented `<host>-<pid>` symlink — the only artifact that names an owner, and therefore the only one that can be judged *stale* — is unavailable there. The cross-platform signal is the OS lock Chromium holds on its LevelDB `LOCK` files (`_LOCK_PROBE_FILES`); note that only *some* of them are held on a live profile (measured: three held, `PersistentOriginTrials/LOCK` free), so any one held file is decisive while "free" needs every present file to agree.
+- **Only a positively-detected live lock blocks a launch, and only a positively-dead owner is cleared.** Every undecidable case returns `unknown`, which never blocks: a fabricated lock takes a healthy server offline, which is worse than the confusing message being replaced. `clear_stale_lock()` unlinks Chromium's singleton artifacts *only* when an owner was identified and found gone, and nothing in that module ever touches a process — the orphaned-tree case still needs a human with a task manager, the change is that they are now told so. Add new signals to the tables in `profile_lock.py`, not to `browser_session.py`, and cover them in `tests/unit/test_profile_lock.py`.
 
 **Transport (`stdio` vs `http`)**: `main()` picks the transport via `--transport`/`EXCHANGE_MCP_TRANSPORT`. The lifespan that creates the `BrowserSession` runs exactly once per process either way (on v2 that is the SDK's own behaviour; 1.x re-entered it per streamable-http client session, which `_ensure_started()`'s process-wide state already absorbed) — under `stdio` that process is spawned and killed per client session, so the warm browser/login is rebuilt every time; under `--transport http` the process is long-lived and the same `BrowserSession`/login is shared across every client connection that hits it, but it must be started manually — there is no autostart mechanism. Never bind `--host`/`EXCHANGE_MCP_HOST` off `127.0.0.1` — the MCP endpoint has no auth of its own, and the SDK's `transport_security` (Host header validation) must stay enabled to block DNS-rebinding from other pages in the user's browser. Under v2 that protection is armed by the `host` passed to `run()` — the SDK auto-enables it for `127.0.0.1`/`localhost`/`::1` — so moving the bind address off loopback silently disarms it as well as exposing the port.
 

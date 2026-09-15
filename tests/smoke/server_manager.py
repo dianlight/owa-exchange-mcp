@@ -8,9 +8,12 @@ Only an explicit `python -m tests.smoke.server_manager stop` tears it down.
 `EXCHANGE_SMOKE_HOST`/`EXCHANGE_SMOKE_PORT` point the suite at a server that is
 *already* running elsewhere (e.g. a long-lived instance on another port) instead
 of spawning one here. That matters because two servers cannot share one browser
-profile directory -- Chromium holds an exclusive lock on it -- so spawning a
-second server while another already owns the default profile fails or, worse,
-disturbs the live session. Reuse the running one instead:
+profile directory, so spawning a second server while another already owns the
+default profile fails or, worse, disturbs the live session. Since 2026-09-15 that
+failure is at least legible: the second server detects the held profile and says
+so (`ProfileLockedError`, issue #11) instead of reporting a generic closed-context
+error. Note it is the *server* that refuses -- Playwright's Chromium does not,
+which is exactly why the check had to be written. Reuse the running one instead:
     EXCHANGE_SMOKE_PORT=8767 python -m tests.smoke.tests.test_copilot
 
 **Reuse is deliberate, but it is not free, and it used to be silent.** Attaching to

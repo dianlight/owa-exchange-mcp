@@ -1214,6 +1214,69 @@ rule that shipped the same morning, that identical state came back as `{"status"
 
 Suite total 43 checks, still ~1.3s.
 
+**Update 2026-09-15 — a profile directory another browser owns is now detected and named
+(#11), and two long-standing claims in this document turned out to be wrong.** The gap in §4
+is closed: `BrowserSession` inspects the profile directory before launching, waits out a lock
+that is merely transient, and raises `ProfileLockedError` — naming the directory, the owner
+PID where knowable, and the remediation — when it is genuinely held. `_run_with_recovery`
+re-raises that *ahead* of its `_CRASH_HINTS` check, which is the specific non-recovery the
+issue reported: a contended profile and a crashed browser produce the same
+`Target page, context or browser has been closed`, so the automatic one-retry relaunched into
+the same lock and failed identically. The diagnosis lives in a new pure module,
+[profile_lock.py](exchange_mcp/profile_lock.py), covered by
+[tests/unit/test_profile_lock.py](tests/unit/test_profile_lock.py) (66 checks, no browser).
+
+Two things this document has asserted for months are **not true**, and both were measured
+rather than reasoned about:
+
+- **"Chromium holds an exclusive lock on the profile directory" — it does not, under
+  Playwright.** A second `launch_persistent_context` against a profile a live browser was
+  holding launched successfully and was usable. So "two servers can't share one profile" is a
+  *hazard* here, not an enforced error, and nothing was ever going to surface it by failing:
+  detection has to happen **before** the launch. It also means every accidental double-start
+  in this repo's history silently shared a `user-data-dir` rather than bouncing off it, which
+  is a better explanation for the original orphaned-tree incident than "a rare idle-gap
+  crash". Corrected in CLAUDE.md and `tests/smoke/server_manager.py`; the older §1 paragraphs
+  repeating the claim are left as written, dated as they are.
+- **`SingletonLock` does not exist on Windows.** Chromium's ProcessSingleton uses a named
+  mutex there, so the documented `<host>-<pid>` symlink — the only artifact that names an
+  owner, and therefore the only one that can distinguish a *stale* lock from a live one — is
+  simply absent on the platform this repo is developed on. The cross-platform signal is the OS
+  lock Chromium holds on its LevelDB `LOCK` files; measured on a live server's profile, three
+  of the four probed files reported held and `Default/PersistentOriginTrials/LOCK` reported
+  free, so any single held file is decisive while "free" requires every present file to agree.
+  A scan that stopped at the first readable file would have called that profile free.
+
+Three deliberate choices, each with a wrong-looking-but-tempting alternative:
+
+- **The error text is not sufficient input.** Unlike `auth_errors.py`, whose page text is the
+  whole story, `classify_launch_failure()` takes the launch error *plus* a live probe, and
+  returns "no verdict" for a bare "has been closed". Reading `profile_locked` off that text
+  alone would relabel every ordinary browser crash as an operator error.
+- **Undecidable means proceed.** Every path that cannot reach a verdict returns `unknown`, and
+  `unknown` never blocks a launch. A missed lock costs one confusing failure and a manual
+  taskkill; a *fabricated* one takes a healthy server offline, so the two directions are not
+  weighted equally.
+- **Nothing kills anything.** Only a positively-dead named owner has its singleton artifacts
+  cleared, and the module contains no process-termination call at all (the unit suite asserts
+  that by reading its own source). If another server is genuinely running, the correct outcome
+  is a message, not a fight over the profile — the orphaned-tree case still needs a human with
+  a task manager, and the change is that they are now told exactly that.
+
+Verified live 2026-09-15 on an isolated throwaway profile and port 8791 (production untouched,
+per the port conventions in `server_manager.py`): with the profile held by another browser, the
+startup banner read `lock: HELD BY ANOTHER PROCESS (a live process holds the browser lock file
+'Default/Local Storage/leveldb/LOCK')` and startup logged `Browser status: PROFILE LOCKED`
+naming the directory and the remediation, instead of the old closed-context error; with the
+holder gone, the same start read `lock: free (no process holds any of the 4 browser lock
+file(s) probed)` and launched normally, and the visible relaunch the interactive-login path
+performs was **not** mistaken for a foreign lock — that regression risk (waiting out our own
+exiting Chromium) is what the two separate wait budgets in `browser_session.py` exist for.
+One unrelated diagnostic improved on the way past: `_startup`'s catch-all now logs the
+exception *class* as well as its message, because the one that actually shows up there
+(`concurrent.futures.TimeoutError`, when a slow or unreachable host outlasts `_run`'s budget)
+stringifies to nothing and printed `startup failed: .`
+
 ## 2. How to read the table
 
 - **ID** — a permanent identifier, `<module number><2-digit sequence within that module>`:
@@ -1828,21 +1891,31 @@ hold a request open for.
   (Copilot settings). These are ordinary substrate calls — unlike generation itself, they'd
   need no UI automation. None of them produce an answer to a prompt, so they'd extend the
   Copilot module's surface rather than fix #901-905.
-- **`BrowserSession`'s crash recovery doesn't cover a stuck profile lock.** Its documented
-  recovery path (see CLAUDE.md's "Recovery" section) relaunches on the same profile directory
-  and retries once if the browser process/context crashes. Observed during folder-tool testing
-  (2026-09-08): after a long idle gap, an orphaned Chromium process tree from an earlier launch
-  was still holding `.browser-profile`'s singleton lock, so every subsequent
-  `launch_persistent_context` call — including the automatic one-retry recovery itself — hit
-  the same lock and failed with "Target page, context or browser has been closed." Only a
-  manual `taskkill /T /F` on the whole process tree (freeing the lock) followed by a fresh
-  server start recovered it. **Reframed 2026-09-08**: this was originally logged as a rare,
-  one-off idle-gap crash, but the same-day discovery that `server.py`'s lifespan ran fresh per
-  client session (now fixed, see §1) means every single MCP connection up to that fix was
-  independently launching Chromium against the same profile lock — i.e. lock contention was a
-  structural risk on every multi-session run, not an edge case. The lifespan fix removes most of
-  that exposure (one browser per process now, not per session), but the underlying gap — no
-  stuck-lock detection/recovery — is still open and worth hardening later.
+- ~~**`BrowserSession`'s crash recovery doesn't cover a stuck profile lock.**~~ **Closed
+  2026-09-15 (#11)** — see the 2026-09-15 update in §1 for the fix and for the two claims this
+  document had wrong. History, because the reframing is instructive: its documented recovery
+  path (see CLAUDE.md's "Recovery" section) relaunches on the same profile directory and retries
+  once if the browser process/context crashes. Observed during folder-tool testing (2026-09-08):
+  after a long idle gap, an orphaned Chromium process tree from an earlier launch was still
+  holding `.browser-profile`'s singleton lock, so every subsequent `launch_persistent_context`
+  call — including the automatic one-retry recovery itself — hit the same lock and failed with
+  "Target page, context or browser has been closed." Only a manual `taskkill /T /F` on the whole
+  process tree (freeing the lock) followed by a fresh server start recovered it. **Reframed
+  2026-09-08**: this was originally logged as a rare, one-off idle-gap crash, but the same-day
+  discovery that `server.py`'s lifespan ran fresh per client session (now fixed, see §1) means
+  every single MCP connection up to that fix was independently launching Chromium against the
+  same profile lock — i.e. lock contention was a structural risk on every multi-session run, not
+  an edge case. The lifespan fix removed most of that exposure (one browser per process, not per
+  session); the detection gap is what closed now.
+  **Still open — the orphan itself.** What is fixed is the *diagnosis*: a held profile is
+  detected before launching and reported with the directory, the owner PID where knowable, and
+  what to do about it, and the crash-recovery retry no longer relaunches into the same lock.
+  Recovering from an orphaned Chromium tree still needs a human to end it, deliberately: only a
+  *stale* lock (a named owner confirmed gone, which on Windows cannot arise at all — no
+  `SingletonLock` file exists there) is cleared automatically, and nothing in
+  `profile_lock.py` will ever terminate a process. Killing a browser that might still be
+  serving another instance of this server is not a recovery, and an operator who is told which
+  directory is held and by which PID has a one-step fix already.
 - **Reminder times are written in a hardcoded timezone, and for tasks that's now
   user-visible.** Every write in this codebase sends `TimeZoneContext` =
   `Russian Standard Time` (UTC+3) — inherited from the original scripts, and harmless while
