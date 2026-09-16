@@ -5,7 +5,14 @@ instructions.md
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 
-# Credentials and session data
+# Credentials and session data.
+# The first three are artifacts of mechanisms this server no longer has —
+# `.credentials.enc`/`.salt` came from `login.py --setup` + EXCHANGE_MASTER_PASSWORD,
+# `session-cookies.txt` from the pre-browser requests transport (both removed, see
+# PROJECT_STATUS.md §"Update 2026-09-10"). Nothing writes them anymore, but the rules
+# stay: an old checkout still has those files on disk, and this repository is public,
+# so dropping the rule is how an encrypted credential blob gets committed. Do not
+# "clean up" these three lines — delete the files instead.
 .credentials.enc
 .salt
 session-cookies.txt
