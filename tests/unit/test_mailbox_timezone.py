@@ -260,20 +260,31 @@ def test_describe() -> None:
 # ------------------------------------------------------------------
 
 
-class _FakeClient(OWAClient):
-    """An OWAClient with request() stubbed out and no BrowserSession at all.
+class _StubBrowser:
+    """Just enough of a BrowserSession for OWAClient.__init__ to read.
 
-    Subclassed rather than constructed so __init__'s real cache/lock setup is
-    what's under test; BrowserSession is bypassed because nothing here needs
-    a browser and importing one would need Playwright's browsers installed.
+    A real one is avoided because nothing here needs a browser and importing
+    one would need Playwright's browsers installed.
+    """
+
+    owa_url = "https://owa.example.com"
+
+
+class _FakeClient(OWAClient):
+    """An OWAClient with request() stubbed out and a stub for a BrowserSession.
+
+    `super().__init__` is called on purpose, so __init__'s real cache/lock setup
+    is genuinely what's under test. It used to be hand-copied here instead,
+    which read the same but wasn't: adding a cache field to OWAClient (the
+    shared `_user_configuration` blob) left this fake without it, and seven
+    checks failed on an AttributeError that said nothing about the behaviour
+    they were checking.
     """
 
     def __init__(self, responses):
+        super().__init__(_StubBrowser())
         self.actions: list[str] = []
         self._responses = responses
-        self._timezone = None
-        import threading
-        self._timezone_lock = threading.Lock()
 
     def request(self, action, payload, *, timeout=30):
         self.actions.append(action)

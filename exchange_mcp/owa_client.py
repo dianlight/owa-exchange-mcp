@@ -145,6 +145,10 @@ class OWAClient:
         # other one.
         self._timezone: mtz.TimezoneResolution | None = None
         self._timezone_lock = threading.Lock()
+        # The one GetOwaUserConfiguration response both of the above read from
+        # -- see _owa_user_configuration() for why it is shared.
+        self._user_configuration: dict | None = None
+        self._user_configuration_lock = threading.Lock()
 
     @property
     def cookie_file(self):
@@ -345,12 +349,17 @@ class OWAClient:
         capture would then report two endpoints we *do* call as unknown APIs --
         the expensive direction of that error (see CLAUDE.md on why the
         attribution rules over-credit rather than under-credit).
+
+        The first probe is deliberately the *shared*, process-cached
+        `_owa_user_configuration()` rather than a timezone-private request:
+        `resolve_own_mailbox()` reads the mailbox's SMTP address out of the same
+        response, and whichever of the two runs first pays for it.
         """
         failures: list[str] = []
         # The names here are only for the failure message an operator reads --
         # the action each probe actually sends is the literal inside it.
         for action, probe in (
-            ("GetOwaUserConfiguration", self._probe_owa_user_configuration),
+            ("GetOwaUserConfiguration", self._owa_user_configuration),
             ("GetUserConfiguration", self._probe_ews_user_configuration),
         ):
             try:
@@ -366,24 +375,56 @@ class OWAClient:
             failures.append(f"{action}: no timezone in the response")
         return None, "; ".join(failures), False
 
-    def _probe_owa_user_configuration(self) -> dict:
-        """OWA's own user-options blob, where its web client reads the zone from.
+    def _owa_user_configuration(self) -> dict:
+        """OWA's own user-options blob, fetched at most once per process.
 
-        Deliberately *not* delegated to `_get_owa_user_configuration()`, which
-        issues the same request for the mailbox-address lookup: that one swallows
-        every exception and returns None, so a `SessionExpiredError` would come
-        back indistinguishable from "this backend won't serve it" -- and telling
-        those apart is the whole reason the timezone resolution refuses to cache
-        an expiry (see mailbox_timezone_detail, and the unit check that asserts
-        it). The cost of keeping them separate is one extra request per process;
-        unifying them means one fetcher that *surfaces* expiry and lets each
-        caller decide, which is a refactor rather than a merge fix.
+        Two unrelated questions are answered out of this one response -- the
+        mailbox's timezone (`mailbox_timezone_detail()`) and its own SMTP
+        address (`resolve_own_mailbox()`) -- so it is cached here, at the
+        transport, rather than by either caller. They arrived as two methods
+        issuing the same request because they were built in parallel, which
+        costs a second round-trip on the first availability call for a blob
+        that cannot change underneath us.
+
+        **This is the refactor the two probes' own comment called for.** They
+        were kept apart on the grounds that delegating the timezone probe to
+        the identity one would make a `SessionExpiredError` indistinguishable
+        from "this backend won't serve it" -- correct, and the reason the
+        delegation runs the *other* way: this method surfaces every exception,
+        and `_user_configuration_or_none()` is the identity side's swallowing
+        wrapper on top of it. Each caller keeps its own error semantics and the
+        second round-trip goes away.
+
+        **Successes are cached, failures are not**, which is the asymmetry to
+        keep. Each caller already caches its own *outcome* (`_timezone`,
+        `_mailbox_address`), so a backend with no such surface still costs at
+        most one failed request per caller and never repeats per tool call.
+        Caching the exception here instead would mean choosing one caller's
+        error semantics for both, and they differ on purpose: the timezone path
+        has to see `SessionExpiredError` distinctly (it means "asked before
+        sign-in landed, try again"), while the identity path swallows
+        everything and degrades to an empty address.
+
+        Note the action name is a literal at the `request()` call below.
+        `capability_inventory.py` `ast`-scans for exactly that shape, so hiding
+        it behind a variable would make a discovery capture report an endpoint
+        we *do* call as an unknown API.
         """
-        return self.request("GetOwaUserConfiguration", {
-            "__type": "GetOwaUserConfigurationJsonRequest:#Exchange",
-            "Header": mtz.request_header("Exchange2013"),
-            "Body": {"__type": "GetOwaUserConfigurationRequest:#Exchange"},
-        })
+        cached = self._user_configuration
+        if cached is not None:
+            return cached
+
+        with self._user_configuration_lock:
+            if self._user_configuration is not None:
+                return self._user_configuration
+            data = self.request("GetOwaUserConfiguration", {
+                "__type": "GetOwaUserConfigurationJsonRequest:#Exchange",
+                "Header": mtz.request_header("Exchange2013"),
+                "Body": {"__type": "GetOwaUserConfigurationRequest:#Exchange"},
+            })
+            if isinstance(data, dict):
+                self._user_configuration = data
+            return data
 
     def _probe_ews_user_configuration(self) -> dict:
         """The EWS UserConfiguration equivalent, as a fallback for classic OWA."""
@@ -476,9 +517,12 @@ class OWAClient:
         """Our own mailbox's SMTP address, with the signal it came from.
 
         Resolved on first use and cached for the process. Costs at most one
-        request (`GetOwaUserConfiguration`) ever, and often none at all: in
-        bearer mode the `x-anchormailbox` header captured with the session's
-        token usually answers it outright.
+        request ever, and usually none at all -- for two independent reasons:
+        in bearer mode the `x-anchormailbox` header captured with the session's
+        token often answers it outright, and when it doesn't, the
+        `GetOwaUserConfiguration` blob it falls back to is the *shared*
+        `_owa_user_configuration()` that `mailbox_timezone_detail()` has
+        typically already paid for.
 
         **Degrades, never raises.** Every caller here is a tool that has
         something useful to do without the address (`find_free_time` reads the
@@ -507,7 +551,7 @@ class OWAClient:
         )
 
         if not resolved.address:
-            config = self._get_owa_user_configuration()
+            config = self._user_configuration_or_none()
             # Re-read the hints afterwards even when the config call failed:
             # that call is what establishes auth on a session whose first tool
             # call this is, so a bearer capture (and with it the anchormailbox
@@ -530,39 +574,43 @@ class OWAClient:
         """
         return self.resolve_own_mailbox(refresh=refresh).address
 
-    def forget_mailbox_address(self) -> None:
-        """Drop the cached address, so the next read re-resolves it.
+    def forget_mailbox_identity(self) -> None:
+        """Drop everything derived from *which* mailbox we are signed in to.
 
         Called after an interactive sign-in: `login(force=True)` exists to
         switch accounts, and a cached address from the *previous* account is
         the one failure mode worse than having none.
+
+        All three caches go, because all three answer that same question and
+        they now share a source. Dropping `_mailbox_address` alone would be
+        worse than useless: the next read would re-resolve it straight out of
+        the previous account's still-cached `_user_configuration` blob, so the
+        stale address would come back looking freshly probed. The timezone goes
+        with them for the same reason -- the new account can sit in a different
+        zone, and it was read from that same blob.
         """
         self._mailbox_address = None
+        self._user_configuration = None
+        self._timezone = None
 
-    def _get_owa_user_configuration(self) -> dict | None:
-        """Fetch GetOwaUserConfiguration, or None if this backend won't serve it.
+    def _user_configuration_or_none(self) -> dict | None:
+        """The shared user-options blob, or None if this backend won't serve it.
 
-        This is OWA's own bootstrap call for the signed-in user's settings, so
-        it exists wherever a mailbox does, but its response shape isn't pinned
-        down across the classic and modern backends (which is why the parsing
-        in mailbox_identity searches by key name rather than by path). Errors
-        are swallowed on purpose, including AuthenticationRequiredError: if the
-        session really is dead, the caller's own next request raises it with
-        the remediation text attached, and this identity probe is not the place
-        to surface that.
+        `_owa_user_configuration()` is OWA's own bootstrap call for the
+        signed-in user's settings, so it exists wherever a mailbox does, but
+        its response shape isn't pinned down across the classic and modern
+        backends (which is why the parsing in mailbox_identity searches by key
+        name rather than by path).
+
+        Errors are swallowed on purpose, including AuthenticationRequiredError:
+        if the session really is dead, the caller's own next request raises it
+        with the remediation text attached, and this identity probe is not the
+        place to surface that. That swallowing is exactly why the *cache* lives
+        one level down in `_owa_user_configuration()` and not here -- the
+        timezone path needs those same exceptions to stay visible.
         """
-        payload = {
-            "__type": "GetOwaUserConfigurationJsonRequest:#Exchange",
-            "Header": {
-                "__type": "JsonRequestHeaders:#Exchange",
-                "RequestServerVersion": "Exchange2013",
-            },
-            "Body": {
-                "__type": "GetOwaUserConfigurationRequest:#Exchange",
-            },
-        }
         try:
-            data = self.request("GetOwaUserConfiguration", payload)
+            data = self._owa_user_configuration()
         except Exception:
             return None
         return data if isinstance(data, dict) else None
