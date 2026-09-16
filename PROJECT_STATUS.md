@@ -2325,8 +2325,15 @@ hold a request open for.
   is wrong. Rows #601/#602/#701/#702 are `OK`. One thing that run turned up about the
   *other* 2026-09-16 change is logged separately below (cold-start identity caching).
 
-- **`resolve_own_mailbox()` caches a cold-start failure, so the first tool call of a process
-  decides `find_free_time`'s data source for the rest of that process's life.** Found live
+- ~~**`resolve_own_mailbox()` caches a cold-start failure, so the first tool call of a process
+  decides `find_free_time`'s data source for the rest of that process's life.**~~
+  **Closed 2026-09-16.** `mailbox_identity.is_retryable()` separates "nothing had answered yet"
+  from "this backend has no address", and `signal_state()` bounds the retry the first of those
+  earns: a miss is re-asked when the session's signals move, and not otherwise. Pinned by
+  `test_no_signals_is_retried_but_no_address_is_cached` and `test_signal_state_and_is_retryable`,
+  both by request *count*. The diagnosis below stands as the record of how it was found, but its
+  stated mechanism is wrong — see the amendment at the end of the entry, which is the part worth
+  reading. Found live
   2026-09-16 while verifying the timezone fix against the merged tree, and reproduced twice in
   each direction. On a freshly started server, the first availability call gets
   `no_identity_signals` and `find_free_time` reports `busy_source: calendar_folder` — the
@@ -2348,7 +2355,41 @@ hold a request open for.
   not cache a `no_identity_signals` result — distinguishing "asked and the backend has no such
   surface" (worth caching) from "asked before anything could answer" (worth retrying), the same
   distinction `OWAClient.mailbox_timezone_detail()` already makes for a `SessionExpiredError`.
-  Logged here rather than patched: it belongs to `mailbox_identity`'s change, one PR over.
+  **Amended 2026-09-16, second pass — the mechanism above is wrong, and the retry it justified
+  was too broad.** Both were corrected by driving `BrowserSession`/`OWAClient` directly instead
+  of through the MCP server, which is what finally made the swallowed exception visible:
+  - `GetOwaUserConfiguration` **is** served on a cold canary session, and carries the address at
+    `SessionSettings.UserEmailAddress` (plus `UserOptions.TimeZone`, which the timezone work
+    reads). So it is not true that "no signal exists until a bearer token is captured" — the
+    request-free signals need one, the configuration does not.
+  - What actually happens is a *flake*: measured over four cold processes against one profile,
+    the call answered on the first attempt twice (8.1s, 9.5s) and, in the two sessions where it
+    timed out, **timed out on all three further attempts — 0 for 6**. The failure is sticky per
+    session, so "retry on the next call" (the fix as first shipped) pays ~30s on *every*
+    availability call of an unlucky session and never wins. It is now bounded instead:
+    `mailbox_identity.signal_state()` fingerprints which signals the session holds, and a
+    retryable miss is re-asked only when that moves — which is free, and is the case that was
+    observed to work (a session that missed cold resolved in **0.0s** right after one substrate
+    call).
+  - Two costs were bounded on the way: the shared probe now carries an **8s** budget rather than
+    the default 30s (it either answers in a few seconds or not at all, and both readers have a
+    documented fallback), and `MailboxAddress.detail` reports the exception that
+    `_user_configuration_or_none()` swallows — recovering one `TimeoutError` took three live
+    probes and produced one wrong published mechanism first. Measured after: a resolution that
+    answers takes **~8.5s**, and one that doesn't still takes **~29s**, because `request()` puts
+    the failed attempt through its one-retry crash-recovery path — so the budget halves the
+    per-attempt wait rather than the whole miss. That doubling is the next thing to look at if
+    this ever matters more than it does now; it is *not* a second probe of the identity path.
+  - Rejected with numbers, so nobody re-derives them: minting a Bearer context on purpose does
+    fix the cold start outright, at 28-41s, unreliably, and by flipping `auth_mode` for the whole
+    process — a draft that did so reached **58s** for one resolution.
+  **Still open, one level down:** on roughly half of cold sessions a `service.svc` response is
+  not observed by `page.expect_response`, and this action is simply the first request unlucky
+  enough to be the one that matters. That is the same shape as the SPA response-listener race
+  already documented for the modern backend, it now affects both readers of the shared blob, and
+  it deserves its own investigation and capture rather than a third identity workaround. Until
+  then `find_free_time` on such a session answers from the calendar scan and *says so*, which is
+  what `busy_source`/`warnings` exist for.
 - ~~**`task_folder` name/path resolution is written but untested, because no To Do list exists
   to test it against.**~~ **Closed 2026-09-14** — `create_folder` (#503) now takes
   `folder_class`, so `test_task_folder_targeting.py` creates its own disposable `IPF.Task`
