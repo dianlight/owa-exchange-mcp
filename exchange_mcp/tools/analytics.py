@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, date
 
 from mcp.server.mcpserver import Context
 
+from exchange_mcp import mailbox_identity
 from exchange_mcp.server import mcp, AppContext
 from exchange_mcp.mailbox_timezone import MailboxTimezone
 from exchange_mcp.owa_client import BearerModeRequiredError, OWAClient
@@ -385,8 +386,9 @@ def get_meeting_contacts(
         top_n: Number of top contacts to return. Default 30.
 
     Returns:
-        JSON object with total_meetings, unique_contacts, and a ranked
-        contacts array of {name, email, meetings} objects.
+        JSON object with mailbox (the own address the analysis ran against),
+        total_meetings, unique_contacts, and a ranked contacts array of
+        {name, email, meetings} objects.
     """
     client = _get_client(ctx)
 
@@ -398,9 +400,21 @@ def get_meeting_contacts(
 
     # Step 1: Get own expanded events via GetUserAvailability
     # to count subject occurrences (handles recurring meetings)
-    own_email = client.user_email.lower() if client.user_email else ""
-    if not own_email:
-        return json.dumps({"error": "User email not available. Call the login tool first."})
+    #
+    # This mailbox's own address is this tool's *only* data source, so unlike
+    # find_free_time there is nothing to degrade to and an unresolved address
+    # is a real error. It says what it tried, though: the previous message
+    # ("Call the login tool first") named a fix that could not work, because
+    # from 2026-09-10 until this change nothing wrote the field it checked --
+    # so every call failed here and no login could change that.
+    own = client.resolve_own_mailbox()
+    if not own.address:
+        return json.dumps({
+            "error": "Could not determine this mailbox's own SMTP address, which this tool "
+                     "needs to read your calendar's free/busy data.",
+            "reason": own.reason,
+        })
+    own_email = own.address.lower()
 
     try:
         folder_id = client.get_folder_id("calendar")
@@ -408,8 +422,8 @@ def get_meeting_contacts(
             return json.dumps({"error": "Could not find calendar folder."})
 
         # Get expanded event subjects with occurrence counts
-        avail_result, avail_errors = _get_availability_events(client, [client.user_email], sd, ed)
-        expanded_events = avail_result.get(client.user_email, [])
+        avail_result, avail_errors = _get_availability_events(client, [own.address], sd, ed)
+        expanded_events = avail_result.get(own.address, [])
 
         subject_counts = Counter(ev['subject'] for ev in expanded_events)
         total_expanded = len(expanded_events)
@@ -547,12 +561,24 @@ def get_meeting_contacts(
 
         result = {
             "period": {"start": start_date, "end": end_date},
+            "mailbox": own.address,
             "total_meetings": total_expanded,
             "unique_contacts": len(contacts),
             "contacts": result_contacts,
         }
-        if avail_errors:
-            result["warnings"] = avail_errors
+        warnings = list(avail_errors)
+        if own.source.startswith(mailbox_identity.SOURCE_BEARER_CLAIM):
+            # A sign-in name need not equal the primary SMTP address (hybrid
+            # tenants), and self-exclusion above compares against it - so say
+            # so rather than let the user wonder why they rank in their own
+            # contact list.
+            warnings.append(
+                f"Own address {own.address} came from a sign-in token claim "
+                f"({own.source}), which is not guaranteed to be this mailbox's primary "
+                "SMTP address; if it isn't, you may appear in your own contact list."
+            )
+        if warnings:
+            result["warnings"] = warnings
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": f"Failed to get meeting contacts: {e}"})

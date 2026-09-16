@@ -419,12 +419,17 @@ def find_free_time(
 
     Returns:
         JSON object with free_slots keyed by date, each containing an
-        array of {start, end, duration_minutes} objects, plus a `timezone`
-        block naming the frame those times are in and where it was determined
-        from. Times are mailbox-local wall clock with no offset suffix: until
+        array of {start, end, duration_minutes} objects, plus busy_source
+        naming where the busy periods came from and warnings when that
+        source was the degraded one (see below), plus a `timezone` block
+        naming the frame those times are in and where it was determined from.
+
+        Times are mailbox-local wall clock with no offset suffix. Until
         2026-09-16 they were UTC instants rendered the same way, which put
         every slot out by the mailbox's UTC offset (PROJECT_STATUS.md #601),
-        so the frame is now reported rather than assumed.
+        so the frame is now reported rather than assumed — the same reasoning
+        as busy_source, one field over: an answer that is silently in the wrong
+        frame is worse than one that says which frame it is in.
     """
     client = _get_client(ctx)
 
@@ -434,19 +439,53 @@ def find_free_time(
     except ValueError as e:
         return json.dumps({"error": f"Invalid date format: {e}"})
 
-    try:
-        tz = client.mailbox_timezone()
-        # Use GetUserAvailability for accurate recurring event expansion
-        if client.user_email:
-            all_busy = _get_availability_events(client, client.user_email, sd, ed, tz)
-        else:
-            # Fallback to FindItem (misses recurring event occurrences)
+    # Resolved before either source, because both of them need it: it decides
+    # the timezone id sent on the wire as well as the frame the answer is
+    # converted into. Shares one GetOwaUserConfiguration request with
+    # resolve_own_mailbox() below (see OWAClient._get_owa_user_configuration),
+    # so having two per-mailbox facts to look up costs one round-trip, not two.
+    tz = client.mailbox_timezone()
+
+    # Two sources, and which one answered changes how much the answer is
+    # worth. Free/busy (GetSchedule, or GetUserAvailability on classic OWA)
+    # expands recurring masters into occurrences; the calendar-folder scan
+    # below does not, so a weekly stand-up reads as free time there. That is a
+    # *wrong* answer rather than an incomplete one, which is why the fallback
+    # is reported instead of quietly taken -- it was taken on every call
+    # between 2026-09-10 and this change, when the own-address read this
+    # branches on had no writer left (see mailbox_identity's docstring).
+    own = client.resolve_own_mailbox()
+    warnings: list[str] = []
+    all_busy = None
+    busy_source = ""
+
+    if own.address:
+        try:
+            all_busy = _get_availability_events(client, own.address, sd, ed, tz)
+            busy_source = "free_busy"
+        except Exception as e:
+            warnings.append(
+                f"Free/busy lookup for {own.address} failed ({e}); fell back to a "
+                "calendar-folder scan, which does not expand recurring meetings, so "
+                "slots occupied by a recurring occurrence may be reported as free."
+            )
+    else:
+        warnings.append(
+            f"Could not determine this mailbox's own address ({own.reason}), so free/busy "
+            "could not be queried; used a calendar-folder scan instead, which does not "
+            "expand recurring meetings, so slots occupied by a recurring occurrence may "
+            "be reported as free."
+        )
+
+    if all_busy is None:
+        try:
             folder_id = client.get_folder_id("calendar")
             if not folder_id:
                 return json.dumps({"error": "Could not find calendar folder. Session may have expired."})
             all_busy = _get_calendar_events(client, folder_id, sd, ed, tz)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+            busy_source = "calendar_folder"
+        except Exception as e:
+            return json.dumps({"error": str(e)})
 
     # Convert event dicts to (start, end) tuples for _find_free_slots
     busy_periods = [(ev['start'], ev['end']) for ev in all_busy]
@@ -471,17 +510,20 @@ def find_free_time(
                 ]
         current_date += timedelta(days=1)
 
-    return json.dumps(
-        {
-            "free_slots": result,
-            # Described at the start of the queried range, not at "now": the
-            # offset reported has to be the one actually applied to these slots,
-            # and a range a few months out can be on the other side of a DST
-            # transition from today.
-            "timezone": tz.describe(tz.to_utc(datetime.combine(sd, datetime.min.time()))),
-        },
-        ensure_ascii=False,
-    )
+    payload = {
+        "free_slots": result,
+        "busy_source": busy_source,
+        # Described at the start of the queried range, not at "now": the offset
+        # reported has to be the one actually applied to these slots, and a
+        # range a few months out can be on the other side of a DST transition
+        # from today.
+        "timezone": tz.describe(tz.to_utc(datetime.combine(sd, datetime.min.time()))),
+    }
+    if own.address:
+        payload["mailbox"] = own.address
+    if warnings:
+        payload["warnings"] = warnings
+    return json.dumps(payload, ensure_ascii=False)
 
 
 # ------------------------------------------------------------------

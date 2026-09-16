@@ -59,6 +59,7 @@ import types
 from exchange_mcp.auth_errors import AuthenticationRequiredError
 from exchange_mcp.browser_session import BearerModeRequiredError
 from exchange_mcp.mailbox_timezone import resolve_mailbox_timezone
+from exchange_mcp.owa_client import OWAClient
 from exchange_mcp.tools import analytics as an
 from exchange_mcp.tools import availability as av
 
@@ -117,7 +118,6 @@ class FakeClient:
         self.schedule_raises = schedule_raises
         self.requests: list[tuple] = []
         self.schedule_calls: list[dict] = []
-        self.user_email = "mailbox@example.com"
 
     def mailbox_timezone(self):
         return self._tz
@@ -137,9 +137,10 @@ class FakeClient:
             return self.availability
         raise AssertionError(f"unexpected action {action}")
 
-    # Only reached by find_free_time's no-user_email fallback, which these
-    # tests do not use; present so an accidental call is loud rather than an
-    # AttributeError deep inside a tool.
+    # find_free_time's calendar-folder fallback would reach this. These tests
+    # drive the helpers and find_meeting_time directly, so it should never fire
+    # -- present so an accidental call is loud rather than an AttributeError
+    # deep inside a tool.
     def get_folder_id(self, name):
         raise AssertionError("these tests should not reach the FindItem fallback")
 
@@ -497,6 +498,102 @@ def test_analytics_does_not_swallow_an_authentication_error() -> None:
     FAILURES.append("an authentication error was swallowed into the errors list")
 
 
+# ------------------------------------------------------------------
+# Two per-mailbox facts, one request
+# ------------------------------------------------------------------
+
+class _CountingBrowser:
+    """Just the surface OWAClient touches. Mirrors test_mailbox_identity's."""
+
+    def __init__(self):
+        self.owa_url = "https://owa.example.com"
+        self.profile_dir = "/tmp/profile"
+        self.auth_mode = "canary"
+
+    def identity_hints(self) -> dict:
+        # Empty, so the address resolution has to reach the config call — which
+        # is the whole point of counting it.
+        return {}
+
+
+class _CountingClient(OWAClient):
+    """A real OWAClient with GetOwaUserConfiguration served from memory."""
+
+    def __init__(self, config):
+        super().__init__(_CountingBrowser())
+        self.config = config
+        self.calls: list[str] = []
+
+    def request(self, action, payload, *, timeout=30):
+        self.calls.append(action)
+        return self.config
+
+
+def _config_with_both() -> dict:
+    """One response carrying both facts, which is why they should share it."""
+    return {"Body": {"UserConfiguration": {
+        "SessionSettings": {"UserEmailAddress": "first.last@example.com"},
+        "UserOptions": {"TimeZone": W_EUROPE},
+    }}}
+
+
+def test_address_and_timezone_share_one_request() -> None:
+    """The invariant the 2026-09-16 merge created and nothing else pins.
+
+    The address and the timezone were added by two separate changes, each with
+    its own probe of the *same* action — so before `_get_owa_user_configuration`
+    memoised, asking for both cost two identical round-trips on every cold
+    session. Asserted in both orders because either can be the first tool call:
+    `find_free_time` reads the timezone first, `get_meeting_contacts` the
+    address.
+    """
+    for label, first, second in (
+        ("timezone then address", "tz", "addr"),
+        ("address then timezone", "addr", "tz"),
+    ):
+        client = _CountingClient(_config_with_both())
+        for which in (first, second):
+            if which == "tz":
+                tz = client.mailbox_timezone()
+                check(f"{label}: timezone resolved", tz.windows_id, W_EUROPE)
+            else:
+                check(f"{label}: address resolved",
+                      client.mailbox_address(), "first.last@example.com")
+        check(f"{label}: exactly one GetOwaUserConfiguration",
+              client.calls, ["GetOwaUserConfiguration"])
+
+    # And repeated reads add nothing, which is what makes it safe to call
+    # mailbox_timezone() at the top of every availability tool.
+    client = _CountingClient(_config_with_both())
+    for _ in range(5):
+        client.mailbox_timezone()
+        client.mailbox_address()
+    check("repeated reads still cost one request", client.calls, ["GetOwaUserConfiguration"])
+
+
+def test_forget_mailbox_address_also_forgets_the_timezone() -> None:
+    """`login(force=True)` exists to switch accounts, and the new account can be
+    in another timezone. A stale zone there would shift every free/busy answer
+    by the difference between the two — #601 again, arrived at from the other
+    direction — so the one event that invalidates the address invalidates this
+    too, and both are dropped by the one method."""
+    client = _CountingClient(_config_with_both())
+    check("timezone resolved", client.mailbox_timezone().windows_id, W_EUROPE)
+    check("address resolved", client.mailbox_address(), "first.last@example.com")
+    check("one request so far", len(client.calls), 1)
+
+    # The second account: different mailbox, different zone.
+    client.config = {"Body": {"UserConfiguration": {
+        "SessionSettings": {"UserEmailAddress": "other.person@example.com"},
+        "UserOptions": {"TimeZone": "Tokyo Standard Time"},
+    }}}
+    client.forget_mailbox_address()
+
+    check("the timezone re-resolves", client.mailbox_timezone().windows_id, "Tokyo Standard Time")
+    check("the address re-resolves", client.mailbox_address(), "other.person@example.com")
+    check("and it cost exactly one more request", len(client.calls), 2)
+
+
 def main() -> bool:
     if local_tz() is None:
         # Every test here needs a real UTC offset to assert against, and without
@@ -523,6 +620,8 @@ def main() -> bool:
         test_analytics_legacy_sends_the_mailbox_timezone_and_local_window,
         test_analytics_records_a_schedule_failure_as_a_warning,
         test_analytics_does_not_swallow_an_authentication_error,
+        test_address_and_timezone_share_one_request,
+        test_forget_mailbox_address_also_forgets_the_timezone,
     ):
         test()
 

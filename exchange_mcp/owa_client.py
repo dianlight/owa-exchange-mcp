@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Iterator, NamedTuple
 from urllib.parse import quote
 
+from exchange_mcp import mailbox_identity
 from exchange_mcp.auth_errors import (  # noqa: F401
     INTERACTIVE_LOGIN_REQUIRED,
     AuthenticationRequiredError,
@@ -133,9 +134,22 @@ class OWAClient:
     def __init__(self, browser_session: BrowserSession):
         self.browser = browser_session
         self.owa_url = browser_session.owa_url
-        self.user_email: str = ""
+        # Resolved lazily by mailbox_address(), then cached for the process --
+        # never assigned here. The predecessor of that method was a plain
+        # `self.user_email = ""` attribute whose only writers lived in the
+        # credential store; see mailbox_identity's module docstring for what
+        # removing them broke and for how long.
+        self._mailbox_address: mailbox_identity.MailboxAddress | None = None
         # Probed once, lazily, on first use -- see mailbox_timezone().
         self._mailbox_timezone: MailboxTimezone | None = None
+        # The GetOwaUserConfiguration response, shared by the two things that
+        # read it (our own address and our own timezone) so the process makes
+        # that request at most once. `_probed` is separate from the value
+        # because None is a real answer -- "this backend won't serve it" -- and
+        # caching it is the point: the realistic failure is a backend with no
+        # such surface, which will not grow one mid-process.
+        self._owa_user_config: dict | None = None
+        self._owa_user_config_probed: bool = False
 
     @property
     def cookie_file(self):
@@ -321,6 +335,138 @@ class OWAClient:
             return data["Body"]["ResponseMessages"]["Items"]
         except (KeyError, TypeError):
             return []
+
+    # ------------------------------------------------------------------
+    # Own mailbox identity
+    # ------------------------------------------------------------------
+
+    def resolve_own_mailbox(self, *, refresh: bool = False) -> mailbox_identity.MailboxAddress:
+        """Our own mailbox's SMTP address, with the signal it came from.
+
+        Resolved on first use and cached for the process. Costs at most one
+        request (`GetOwaUserConfiguration`) ever, and often none at all: in
+        bearer mode the `x-anchormailbox` header captured with the session's
+        token usually answers it outright.
+
+        **Degrades, never raises.** Every caller here is a tool that has
+        something useful to do without the address (`find_free_time` reads the
+        calendar folder directly; `get_schedule` can send an attendee's id as
+        the requesting user), so a mailbox whose backend won't tell us who we
+        are must not take those tools offline. `MailboxAddress.reason` says why
+        it's empty, for tools that report it. The one thing this must never do
+        is *guess*: `get_meeting_contacts` excludes "self" by comparing against
+        this value, so a wrong address silently keeps the user in their own
+        contact ranking, while an absent one is visible.
+
+        Failures are cached too, deliberately. The realistic failure is a
+        backend with no such surface, which will not start having one mid-
+        process, and re-probing per call would add a request to every
+        availability call for the life of the server. `refresh=True` is for the
+        one case where the answer can genuinely change: an interactive
+        `login(force=True)` that switched accounts.
+        """
+        if self._mailbox_address is not None and not refresh:
+            return self._mailbox_address
+
+        hints = self.browser.identity_hints()
+        resolved = mailbox_identity.resolve_mailbox_address(
+            anchor_mailbox=hints.get("anchor_mailbox", ""),
+            bearer_token=hints.get("bearer_token", ""),
+        )
+
+        if not resolved.address:
+            config = self._get_owa_user_configuration()
+            # Re-read the hints afterwards even when the config call failed:
+            # that call is what establishes auth on a session whose first tool
+            # call this is, so a bearer capture (and with it the anchormailbox
+            # header) may only exist now. Free, since both live in memory.
+            hints = self.browser.identity_hints()
+            resolved = mailbox_identity.resolve_mailbox_address(
+                anchor_mailbox=hints.get("anchor_mailbox", ""),
+                user_configuration=config,
+                bearer_token=hints.get("bearer_token", ""),
+            )
+
+        self._mailbox_address = resolved
+        return resolved
+
+    def mailbox_address(self, *, refresh: bool = False) -> str:
+        """Our own mailbox's SMTP address, or "" if this session can't say.
+
+        Thin wrapper over resolve_own_mailbox() for the callers that only need
+        the address itself. Same caching and same never-raises contract.
+        """
+        return self.resolve_own_mailbox(refresh=refresh).address
+
+    def forget_mailbox_address(self) -> None:
+        """Drop everything cached about *which* mailbox this is, so the next
+        read re-resolves it.
+
+        Called after an interactive sign-in: `login(force=True)` exists to
+        switch accounts, and a cached address from the *previous* account is
+        the one failure mode worse than having none.
+
+        That reasoning covers the timezone and the shared config response as
+        well, so both are dropped here despite the name: the new account can be
+        in a different zone, and a stale one would silently shift every
+        free/busy answer by the difference between the two -- the #601 bug
+        again, arrived at from the other direction. Kept as one method rather
+        than three because there is exactly one event that invalidates them
+        (the account changed) and a caller that forgot one of three calls would
+        reintroduce precisely this.
+        """
+        self._mailbox_address = None
+        self._mailbox_timezone = None
+        self._owa_user_config = None
+        self._owa_user_config_probed = False
+
+    def _get_owa_user_configuration(self) -> dict | None:
+        """Fetch GetOwaUserConfiguration, or None if this backend won't serve it.
+
+        This is OWA's own bootstrap call for the signed-in user's settings, so
+        it exists wherever a mailbox does, but its response shape isn't pinned
+        down across the classic and modern backends (which is why the parsing
+        in mailbox_identity searches by key name rather than by path). Errors
+        are swallowed on purpose, including AuthenticationRequiredError: if the
+        session really is dead, the caller's own next request raises it with
+        the remediation text attached, and this identity probe is not the place
+        to surface that.
+
+        **Memoised, because it now has two consumers.** This response carries
+        both our own address (`resolve_own_mailbox`) and our own timezone
+        (`mailbox_timezone`), and each was added by a separate change that
+        introduced its own probe of the same action -- so without this the
+        second one silently doubled the request. Sharing it here rather than
+        having one caller pass the dict to the other keeps both entry points
+        independently callable and order-independent, which matters because
+        either can be the first tool call of a session.
+
+        A None result is cached too, for the reason `resolve_own_mailbox`
+        states about its own failures: the realistic failure is a backend with
+        no such surface, and re-probing per call would add a request to every
+        availability call for the life of the server.
+        """
+        if self._owa_user_config_probed:
+            return self._owa_user_config
+
+        payload = {
+            "__type": "GetOwaUserConfigurationJsonRequest:#Exchange",
+            "Header": {
+                "__type": "JsonRequestHeaders:#Exchange",
+                "RequestServerVersion": "Exchange2013",
+            },
+            "Body": {
+                "__type": "GetOwaUserConfigurationRequest:#Exchange",
+            },
+        }
+        try:
+            data = self.request("GetOwaUserConfiguration", payload)
+        except Exception:
+            data = None
+
+        self._owa_user_config = data if isinstance(data, dict) else None
+        self._owa_user_config_probed = True
+        return self._owa_user_config
 
     # ------------------------------------------------------------------
     # Folder helpers
@@ -730,54 +876,33 @@ class OWAClient:
     # Mailbox timezone (probed once per process)
     # ------------------------------------------------------------------
 
-    def _probe_owa_user_configuration(self) -> dict:
-        """Fetch the mailbox's own OWA configuration, or `{}` if unavailable.
-
-        The only caller is `mailbox_timezone()`, and the reason this is a
-        separate method is that it must be allowed to fail *quietly*: a mailbox
-        whose configuration cannot be read is a mailbox we assume the host's
-        timezone for (with a warning), not a mailbox whose calendar tools stop
-        working. That includes the case where this action does not exist on the
-        backend at all -- classic and modern OWA disagree about it, and neither
-        answer is an error worth propagating through `find_free_time`.
-
-        `AuthenticationRequiredError` is the one exception deliberately left to
-        propagate: it means a human must sign in, `request()` has already
-        exhausted its silent retry, and swallowing it here would turn a
-        fixable "use the login tool" into a silently wrong timezone.
-        """
-        payload = {
-            "__type": "GetOwaUserConfigurationJsonRequest:#Exchange",
-            "Header": {
-                "__type": "JsonRequestHeaders:#Exchange",
-                "RequestServerVersion": "Exchange2013",
-            },
-            "Body": {"__type": "GetOwaUserConfigurationRequest:#Exchange"},
-        }
-        try:
-            return self.request("GetOwaUserConfiguration", payload, timeout=15) or {}
-        except AuthenticationRequiredError:
-            raise
-        except Exception:
-            return {}
-
-    def mailbox_timezone(self) -> MailboxTimezone:
+    def mailbox_timezone(self, *, refresh: bool = False) -> MailboxTimezone:
         """The mailbox's timezone -- the frame every wall-clock number means.
 
-        Probed once per process and cached, like `user_email`: it is a
-        per-mailbox server fact that does not change under us, and the tools
-        that need it (`find_free_time` #601, `find_meeting_time` #602) would
-        otherwise pay a round-trip per call for an answer that never differs.
+        Probed once per process and cached, exactly like `resolve_own_mailbox()`
+        and off the *same* `GetOwaUserConfiguration` response (see
+        `_get_owa_user_configuration`, which memoises it so having two
+        consumers costs one request, not two). It is a per-mailbox server fact
+        that does not change under us, and the tools that need it
+        (`find_free_time` #601, `find_meeting_time` #602) would otherwise pay a
+        round-trip per call for an answer that never differs.
 
         Never raises for a timezone reason and never returns None -- the
         fallback chain in `resolve_mailbox_timezone()` is the contract, and
         `MailboxTimezone.source` / `.warning` say which step it took so the
         tools can report it. See exchange_mcp/mailbox_timezone.py for why a
-        shifted-but-working answer beats an error here.
+        shifted-but-working answer beats an error here. Note that a session too
+        dead to answer the config call lands in that chain rather than raising:
+        the caller's own next request surfaces the auth error with its
+        remediation text, which is the same division of labour
+        `_get_owa_user_configuration` documents for the address.
+
+        `refresh=True` mirrors `resolve_own_mailbox`: only an interactive
+        `login(force=True)` that switched accounts can change the answer.
         """
-        if self._mailbox_timezone is None:
+        if self._mailbox_timezone is None or refresh:
             self._mailbox_timezone = resolve_mailbox_timezone(
-                parse_mailbox_timezone_id(self._probe_owa_user_configuration())
+                parse_mailbox_timezone_id(self._get_owa_user_configuration())
             )
         return self._mailbox_timezone
 
@@ -889,7 +1014,13 @@ class OWAClient:
             "operationName": "GetSchedule",
             "variables": {
                 "input": {
-                    "userId": self.user_email or (emails[0] if emails else ""),
+                    # The *requesting* user, not one of the queried mailboxes:
+                    # the Scheduling Assistant sends its own address here. The
+                    # fallback to an attendee is what this had to do while
+                    # mailbox_address() didn't exist, and this tenant accepts
+                    # it, so it stays as the degraded path rather than
+                    # becoming an error.
+                    "userId": self.mailbox_address() or (emails[0] if emails else ""),
                     "availabilityViewInterval": interval_minutes,
                     "schedules": emails,
                     "startTime": {"dateTime": start.strftime("%Y-%m-%dT%H:%M:%S.000"), "timeZone": {"name": tz_id}},
