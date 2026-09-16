@@ -1277,6 +1277,106 @@ exception *class* as well as its message, because the one that actually shows up
 (`concurrent.futures.TimeoutError`, when a slow or unreachable host outlasts `_run`'s budget)
 stringifies to nothing and printed `startup failed: .`
 
+**Update 2026-09-16 — the availability tools were comparing two different clocks.**
+`find_free_time` (#601) and `find_meeting_time` (#602) laid busy periods that arrive in
+**UTC** over a working-hours window built in **local wall clock**, so every meeting was
+subtracted from a slot displaced by the mailbox's UTC offset — two hours for a Central
+European mailbox in summer. The tool then reported free time on top of a booked hour and
+hid an hour that was genuinely free, with no error anywhere. New pure module
+[availability_frame.py](exchange_mcp/availability_frame.py) owns the conversion, and
+[tests/unit/test_availability_frame.py](tests/unit/test_availability_frame.py) covers it.
+
+What makes this worth its own entry is that three separate things were all conspiring to
+keep it invisible:
+
+- **The two availability surfaces disagree about their own frame, and only one of them is
+  wrong.** `availabilityView` / `MergedFreeBusy` (the `0/1/2/3/4`-per-interval string) is
+  wall-clock in the *requested* timezone, so laying it out from the caller's own
+  `start_date` at local midnight is already correct. `scheduleItems` — the same response,
+  one field over — is UTC-offset whatever `tz_id` you ask for. A fix that converted "the
+  availability times" as one category would have broken the working path in the opposite
+  direction, which is why `_parse_freebusy_string` now carries a docstring saying so and
+  the unit suite asserts both paths produce the *same* answer for the same meeting.
+- **It is a no-op on a UTC mailbox**, and UTC is exactly what a mailbox whose timezone
+  can't be read falls back to. The tenant this repo is developed against is UTC+2 in
+  summer, so the skew was live the whole time — but the smoke tests only assert the shape
+  of the response (`"free_slots" in payload`), and a plausible set of half-hour slots is
+  indistinguishable from the right one without a second source to check it against.
+- **The offset was never in the code to begin with.** Nothing read a timezone; two
+  functions simply produced naive `datetime`s from different origins and Python compared
+  them without complaint. That is the general hazard of the naive-datetime convention this
+  codebase adopted early (see `_parse_schedule_dt`): it makes a frame mismatch a silent
+  arithmetic error rather than a `TypeError`.
+
+Three design points, since each had a tempting wrong alternative:
+
+- **The events move, not the window.** Converting the busy periods once at the edge is one
+  change; converting the window would mean converting the day buckets, the weekend skip
+  and the `HH:MM` output too — and `_find_free_slots` is shared with the
+  `availabilityView` path that is *already* wall-clock, so its window has to stay local.
+- **`OWAClient` keeps its naive-UTC convention.** `_parse_schedule_dt`'s return type is
+  assumed by both `availability.py` and `analytics.py`; the conversion therefore lives in
+  the tools, next to the grid it has to match. One latent bug was fixed inside that
+  convention rather than around it: an offset other than `Z`/`+00:00` used to have its
+  `tzinfo` stripped outright, which keeps *that* zone's wall clock and calls it UTC.
+- **An unresolvable zone shifts nothing and says so.** Same doctrine as `profile_lock.py`:
+  a fabricated offset is worse than the status quo, because being wrong by one hour looks
+  right. Both tools now report the zone they used (`"timezone": {"id", "source"}`) and a
+  `warning` when it could not be resolved; `get_meeting_stats`/`get_meeting_contacts`
+  route the same warning through their existing `warnings` field.
+
+**One thing the live run taught that no amount of reading would have.** With the events
+converted but the *window* still requested in the old hardcoded UTC+3, the two tools answered
+grids an hour apart for the same mailbox and the same day: `find_free_time` matched the
+calendar, while `find_meeting_time` — which took the `availabilityView` branch — returned
+`12:30-13:00, 16:00-17:00` where the real gaps were `11:30-12:00, 15:00-16:00, 17:00-18:00`.
+The view cannot be converted after the fact, so the *only* lever it has is the zone it was
+asked for; `frame.schedule_tz_id()` now passes the resolved zone to `get_schedule`, and with
+that in place the view's free windows moved exactly one hour (UTC+3 → UTC+2) onto genuine
+calendar gaps. Getting the events right and the request wrong is a *worse* state than the
+original bug, because the two tools then disagree with each other — the unit suite pins it
+(`test_schedule_tz_id_asks_for_the_grid_it_compares_against`).
+
+**Live verification, 2026-09-16** (isolated server on port 8793, own profile directory,
+production on 8766 untouched), against three real days of this mailbox's calendar:
+
+| | free slots for 2026-09-16 |
+|---|---|
+| real calendar gaps (09:00-18:00) | 09:00-09:30, 11:30-12:00, 13:00-14:00, 15:00-16:00, 16:30-18:00 |
+| `find_free_time` before | 09:30-10:00, 11:00-12:00, 13:00-14:00, **14:30-18:00** |
+| `find_free_time` after | 09:00-09:30, 11:30-12:00, 13:00-14:00, 15:00-16:00, 16:30-18:00 |
+
+The old answer offered 09:30 (inside a meeting) and a four-hour block covering two more; the
+new one reproduces the calendar's gaps exactly, on all three days checked. Two things the run
+also showed, both **pre-existing and both being fixed on other branches**, noted here so the
+`Pending`→`OK` rows below aren't read as covering more than they do:
+
+- `find_free_time` took its **`FindItem` fallback**, not the free/busy path, because
+  `OWAClient.user_email` has had no writer since 2026-09-10 — so what was verified live is the
+  calendar-scan branch's conversion; the `GetSchedule` branch's is covered by the unit suite
+  and by `get_meeting_stats` #701's live run. Fixed by `399ada4` on another branch (own-address
+  discovery), which rewrites the same `find_free_time` lines this change touches.
+- **The two sources genuinely differ in coverage**, which is not a frame problem: the
+  server-side view reported busy at 09:00-09:30, 13:00-14:00 and 16:30-17:00 where the
+  item-level path reported free, and `get_calendar_events(expand_recurrences=True)` shows
+  recurring series at exactly those three times. Free/busy expands recurring masters; the
+  calendar scan doesn't.
+
+Two things this fix depends on, one of them an ordinary dependency and one a caveat:
+
+- **`tzdata` is now a declared dependency.** Windows ships no IANA timezone database, so on
+  a stock Windows install `zoneinfo.available_timezones()` is **empty** and every lookup
+  raises (measured here on CPython 3.14). Exchange also speaks Windows timezone ids, which
+  `zoneinfo` doesn't, so `availability_frame` maps them (`W. Europe Standard Time` →
+  `Europe/Berlin`) and treats an unmapped id as unresolvable with a warning naming the
+  `EXCHANGE_TIMEZONE` override — which accepts an IANA id and therefore always resolves.
+- **The zone's source of truth is issue #8's, and this branch predates it.** Once
+  `OWAClient.mailbox_timezone()` exists, `availability_frame` uses it. Until then it reads
+  `EXCHANGE_TIMEZONE` directly (`timezone_id_from_client`, via `getattr`) so the grid can
+  be made correct today, and falls back to no shift. That bridge is a few lines and is
+  marked for deletion once #8 merges; what it is *not* is a second copy of the precedence
+  rule — when the method is present, its answer is taken whole.
+
 ## 2. How to read the table
 
 - **ID** — a permanent identifier, `<module number><2-digit sequence within that module>`:
@@ -1388,15 +1488,15 @@ stringifies to nothing and printed `startup failed: .`
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 601 | `find_free_time` | Find free slots in your own calendar within working hours | `tests/smoke/tests/test_find_free_time.py` | OK (2026-09-08) | Stable |
-| 602 | `find_meeting_time` | Find common free slots across multiple attendees — tries the modern-backend `GetSchedule` GraphQL operation first, falling back to EWS `GetUserAvailability` only on classic/on-prem OWA | `tests/smoke/tests/test_find_meeting_time.py` | OK (2026-09-09) — `GetUserAvailability` still returns `{ErrorCode: 500, ExceptionName: NotImplementedException}` on this tenant and is unfixable server-side, but the Scheduling Assistant UI's own `GetSchedule` operation works correctly here (confirmed via live network capture) and returns free/busy data in the same `MergedFreeBusy`-compatible encoding; see "Update 2026-09-09 — found a working replacement for the broken GetUserAvailability path" above. Also fixes `get_meeting_stats`/`get_meeting_contacts` (below), which share the underlying helper. A prior fix (2026-09-08) to the legacy fallback's error path (`FaultMessage`→`ExceptionName` when the former is present-but-`null`) still applies to that branch. | Stable |
+| 601 | `find_free_time` | Find free slots in your own calendar within working hours, in the mailbox's own timezone; the response names the zone it used | `tests/unit/test_availability_frame.py`, `tests/smoke/tests/test_find_free_time.py` | OK (2026-09-16, re-verified live on an isolated server/profile) — busy periods are now converted from UTC to the mailbox's wall clock before being compared with `start_hour`/`end_hour`. Checked against three real days of calendar rather than the smoke suite's shape assertion, which cannot see this bug: the returned slots reproduce the calendar's gaps exactly, where the previous answer offered a slot inside a meeting and a four-hour block covering two more (table in the 2026-09-16 update above). Two caveats: on this branch the zone comes from `EXCHANGE_TIMEZONE` (issue #8's `mailbox_timezone()` isn't merged here), and the branch that ran live was the `FindItem` calendar scan — `user_email` has had no writer since 2026-09-10, so the free/busy branch's conversion is covered by the unit suite and by #701's live run, not by this one. Previously OK (2026-09-08), against the skewed grid. | Stable |
+| 602 | `find_meeting_time` | Find common free slots across multiple attendees — tries the modern-backend `GetSchedule` GraphQL operation first, falling back to EWS `GetUserAvailability` only on classic/on-prem OWA | `tests/unit/test_availability_frame.py`, `tests/smoke/tests/test_find_meeting_time.py` | OK (2026-09-16, re-verified live) — same frame fix as #601, with the asymmetry that matters: the `scheduleItems`/`CalendarEventArray` paths are converted to the mailbox's wall clock, while the `availabilityView` path deliberately is **not** — it is already wall-clock in the requested zone, so it is *requested* in the resolved zone instead (`frame.schedule_tz_id`). This tool took that view branch live, and its free windows moved exactly one hour (UTC+3 → UTC+2) onto real calendar gaps. It reports more busy time than #601 does, which is coverage rather than skew: the server-side view expands recurring masters that the item-level path doesn't return (evidence in the 2026-09-16 update above). Note the failure mode that appeared mid-verification and is now unit-pinned: converting the events while still *requesting* UTC+3 makes this tool and #601 disagree with each other, which is worse than the original bug. Previously OK (2026-09-09) — `GetUserAvailability` still returns `{ErrorCode: 500, ExceptionName: NotImplementedException}` on this tenant and is unfixable server-side, but the Scheduling Assistant UI's own `GetSchedule` operation works correctly here (confirmed via live network capture) and returns free/busy data in the same `MergedFreeBusy`-compatible encoding; see "Update 2026-09-09 — found a working replacement for the broken GetUserAvailability path" above. Also fixes `get_meeting_stats`/`get_meeting_contacts` (below), which share the underlying helper. A prior fix (2026-09-08) to the legacy fallback's error path (`FaultMessage`→`ExceptionName` when the former is present-but-`null`) still applies to that branch. | Stable |
 
 ### Analytics — [exchange_mcp/tools/analytics.py](exchange_mcp/tools/analytics.py) (2)
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 701 | `get_meeting_stats` | Meeting-count statistics for one or more people over a date range | `tests/smoke/tests/test_get_meeting_stats.py` | OK (2026-09-09) — used to fail at the `ResolveNames` step (same `NullReferenceException` as `find_person` #401) before ever reaching availability data. `_resolve_to_email()` tries the Substrate Search path first (see #401, above) and falls back to `ResolveNames` only in classic canary-cookie auth mode. Its shared `_get_availability_events()` helper now tries `GetSchedule` first (see #602, above) and only falls back to the still-unimplemented `GetUserAvailability` on classic OWA, so this tool now returns real per-person stats without needing the `warnings` fallback in the common case — `warnings` remains for the classic-OWA/`GetUserAvailability`-failure path. | Stable |
-| 702 | `get_meeting_contacts` | Weighted "who you meet with most" connection matrix from your own calendar | `tests/smoke/tests/test_get_meeting_contacts.py` | OK (2026-09-09) — doesn't call `ResolveNames`, so it doesn't hit that bug. Its sole data source (own-mailbox availability via the shared `_get_availability_events()` helper) now tries `GetSchedule` first (see #602, above) and returns real meeting/contact data instead of the empty result `GetUserAvailability` always produced on this tenant. A real bug fixed while diagnosing this originally (2026-09-08): `_get_availability_events()` silently swallowed the `GetUserAvailability` failure (`except Exception: pass`) and never checked for an `ErrorCode` in a successfully-parsed error body either, so both this tool and `get_meeting_stats` were reporting a false-clean empty result instead of a diagnosable one — it now returns `(results, errors)`, and both tools add a `"warnings"` field when `errors` is non-empty (still relevant on classic OWA, where the legacy fallback is the only option). [test_get_meeting_contacts.py](tests/smoke/tests/test_get_meeting_contacts.py)/[test_get_meeting_stats.py](tests/smoke/tests/test_get_meeting_stats.py) include `warnings` in their recorded note when present. | Stable |
+| 701 | `get_meeting_stats` | Meeting-count statistics for one or more people over a date range | `tests/unit/test_availability_frame.py`, `tests/smoke/tests/test_get_meeting_stats.py` | OK (2026-09-16, live re-run on the isolated server with the zone resolved) — every count here is per-day (meetings/day, busiest weekday, unique days), and the event date came from a UTC timestamp, so a meeting near either end of the day was attributed to the wrong day and, for a Monday or Friday, the wrong week. Now dated in the mailbox's own zone (see #601 and the 2026-09-16 update above); an unresolvable zone adds a "Day attribution may be off by one" line to the existing `warnings`. Bounded by one day rather than by the offset, which is why it read as slightly-off statistics rather than a fault. Previously OK (2026-09-09) — used to fail at the `ResolveNames` step (same `NullReferenceException` as `find_person` #401) before ever reaching availability data. `_resolve_to_email()` tries the Substrate Search path first (see #401, above) and falls back to `ResolveNames` only in classic canary-cookie auth mode. Its shared `_get_availability_events()` helper now tries `GetSchedule` first (see #602, above) and only falls back to the still-unimplemented `GetUserAvailability` on classic OWA, so this tool now returns real per-person stats without needing the `warnings` fallback in the common case — `warnings` remains for the classic-OWA/`GetUserAvailability`-failure path. | Stable |
+| 702 | `get_meeting_contacts` | Weighted "who you meet with most" connection matrix from your own calendar | `tests/unit/test_availability_frame.py`, `tests/smoke/tests/test_get_meeting_contacts.py` | KO (2026-09-16) — `"User email not available. Call the login tool first."` on every call, and the advice is unfollowable: `OWAClient.user_email` has had no writer since f2f3c7b removed the credential store on 2026-09-10, so this tool has been failing for six days. **Not caused by this change and not fixed by it** — found while re-verifying the timezone fix, and already fixed by `399ada4` (own-address discovery) on another branch; `Stability` is deliberately left `Stable` and `KNOWN_BUGGY_TOOLS` untouched, because that column tracks *unfixable server-side* failures and this is neither. It does share `_get_availability_events()` with #701 and so the same UTC-vs-local day attribution fix, which cannot be verified live here until the address is available; the weighting is per meeting, not per day, so the effect is confined to meetings sitting near a day boundary. Previously OK (2026-09-09) — doesn't call `ResolveNames`, so it doesn't hit that bug. Its sole data source (own-mailbox availability via the shared `_get_availability_events()` helper) now tries `GetSchedule` first (see #602, above) and returns real meeting/contact data instead of the empty result `GetUserAvailability` always produced on this tenant. A real bug fixed while diagnosing this originally (2026-09-08): `_get_availability_events()` silently swallowed the `GetUserAvailability` failure (`except Exception: pass`) and never checked for an `ErrorCode` in a successfully-parsed error body either, so both this tool and `get_meeting_stats` were reporting a false-clean empty result instead of a diagnosable one — it now returns `(results, errors)`, and both tools add a `"warnings"` field when `errors` is non-empty (still relevant on classic OWA, where the legacy fallback is the only option). [test_get_meeting_contacts.py](tests/smoke/tests/test_get_meeting_contacts.py)/[test_get_meeting_stats.py](tests/smoke/tests/test_get_meeting_stats.py) include `warnings` in their recorded note when present. | Stable |
 
 ### Auth — [exchange_mcp/tools/auth.py](exchange_mcp/tools/auth.py) (1)
 
@@ -1916,6 +2016,33 @@ hold a request open for.
   `profile_lock.py` will ever terminate a process. Killing a browser that might still be
   serving another instance of this server is not a recovery, and an operator who is told which
   directory is held and by which PID has a one-step fix already.
+- ~~**`find_free_time`/`find_meeting_time` compare naive-UTC busy periods against local
+  working hours.**~~ **Closed 2026-09-16** — see the 2026-09-16 update in §1 for the fix and
+  for the three things that kept it invisible. History, because the shape of the mistake
+  generalises: `get_schedule`'s `scheduleItems` timestamps arrive UTC-offset and are stripped
+  to naive UTC by `_parse_schedule_dt`, while `_find_free_slots` built its day window with
+  `datetime.combine(date, hour=start_hour)` — a naive *local* wall-clock 9-to-18 window — and
+  compared the two directly, so every busy period sat offset from the working-hours grid by the
+  mailbox's UTC offset (2h for a CEST mailbox in summer). Both tools therefore offered time that
+  was already booked and hid time that was free, and `get_meeting_stats`/`get_meeting_contacts`
+  dated meetings by the wrong day near a day boundary. Now converted in
+  [availability_frame.py](exchange_mcp/availability_frame.py) with
+  [tests/unit/test_availability_frame.py](tests/unit/test_availability_frame.py) covering it,
+  including the asymmetry that makes this easy to "fix" wrongly: `availabilityView` really is
+  wall-clock in the requested zone and must be left alone.
+  **One adjacent crash fixed on the way past**, in `find_meeting_time`'s classic-OWA
+  `CalendarEventArray` fallback: those two timestamps were parsed and appended *offset-aware*,
+  so the first comparison against `_find_free_slots`' naive window would raise
+  `TypeError: can't compare offset-naive and offset-aware datetimes`. Unreachable on this
+  tenant (`GetUserAvailability` faults before it), which is why no smoke run ever hit it — the
+  same frame confusion, one line away, failing loudly instead of quietly.
+  **Two follow-ups this deliberately did not do.** The zone comes from
+  `OWAClient.mailbox_timezone()` when that exists and from `EXCHANGE_TIMEZONE` otherwise (see
+  the next entry — that is the same hardcoded-timezone problem, and it owns the discovery
+  logic); and nothing outside the availability/analytics paths was audited for the same
+  naive-frame mixing, so `calendar.py`'s own timestamp handling has *not* been reviewed against
+  this. Both are named here rather than folded in, because a frame bug is exactly the kind that
+  a wide, unverified edit makes worse.
 - **Reminder times are written in a hardcoded timezone, and for tasks that's now
   user-visible.** Every write in this codebase sends `TimeZoneContext` =
   `Russian Standard Time` (UTC+3) — inherited from the original scripts, and harmless while

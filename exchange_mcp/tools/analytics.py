@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, date
 
 from mcp.server.mcpserver import Context
 
+from exchange_mcp import availability_frame as frame
 from exchange_mcp.server import mcp, AppContext
 from exchange_mcp.owa_client import BearerModeRequiredError, OWAClient
 
@@ -75,9 +76,25 @@ def _get_availability_events(
     dicts with keys: subject, start_date, busy_type. errors collects one
     message per failed chunk/batch, so an availability-query failure shows
     up as a reportable warning instead of silently looking like "no meetings".
+
+    `start_date` is the event's date **in the mailbox's own timezone**, which
+    is the whole reason the zone is resolved here. Everything downstream
+    counts by day - meetings per day, busiest day of the week, unique days
+    with meetings - and GetSchedule answers in UTC, so an early-morning
+    meeting east of UTC (or a late-evening one west of it) was being counted
+    on the wrong day, and on the wrong *weekday* for a Monday or a Friday.
+    Unlike the free-slot tools the error is bounded by one day rather than by
+    the offset, which is why it reads as slightly-off statistics instead of
+    an obvious fault. See `availability_frame`.
     """
     results: dict[str, list[dict]] = {email: [] for email in emails}
     errors: list[str] = []
+    zone = frame.mailbox_zone(client)
+    if zone.warning:
+        # Reuses the existing errors -> "warnings" channel rather than adding a
+        # field: both tools already surface it, and "these counts may be a day
+        # out" is exactly the kind of caveat it was added for.
+        errors.append(f"Day attribution may be off by one: {zone.warning}")
 
     # Batch people
     email_batches = [emails[i:i+batch_size] for i in range(0, len(emails), batch_size)]
@@ -94,6 +111,9 @@ def _get_availability_events(
                         batch,
                         datetime.combine(current, datetime.min.time()),
                         datetime.combine(chunk_end, datetime.min.time()),
+                        # Asked for in the same zone the results are dated in,
+                        # so the chunk boundaries and the event dates agree.
+                        tz_id=frame.schedule_tz_id(zone),
                     )
                     for sched in schedules:
                         email = sched["email"]
@@ -103,7 +123,7 @@ def _get_availability_events(
                                 f"{sched['error'].get('message', 'Unknown error')}"
                             )
                             continue
-                        for ev in sched.get("events", []):
+                        for ev in frame.events_to_wall_clock(sched.get("events", []), zone):
                             if ev["status"].lower() in ("free", "nodata"):
                                 continue
                             results[email].append({
@@ -177,14 +197,19 @@ def _get_availability_events(
                     else:
                         items = []
                     for event in items:
-                        s = event.get('StartTime', '')
+                        # Was `StartTime[:10]`, i.e. whichever date the string
+                        # happened to start with. Parsed instead, so an offset
+                        # on the wire is honoured and one that isn't there is
+                        # left alone (frame.wire_to_wall_clock) - the same rule
+                        # the GetSchedule branch above follows.
+                        start = frame.wire_to_wall_clock(event.get('StartTime', ''), zone)
                         bt = event.get('BusyType', '')
-                        if s and bt != 'Free':
+                        if start and bt != 'Free':
                             details = event.get('CalendarEventDetails', {})
                             subject = details.get('Subject', '') if details else ''
                             results[email].append({
                                 'subject': subject,
-                                'start_date': s[:10],
+                                'start_date': start.strftime('%Y-%m-%d'),
                                 'busy_type': bt,
                             })
             except Exception as exc:
