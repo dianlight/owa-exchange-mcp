@@ -51,8 +51,18 @@ async def main() -> bool:
             record("find_meeting_time", args, "EXCEPTION", f"unexpected shape: {info}")
             return False
 
+        # Recorded rather than asserted, for the reason spelled out in
+        # test_find_free_time.py: the mailbox's offset is not knowable from here,
+        # but a regression to the pre-fix `"source": "utc"` has to be visible in
+        # results.jsonl rather than hiding behind plausible-looking slots.
+        tz = info.get("timezone") or {}
+        tz_note = (
+            f", tz {tz.get('utc_offset', '?')} via {tz.get('source', 'missing')}"
+            + (f" [{tz['warning']}]" if tz.get("warning") else "")
+        )
         record("find_meeting_time", args, "OK",
-               f"{len(info['attendees'])} attendee(s), {len(info['free_slots'])} day(s) with free slots")
+               f"{len(info['attendees'])} attendee(s), "
+               f"{len(info['free_slots'])} day(s) with free slots{tz_note}")
         return True
 
 

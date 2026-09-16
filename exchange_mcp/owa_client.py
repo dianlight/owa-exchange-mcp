@@ -21,6 +21,11 @@ from exchange_mcp.browser_session import (  # noqa: F401
     CopilotUnavailableError,
     SessionExpiredError,
 )
+from exchange_mcp.mailbox_timezone import (
+    MailboxTimezone,
+    parse_mailbox_timezone_id,
+    resolve_mailbox_timezone,
+)
 
 # Map common folder names (English + Russian) to OWA distinguished folder IDs
 DISTINGUISHED_FOLDERS = {
@@ -129,6 +134,8 @@ class OWAClient:
         self.browser = browser_session
         self.owa_url = browser_session.owa_url
         self.user_email: str = ""
+        # Probed once, lazily, on first use -- see mailbox_timezone().
+        self._mailbox_timezone: MailboxTimezone | None = None
 
     @property
     def cookie_file(self):
@@ -720,6 +727,61 @@ class OWAClient:
         return suggestions
 
     # ------------------------------------------------------------------
+    # Mailbox timezone (probed once per process)
+    # ------------------------------------------------------------------
+
+    def _probe_owa_user_configuration(self) -> dict:
+        """Fetch the mailbox's own OWA configuration, or `{}` if unavailable.
+
+        The only caller is `mailbox_timezone()`, and the reason this is a
+        separate method is that it must be allowed to fail *quietly*: a mailbox
+        whose configuration cannot be read is a mailbox we assume the host's
+        timezone for (with a warning), not a mailbox whose calendar tools stop
+        working. That includes the case where this action does not exist on the
+        backend at all -- classic and modern OWA disagree about it, and neither
+        answer is an error worth propagating through `find_free_time`.
+
+        `AuthenticationRequiredError` is the one exception deliberately left to
+        propagate: it means a human must sign in, `request()` has already
+        exhausted its silent retry, and swallowing it here would turn a
+        fixable "use the login tool" into a silently wrong timezone.
+        """
+        payload = {
+            "__type": "GetOwaUserConfigurationJsonRequest:#Exchange",
+            "Header": {
+                "__type": "JsonRequestHeaders:#Exchange",
+                "RequestServerVersion": "Exchange2013",
+            },
+            "Body": {"__type": "GetOwaUserConfigurationRequest:#Exchange"},
+        }
+        try:
+            return self.request("GetOwaUserConfiguration", payload, timeout=15) or {}
+        except AuthenticationRequiredError:
+            raise
+        except Exception:
+            return {}
+
+    def mailbox_timezone(self) -> MailboxTimezone:
+        """The mailbox's timezone -- the frame every wall-clock number means.
+
+        Probed once per process and cached, like `user_email`: it is a
+        per-mailbox server fact that does not change under us, and the tools
+        that need it (`find_free_time` #601, `find_meeting_time` #602) would
+        otherwise pay a round-trip per call for an answer that never differs.
+
+        Never raises for a timezone reason and never returns None -- the
+        fallback chain in `resolve_mailbox_timezone()` is the contract, and
+        `MailboxTimezone.source` / `.warning` say which step it took so the
+        tools can report it. See exchange_mcp/mailbox_timezone.py for why a
+        shifted-but-working answer beats an error here.
+        """
+        if self._mailbox_timezone is None:
+            self._mailbox_timezone = resolve_mailbox_timezone(
+                parse_mailbox_timezone_id(self._probe_owa_user_configuration())
+            )
+        return self._mailbox_timezone
+
+    # ------------------------------------------------------------------
     # Substrate GetSchedule (modern Outlook backend only - free/busy)
     # ------------------------------------------------------------------
 
@@ -751,10 +813,24 @@ class OWAClient:
         tz_id). Stripped to naive the same way the rest of this module
         already treats GetUserAvailability's CalendarEventArray timestamps
         (see the pre-existing _get_availability_events in
-        tools/availability.py) - not a real timezone conversion, just the
-        established (if imprecise) convention every caller downstream
-        already assumes. Fractional seconds can run to 7 digits (.NET
-        ticks), one more than datetime.fromisoformat's 6-digit limit.
+        tools/availability.py): **the result is a naive UTC instant, not a
+        local time**, and a caller that compares it against a wall-clock
+        number has to convert it first.
+
+        That last sentence is not a style note. This docstring used to call
+        the convention "established (if imprecise)", and the imprecision was
+        a real, shipped bug: find_free_time/find_meeting_time subtracted
+        these instants from a 9-to-18 *local* working-day window and reported
+        every free slot shifted by the mailbox's UTC offset (PROJECT_STATUS.md
+        #601/#602, fixed 2026-09-16). The conversion now has exactly one
+        home -- exchange_mcp/mailbox_timezone.py, MailboxTimezone.from_utc()
+        -- so a new caller has something to reach for instead of a convention
+        to re-misread. This function's own contract is unchanged, on purpose:
+        every other caller compares these instants only against each other,
+        where naive UTC is correct and cheapest.
+
+        Fractional seconds can run to 7 digits (.NET ticks), one more than
+        datetime.fromisoformat's 6-digit limit.
         """
         if not t:
             return None
@@ -772,7 +848,7 @@ class OWAClient:
 
     def get_schedule(
         self, emails: list[str], start: datetime, end: datetime, *,
-        interval_minutes: int = 30, tz_id: str = "Russian Standard Time",
+        interval_minutes: int = 30, tz_id: str | None = None,
     ) -> list[dict]:
         """Fetch free/busy via the modern Outlook Scheduling Assistant's own
         GetSchedule GraphQL query, instead of the broken EWS
@@ -791,7 +867,24 @@ class OWAClient:
         (list of {"start", "end", "subject", "status", "is_recurring"},
         including free-status items - callers filter as they already do
         for CalendarEventArray).
+
+        **The two returned shapes are in different frames**, which is the whole
+        reason `tz_id` matters and why it no longer has a literal default:
+        `events` timestamps are UTC (see _parse_schedule_dt), while
+        `availability_view`'s character positions are wall-clock offsets from
+        `start` *as expressed in `tz_id`*. `tz_id=None` means "the mailbox's
+        own timezone" (`mailbox_timezone().wire_id`), which is what OWA's own
+        client sends and what makes the two consistent for a caller that
+        converts `events` out of UTC. It used to default to the literal
+        "Russian Standard Time" -- a stray UTC+3 that reached nine call sites
+        across five modules -- so `find_meeting_time` merged UTC `events` for
+        one attendee with Moscow wall-clock `availability_view` for another
+        (PROJECT_STATUS.md #601/#602). `start`/`end` must be expressed in
+        `tz_id` too: use `MailboxTimezone.to_wire_wallclock()`.
         """
+        if tz_id is None:
+            tz_id = self.mailbox_timezone().wire_id
+
         payload = [{
             "operationName": "GetSchedule",
             "variables": {
@@ -809,7 +902,29 @@ class OWAClient:
         data = self.request_substrate("/outlookgatewayb2/graphql", {}, payload)
         results = data if isinstance(data, list) else [data]
         top = results[0] if results else {}
-        schedules = top.get("data", {}).get("getSchedule", {}).get("schedules", []) or []
+
+        # A GraphQL operation that fails wholesale answers `"data": null` with the
+        # reason in a sibling `errors` array. `top.get("data", {})` returns that
+        # null rather than the default (the key *is* present), so chaining
+        # `.get()` off it raised AttributeError: 'NoneType' object has no
+        # attribute 'get' -- an opaque 500 out of find_meeting_time, with the
+        # server's own explanation sitting unread in the response. Surfaced
+        # while verifying the #601/#602 timezone fix, on a request for a mailbox
+        # that does not exist. Raised as a RuntimeError naming the reason
+        # because both callers already treat an exception here as "this
+        # attendee/mailbox has no data I can use" and report it, which is the
+        # right outcome -- what was wrong was that they could not say why.
+        envelope = top.get("data")
+        if not isinstance(envelope, dict):
+            messages = [
+                m.get("message", "") for m in (top.get("errors") or []) if isinstance(m, dict)
+            ]
+            raise RuntimeError(
+                "GetSchedule returned no data: "
+                + ("; ".join(m for m in messages if m) or "no error detail in the response")
+            )
+
+        schedules = (envelope.get("getSchedule") or {}).get("schedules") or []
         by_id = {s.get("scheduleId"): s for s in schedules}
 
         out = []

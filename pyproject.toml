@@ -29,6 +29,18 @@ dependencies = [
     # lifting it means doing that migration, exactly as this one was done.
     "mcp>=2.2.0,<3",
     "playwright",
+    # Timezone database for `zoneinfo`, which ships none of its own and falls
+    # back to the *system* one -- which Windows does not have at all, and slim
+    # Linux images often don't either. `exchange_mcp/mailbox_timezone.py` needs
+    # it to turn the mailbox's Windows timezone id into a real UTC offset, and
+    # Windows is this server's primary platform, so leaving it undeclared means
+    # the common case is the one that silently degrades. Not conditional on
+    # platform for that second reason. Pure data, no code, ~350 KB.
+    #
+    # A missing tzdata is still handled rather than fatal (it lands in the
+    # `host_local` fallback with a warning that names it) -- this dependency is
+    # what keeps that path rare, not what keeps the module working.
+    "tzdata",
 ]
 
 [project.urls]

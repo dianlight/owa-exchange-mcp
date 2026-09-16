@@ -37,7 +37,22 @@ async def main() -> bool:
             record("find_free_time", ARGS, "EXCEPTION", f"unexpected shape: {info}")
             return False
 
-        record("find_free_time", ARGS, "OK", f"{len(info['free_slots'])} day(s) with free slots")
+        # The `timezone` block is recorded, not asserted, and the distinction is
+        # the point. The frame these times are in is exactly what was wrong in
+        # #601 (naive-UTC busy periods against a local working-day window), and
+        # it is not checkable from here: only the mailbox knows its own offset,
+        # and a suite that hardcoded one would fail on every other mailbox. What
+        # a recorded note *does* buy is that a silent regression to `"source":
+        # "utc"` — the pre-fix behaviour, which the fallback chain keeps
+        # deliberately reachable — shows up in results.jsonl as a changed line
+        # instead of as free slots that merely look plausible.
+        tz = info.get("timezone") or {}
+        tz_note = (
+            f", tz {tz.get('utc_offset', '?')} via {tz.get('source', 'missing')}"
+            + (f" [{tz['warning']}]" if tz.get("warning") else "")
+        )
+        record("find_free_time", ARGS, "OK",
+               f"{len(info['free_slots'])} day(s) with free slots{tz_note}")
         return True
 
 

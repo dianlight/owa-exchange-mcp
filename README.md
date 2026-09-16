@@ -354,6 +354,7 @@ exchange_mcp/
     auth.py               # Login tool (opens the sign-in window)
     copilot.py            # Copilot chat-pane delegation (UI automation)
     discovery.py          # Capability discovery: record a session, classify its API surface
+  mailbox_timezone.py     # The mailbox's timezone: the one place UTC becomes wall-clock time
   discovery_session.py    # Recorder: separate Chromium, throwaway profile, user-driven
   capability_inventory.py # What's already implemented (AST scan of this package)
   capability_classify.py  # Verdicts + implementation proposals for a capture

@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, date
 from mcp.server.mcpserver import Context
 
 from exchange_mcp.server import mcp, AppContext
+from exchange_mcp.mailbox_timezone import MailboxTimezone
 from exchange_mcp.owa_client import BearerModeRequiredError, OWAClient
 
 
@@ -52,6 +53,24 @@ def _resolve_to_email(client: OWAClient, name: str) -> tuple[str, str]:
 # Internal: query GetUserAvailability in chunks
 # ------------------------------------------------------------------
 
+def _event_date(tz: MailboxTimezone, raw: str) -> str:
+    """The mailbox-local `YYYY-MM-DD` of a legacy CalendarEvent StartTime.
+
+    Replaces a bare `raw[:10]`, which took the date off whatever frame the
+    string happened to be in. `from_wire_timestamp` is the right call here (not
+    `from_utc`) because this request sends a `TimeZoneContext`, so an
+    unqualified value is already wall clock in `tz.wire_id` -- see
+    MailboxTimezone.from_wire_timestamp. Falls back to the original slice if the
+    timestamp doesn't parse, so an odd format costs a possibly-off-by-one date
+    rather than dropping a meeting out of the statistics entirely.
+    """
+    try:
+        parsed = tz.from_wire_timestamp(datetime.fromisoformat(raw.replace('Z', '+00:00')))
+    except (ValueError, AttributeError):
+        return raw[:10]
+    return parsed.strftime('%Y-%m-%d') if parsed else raw[:10]
+
+
 def _get_availability_events(
     client: OWAClient,
     emails: list[str],
@@ -75,9 +94,18 @@ def _get_availability_events(
     dicts with keys: subject, start_date, busy_type. errors collects one
     message per failed chunk/batch, so an availability-query failure shows
     up as a reportable warning instead of silently looking like "no meetings".
+
+    `start_date` is the event's date **in the mailbox's timezone**, which for a
+    day-granularity counter is the only part of the timezone question that
+    matters -- and it does matter: a 09:00 meeting in a UTC+2 mailbox is 07:00
+    UTC, fine, but an 00:30 one is 22:30 UTC *the previous day*, so counting on
+    the unconverted instant files it under the wrong date and shifts the window
+    edges by a day. Same fix as find_free_time #601 / find_meeting_time #602,
+    same single conversion point (exchange_mcp/mailbox_timezone.py).
     """
     results: dict[str, list[dict]] = {email: [] for email in emails}
     errors: list[str] = []
+    tz = client.mailbox_timezone()
 
     # Batch people
     email_batches = [emails[i:i+batch_size] for i in range(0, len(emails), batch_size)]
@@ -92,8 +120,9 @@ def _get_availability_events(
                 try:
                     schedules = client.get_schedule(
                         batch,
-                        datetime.combine(current, datetime.min.time()),
-                        datetime.combine(chunk_end, datetime.min.time()),
+                        tz.to_wire_wallclock(datetime.combine(current, datetime.min.time())),
+                        tz.to_wire_wallclock(datetime.combine(chunk_end, datetime.min.time())),
+                        tz_id=tz.wire_id,
                     )
                     for sched in schedules:
                         email = sched["email"]
@@ -108,12 +137,39 @@ def _get_availability_events(
                                 continue
                             results[email].append({
                                 'subject': ev.get('subject', ''),
-                                'start_date': ev['start'].strftime('%Y-%m-%d'),
+                                # from_utc: GetSchedule's scheduleItems are UTC
+                                # instants (see _parse_schedule_dt), and the
+                                # date has to be the mailbox's.
+                                'start_date': tz.from_utc(ev['start']).strftime('%Y-%m-%d'),
                                 'busy_type': ev.get('status', ''),
                             })
                     current = chunk_end
                     continue
                 except BearerModeRequiredError:
+                    use_schedule = False
+                except RuntimeError as exc:
+                    # A whole-operation GetSchedule failure (GraphQL
+                    # `"data": null`, raised as a RuntimeError naming the reason
+                    # -- see OWAClient.get_schedule). This helper's entire
+                    # contract is that a failed availability query becomes a
+                    # reportable warning rather than looking like "no meetings",
+                    # and only the legacy branch below was holding up that end.
+                    # Unhandled, it propagated out of get_meeting_stats as a 500.
+                    #
+                    # **RuntimeError, not Exception**: AuthenticationRequiredError
+                    # and SessionExpiredError are plain Exception subclasses, and
+                    # both mean the caller must act (sign in / the retry is spent)
+                    # rather than "this batch has no data". Demoting either to a
+                    # per-batch warning would answer "no meetings" to a mailbox we
+                    # simply cannot read, which is the exact false-clean result
+                    # this helper's `errors` list was introduced to stop.
+                    #
+                    # `use_schedule = False` rather than advancing the chunk: it
+                    # falls through to the legacy branch in this same iteration
+                    # (as the bearer case does), which is what advances `current`
+                    # -- recording the error and looping without that would spin
+                    # on this chunk forever.
+                    errors.append(f"GetSchedule failed for {batch}: {exc}")
                     use_schedule = False
 
             mailbox_data = [{
@@ -134,7 +190,7 @@ def _get_availability_events(
                         '__type': 'TimeZoneContext:#Exchange',
                         'TimeZoneDefinition': {
                             '__type': 'TimeZoneDefinitionType:#Exchange',
-                            'Id': 'Russian Standard Time',
+                            'Id': tz.wire_id,
                         },
                     },
                 },
@@ -145,8 +201,14 @@ def _get_availability_events(
                         '__type': 'FreeBusyViewOptions:#Exchange',
                         'TimeWindow': {
                             '__type': 'Duration:#Exchange',
-                            'StartTime': f'{current}T00:00:00',
-                            'EndTime': f'{chunk_end}T00:00:00',
+                            # Local midnight expressed in tz.wire_id, so the
+                            # chunk covers the mailbox's days rather than UTC's.
+                            'StartTime': tz.to_wire_wallclock(
+                                datetime.combine(current, datetime.min.time())
+                            ).strftime('%Y-%m-%dT%H:%M:%S'),
+                            'EndTime': tz.to_wire_wallclock(
+                                datetime.combine(chunk_end, datetime.min.time())
+                            ).strftime('%Y-%m-%dT%H:%M:%S'),
                         },
                         'MergedFreeBusyIntervalInMinutes': 30,
                         'RequestedView': 'DetailedMerged',
@@ -184,7 +246,7 @@ def _get_availability_events(
                             subject = details.get('Subject', '') if details else ''
                             results[email].append({
                                 'subject': subject,
-                                'start_date': s[:10],
+                                'start_date': _event_date(tz, s),
                                 'busy_type': bt,
                             })
             except Exception as exc:
