@@ -106,11 +106,19 @@ class MailboxAddress(NamedTuple):
     `UNRESOLVED_NO_ADDRESS` (signals were present and carried no address,
     which is the one worth reporting to a human). `source` names the signal
     that answered; see the module docstring for why callers keep it.
+
+    `detail` is free text about *why* a signal didn't answer — the exception a
+    swallowed probe raised, typically. It exists because diagnosing the
+    2026-09-16 cold-start miss took three live probes to recover a single
+    `TimeoutError` that `_user_configuration_or_none`'s `except Exception` had
+    thrown away, and the wrong mechanism was written down twice in the
+    meantime. Never parse it; `reason` is the contract.
     """
 
     address: str
     source: str = ""
     reason: str = ""
+    detail: str = ""
 
 
 def looks_like_smtp_address(value: str) -> bool:
@@ -259,3 +267,45 @@ def resolve_mailbox_address(
     return MailboxAddress(
         "", "", UNRESOLVED_NO_ADDRESS if saw_signal else UNRESOLVED_NO_SIGNALS
     )
+
+
+def is_retryable(resolved: MailboxAddress) -> bool:
+    """True when a failed resolution says "nothing had answered *yet*".
+
+    `UNRESOLVED_NO_ADDRESS` is a property of the backend — signals were there
+    and carried no address — so it will not change mid-process and caching it
+    is right. `UNRESOLVED_NO_SIGNALS` is a statement about *when* we asked, so
+    it may.
+
+    Naming the rule here rather than comparing reason strings in the client is
+    the point: this is the distinction the 2026-09-16 cold-start bug turned on,
+    and a caller open-coding `!= UNRESOLVED_NO_SIGNALS` is how it comes back.
+    """
+    return not resolved.address and resolved.reason == UNRESOLVED_NO_SIGNALS
+
+
+def signal_state(hints: dict | None) -> str:
+    """A fingerprint of *which* identity signals this session currently holds.
+
+    Two states that compare equal mean "re-asking would read exactly the same
+    inputs", which is what makes it safe to serve a cached failure rather than
+    spend another request. It is the bound on the retry that `is_retryable()`
+    allows, and it is a real bound rather than a counter because the failure it
+    guards against is *sticky per session*: measured 2026-09-16, four cold
+    processes against one profile resolved twice on the first call and, in the
+    two that did not, failed all three further attempts — 0 for 6. Retrying
+    inside an unchanged session buys nothing and costs ~30s a call.
+
+    Presence only, never content: a Bearer token that was merely *refreshed*
+    names the same mailbox, so comparing tokens would force a pointless
+    re-probe every hour, while an account switch is handled by
+    `forget_mailbox_identity()` instead. `auth_mode` is included because it is
+    the one field that can move without a hint appearing, and a re-probe in
+    that state is exactly the one worth paying for.
+    """
+    hints = hints or {}
+    return "|".join((
+        str(hints.get("auth_mode", "")),
+        "anchor" if str(hints.get("anchor_mailbox", "")).strip() else "-",
+        "token" if str(hints.get("bearer_token", "")).strip() else "-",
+    ))
