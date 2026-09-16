@@ -203,7 +203,28 @@ def _startup(browser: BrowserSession, client: OWAClient) -> None:
 
         _log("Auth status: NOT AUTHENTICATED - opening a browser window on the OWA sign-in "
              f"page (waiting up to {LOGIN_WINDOW_SECONDS}s). Please sign in there, 2FA included.")
-        result = browser.interactive_login(LOGIN_WINDOW_SECONDS)
+        try:
+            result = browser.interactive_login(LOGIN_WINDOW_SECONDS)
+        except TimeoutError:
+            # Scoped deliberately to this one call. `interactive_login` already
+            # returns a diagnosed timeout result of its own, so reaching here means
+            # the *outer* budget fired instead - and at this one call site that
+            # still unambiguously means "nobody completed the sign-in", which is
+            # the reason and remediation the operator needs. Mapping TimeoutError
+            # this way anywhere wider would be a fabricated diagnosis: the same
+            # exception out of browser.start() or has_active_session() means an
+            # unreachable host, not an unattended window.
+            #
+            # This is the belt to the braces in browser_session (the diagnosis is
+            # bounded there so it cannot eat the margin). Both exist because the
+            # generic handler below reported this as `UNKNOWN - TimeoutError: .`,
+            # with no reason and no remediation - see PROJECT_STATUS.md §4.
+            result = {
+                "success": False,
+                "error": f"Sign-in was not completed within {LOGIN_WINDOW_SECONDS}s "
+                         "(the sign-in window outlasted its own budget).",
+                "reason": auth_errors.LOGIN_TIMEOUT,
+            }
 
         if result.get("success"):
             _log(f"Auth status: AUTHENTICATED. {result.get('message', 'Signed in successfully.')}")

@@ -185,6 +185,52 @@ VISIBLE_ERROR_SELECTORS: tuple[str, ...] = (
     "[role='alert']",
 )
 
+# Hosts and path fragments that mean "this page is still inside the sign-in
+# flow". Used by the interactive-login poll to tell "the user is still working
+# on it" from "the page has moved on and is worth confirming a session against"
+# -- see BrowserSession._async_poll_session_signal, which exists because the
+# confirmation *reloads* the page and so must not run on every tick while
+# somebody is typing a password into it.
+#
+# Deliberately one-directional: matching means "still signing in", but NOT
+# matching is only a *trigger* to go and check properly, never a verdict that a
+# session exists. A mailbox-host URL can equally be an interstitial or a
+# half-booted SPA, and treating it as proof would fabricate a session -- which
+# costs a failed request, where the honest version costs one extra poll.
+SIGNIN_HOST_HINTS: tuple[str, ...] = (
+    "login.microsoftonline.com",
+    "login.microsoft.com",
+    "login.live.com",
+    "login.windows.net",
+    "sts.windows.net",
+    "b2clogin.com",
+    "adfs",
+    "msauth",
+    "msftauth",
+    "aadcdn",
+    "duosecurity",
+    "okta",
+    "ping-identity",
+    # Classic OWA's own forms-based sign-in lives on the mailbox host itself, so
+    # a host check alone would miss it and call it "moved on".
+    "/owa/auth/logon.aspx",
+    "/owa/auth.owa",
+    "/adfs/ls",
+)
+
+
+def looks_like_signin_url(url: str) -> bool:
+    """True if `url` is still part of an authentication flow.
+
+    A blank/unknown URL counts as "still signing in": the safe direction here is
+    to keep waiting quietly rather than to go and reload a page we cannot even
+    identify. See SIGNIN_HOST_HINTS on why this is not a session test.
+    """
+    lowered = (url or "").strip().lower()
+    if not lowered or lowered in ("about:blank", "chrome://newtab/"):
+        return True
+    return any(hint in lowered for hint in SIGNIN_HOST_HINTS)
+
 
 def classify_login_failure(page_text: str = "", page_url: str = "", page_html: str = "") -> tuple[str, str] | None:
     """Map a sign-in page's error surface to a (reason, message) pair.

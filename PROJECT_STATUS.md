@@ -2004,21 +2004,74 @@ hold a request open for.
   acceptable substitute here without the mailbox owner's say-so — `require_self_email()` is
   strict by design because these suites send mail and create calendar items.
 
-- **The startup auth poll reports a false negative, and its timeout skips the diagnosis that
-  exists to explain it.** Observed twice on 2026-09-16, on two fresh profiles: the banner logs
-  `Auth status: NOT AUTHENTICATED - opening a browser window...` and then
-  `Auth status: UNKNOWN - startup failed: TimeoutError: .`, while a `check_session` issued
-  immediately afterwards returns `"authenticated": true` — SSO had carried the profile all
-  along. Two separate problems behind one symptom. First, `has_active_session()` /
-  `interactive_login()`'s poll doesn't see a session the very next real request finds, so an
-  operator is told to sign in when they needn't. Second, the failure arrives as a bare
-  `TimeoutError` with an *empty* message, which lands in `_startup`'s generic
-  `except Exception` branch — so `auth_errors.classify_login_failure()`, whose entire purpose is
-  to explain a timed-out interactive sign-in, never runs, and the operator gets no reason and no
-  remediation. Whatever the first cause turns out to be, the second is worth fixing on its own:
-  the diagnosis path is unreachable from the timeout that is supposed to trigger it. Practical
-  consequence meanwhile: **trust `check_session`, not the startup banner**, when deciding
-  whether a server is usable.
+- ~~**The startup auth poll reports a false negative, and its timeout skips the diagnosis that
+  exists to explain it.**~~ **Fixed 2026-09-16.** The banner logged
+  `Auth status: NOT AUTHENTICATED - opening a browser window...` while a `check_session` issued
+  moments later returned `"authenticated": true` — SSO had carried the profile all along.
+  Observed on two fresh profiles; on the first, the window then expired into
+  `Auth status: UNKNOWN - startup failed: TimeoutError: .` (the second run was stopped before
+  its window closed, so only the false negative itself was seen twice). **Three** distinct
+  faults sat behind that one symptom, and the middle one is the worst:
+
+  1. **One probe attempt was treated as decisive.** On a cold profile the first top-level
+     navigation to `/owa/` lands on an account-selection redirect even with a perfectly good SSO
+     session (already documented in `_async_ensure_logged_in`), so the single bearer capture can
+     give up before the SPA has minted a token — while the *request* path
+     (`_async_ensure_auth`) simply captures again later on a settled page and succeeds. That is
+     the entire gap between the two answers. `_async_probe_active_session()` now retries a
+     **negative** verdict (`_SESSION_PROBE_ATTEMPTS`), returning early on a positive one. The
+     direction follows the same asymmetry as `profile_lock.py`: a false "not signed in" opens a
+     sign-in window nobody asked for and replaces a working server with a minutes-long wait,
+     while a false "signed in" costs one failed request that `_relogin_or_raise()` already
+     retries and reports properly.
+  2. **The login poll reloaded the page the user was typing into.**
+     `_async_has_active_session()` confirms a modern-backend session via
+     `_async_capture_bearer_context()`, which calls `page.reload()` — and during an interactive
+     login that page *is* the sign-in form. Polling it every couple of seconds is hostile on its
+     face and plausibly why a sign-in could sit unfinished for a whole 10-minute window. The
+     loop now asks a new **non-destructive** `_async_poll_session_signal()` first (canary cookie,
+     a bearer already held, or the page having left the sign-in flow per
+     `auth_errors.SIGNIN_HOST_HINTS`) and only pays for the reloading confirmation once that
+     says so — and then no more often than `_LOGIN_CONFIRM_MIN_INTERVAL_SECONDS`. Note the
+     one-directional rule on that host table: matching means "still signing in", but *not*
+     matching is only a trigger to check properly, never a verdict that a session exists.
+     A final authoritative check now also runs once the window expires, because "the poll said
+     no, the next request said yes" was the reported symptom.
+  3. **A wrapper budget smaller than the work it wraps.** `interactive_login()` handed `_run()`
+     a budget of `timeout + 30`, and 30s was *exactly* the diagnosis's worst case — 10
+     `VISIBLE_ERROR_SELECTORS` × 3 nodes × two 500 ms Playwright calls = 30.0s — before
+     `page.content()` on a heavy SPA page was even counted. Zero slack by arithmetic. So
+     `future.result()` raised `concurrent.futures.TimeoutError`, which *is* the builtin
+     `TimeoutError` whose `str()` is empty (hence the useless `TimeoutError: .`), and
+     `_startup`'s generic handler discarded the reason and remediation being computed at that
+     very moment. The diagnosis is now capped (`_LOGIN_DIAGNOSIS_SECONDS`) and degrades to the
+     plain timeout result rather than replacing the answer with an exception, and the margin is
+     **derived** from the post-deadline work instead of hardcoded. `_startup` also maps a
+     `TimeoutError` from that one call to `LOGIN_TIMEOUT` with remediation — scoped to that call
+     site deliberately, since the same exception out of `browser.start()` means an unreachable
+     host, not an unattended window.
+
+  The derived-budget discipline is not decoration: this regressed **twice**, the second time
+  while the fix itself was being written (adding the final authoritative check silently pushed
+  the post-deadline work past the margin again). `tests/unit/test_login_probe.py` therefore
+  asserts the arithmetic as an invariant, alongside the retry behaviour, the host table, and —
+  the property that actually matters — that the reloading check is **not** called while a user
+  is signing in.
+
+  **What is verified, and what isn't.** Faults 2 and 3 are structural and unit-covered: the
+  reloading check provably isn't called while the quiet signal says "still signing in", and the
+  margin provably covers the post-deadline work. Fault 1 is unit-covered for its *logic* (a
+  negative is retried, a positive returns early, a hung attempt is abandoned) but has **not**
+  been re-observed live against a cold profile, because reproducing it needs a fresh profile plus
+  a completed interactive sign-in and the window went unattended both times it was tried.
+
+  One operational gotcha learned the hard way while trying: **force-killing the server
+  (`taskkill /F`) destroys the profile's session.** `context.close()` is what flushes cookies to
+  disk (see `_async_relaunch`), and a killed process never runs it — so a profile that was signed
+  in minutes earlier comes back with no session at all, and the *next* startup's
+  `NOT AUTHENTICATED` is then perfectly correct rather than a false negative. That is exactly
+  what happened on the third attempt here, and it is a good way to mistake a healthy probe for
+  a broken one. Stop a test server gracefully if the profile is meant to survive it.
 
 - **`OWAClient.user_email` is never assigned, and it breaks `get_meeting_contacts` outright.**
   Found while tracing the availability read path for issue #8, and unrelated to it, but

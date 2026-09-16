@@ -32,6 +32,7 @@ from exchange_mcp.auth_errors import (  # noqa: F401  (re-exported for callers)
     VISIBLE_ERROR_SELECTORS,
     AuthenticationRequiredError,
     classify_login_failure,
+    looks_like_signin_url,
 )
 from exchange_mcp.profile_lock import (  # noqa: F401  (re-exported for callers)
     PROFILE_LOCKED,
@@ -97,6 +98,72 @@ def default_profile_dir() -> Path:
 _LOCK_WAIT_RELAUNCH_SECONDS = 15.0
 _LOCK_WAIT_LAUNCH_SECONDS = 3.0
 _LOCK_POLL_SECONDS = 0.5
+
+# How many times a *negative* session probe is retried before it answers "no"
+# (PROJECT_STATUS.md §4, the startup false negative). One attempt is not
+# decisive on a cold profile: the first top-level navigation to /owa/ lands on
+# an account-selection redirect even with a perfectly good SSO session (see
+# _async_ensure_logged_in), so the SPA may not have minted a token yet when the
+# single capture attempt gives up -- which is exactly the state where a
+# `check_session` moments later succeeds, because the request path
+# (_async_ensure_auth) simply captures again on a settled page.
+#
+# The asymmetry decides the direction, the same way it does in profile_lock.py:
+# a false "not signed in" opens a sign-in window nobody asked for and replaces a
+# working server with a minutes-long wait, while a false "signed in" costs one
+# failed request that OWAClient._relogin_or_raise() already retries and then
+# reports properly. So the probe leans towards "signed in" and has to try hard
+# before saying no.
+# Two, not three: the observed failure needs exactly one more look at a settled
+# page, and every extra attempt is paid in full by the *genuinely* signed-out
+# profile -- the case where we want the sign-in window on screen promptly.
+_SESSION_PROBE_ATTEMPTS = 2
+_SESSION_PROBE_SETTLE_SECONDS = 3.0
+
+# Ceiling per attempt, enforced with asyncio.wait_for so it is a real bound and
+# not a hope. warm_anchor's goto (30s ceiling) plus a bearer capture (a 20s
+# reload, a 20s wait for the token, a 10s load-state, a 3s settle) can otherwise
+# reach ~83s on paper, and a wrapper budget smaller than the work it wraps is the
+# precise shape of the bug being fixed here -- so the work is bounded first and
+# the budget derived from it, never the reverse.
+_SESSION_PROBE_ATTEMPT_SECONDS = 60.0
+_SESSION_PROBE_BUDGET_SECONDS = (
+    _SESSION_PROBE_ATTEMPTS * _SESSION_PROBE_ATTEMPT_SECONDS
+    + (_SESSION_PROBE_ATTEMPTS - 1) * _SESSION_PROBE_SETTLE_SECONDS
+)
+_SESSION_PROBE_RUN_MARGIN_SECONDS = 15.0
+
+# Hard ceiling on the post-timeout login diagnosis (_async_detect_login_failure).
+# It is *explanation*, never the answer, so it must not be able to outlive the
+# budget its caller was given -- see _LOGIN_RUN_MARGIN_SECONDS.
+_LOGIN_DIAGNOSIS_SECONDS = 20.0
+
+# Floor between two *reloading* session confirmations inside the interactive-login
+# poll. The quiet signal (_async_poll_session_signal) gates most ticks, but a page
+# that has left the sign-in flow and is merely still booting would satisfy it on
+# every tick - and reloading a booting SPA every couple of seconds prevents the
+# token dance it is trying to finish. Comfortably longer than a bearer capture's
+# own budget, so two confirmations can never overlap.
+_LOGIN_CONFIRM_MIN_INTERVAL_SECONDS = 30.0
+
+# Slack added to interactive_login()'s own deadline when handing it to _run().
+# This used to be a bare `+ 30`, which happened to equal the diagnosis's exact
+# worst case (10 VISIBLE_ERROR_SELECTORS x 3 nodes x two 500ms Playwright calls
+# = 30.0s) *before* page.content() on a heavy SPA page was even counted. So the
+# margin was zero-slack by arithmetic: the diagnosis ate it, future.result()
+# raised a bare TimeoutError (whose str() is empty -- hence the useless
+# `TimeoutError: .` in the log), and _startup's generic handler discarded the
+# reason and remediation that were being computed at that very moment.
+#
+# Derived now, and it has to cover *everything* the coroutine does after its own
+# deadline expires: the final authoritative session check (one bounded probe
+# attempt) and then the diagnosis. Getting this wrong is not a hypothetical --
+# adding that final check is what silently over-ran the margin again while this
+# very fix was being written. Whenever post-deadline work is added, it belongs in
+# this sum on the same commit.
+_LOGIN_RUN_MARGIN_SECONDS = (
+    _SESSION_PROBE_ATTEMPT_SECONDS + _LOGIN_DIAGNOSIS_SECONDS + 15.0
+)
 
 _CRASH_HINTS = (
     "target closed",
@@ -697,8 +764,86 @@ class BrowserSession:
             pass  # the caller retries navigation as needed
 
     async def _async_probe_active_session(self) -> bool:
+        """Is this profile signed in? Retries a *negative* answer before trusting it.
+
+        The single-attempt version of this produced the startup false negative in
+        PROJECT_STATUS.md §4: the banner said NOT AUTHENTICATED and opened a
+        sign-in window, while a `check_session` issued moments later came back
+        authenticated. Nothing had changed in between except that the request
+        path (`_async_ensure_auth`) captured a bearer token again, on an anchor
+        page that had by then settled.
+
+        So a "no" here is only reported after `_SESSION_PROBE_ATTEMPTS` tries --
+        see that constant for why the retry goes in this direction and not the
+        other. A "yes" returns immediately: there is nothing to re-check about a
+        session we can already see.
+
+        Retries live *here* rather than in `_async_has_active_session()`, which
+        stays a single-shot primitive, because `_async_interactive_login`'s poll
+        loop calls that one on its own cadence and is itself the retry -- adding a
+        second layer of waiting inside it would stretch each tick unpredictably.
+        """
+        for attempt in range(_SESSION_PROBE_ATTEMPTS):
+            if attempt:
+                # Only between attempts: the first warm_anchor already paid a
+                # navigation, and this settle is for the SPA's own redirect
+                # chain, which outlives "networkidle" by a couple of seconds.
+                await asyncio.sleep(_SESSION_PROBE_SETTLE_SECONDS)
+            try:
+                if await asyncio.wait_for(
+                    self._async_warm_and_check(), timeout=_SESSION_PROBE_ATTEMPT_SECONDS
+                ):
+                    return True
+            except Exception:
+                # Mid-navigation, a context swapped under us, or this attempt
+                # simply outran its own ceiling. All indistinguishable from "not
+                # signed in" at this level, and all want another look -- only the
+                # last attempt's verdict is allowed to be negative.
+                continue
+        return False
+
+    async def _async_warm_and_check(self) -> bool:
+        """One probe attempt: touch the anchor page, then ask if we're signed in."""
         await self._async_warm_anchor()
         return await self._async_has_active_session()
+
+    async def _async_poll_session_signal(self) -> bool:
+        """Cheap, *non-destructive* "are we in yet?" for the interactive-login poll.
+
+        This must not navigate or reload anything, and that is the whole reason it
+        exists. `_async_has_active_session()` confirms a modern-backend session by
+        calling `_async_capture_bearer_context()`, which **reloads the anchor
+        page** - and during an interactive login the anchor page is the page a
+        human is typing their password into. Polling it directly therefore
+        reloaded the sign-in form every few seconds, which is hostile at best and
+        plausibly why a sign-in could sit unfinished for a whole window
+        (PROJECT_STATUS.md §4).
+
+        So the loop asks this first and only pays for the real, reloading check
+        once this returns True. Three signals, cheapest first, none of which
+        touches the page:
+
+        1. The classic canary cookie - a pure cookie read, and conclusive.
+        2. A bearer token we already hold and that has not expired.
+        3. The visible page has left the sign-in flow.
+
+        Only (1) and (2) are evidence of a session; (3) is a *trigger* to go and
+        check properly, never a verdict - see `auth_errors.SIGNIN_HOST_HINTS`.
+        """
+        try:
+            if await self._async_is_session_valid():
+                return True
+            if (
+                self._auth_mode == "bearer"
+                and self._bearer
+                and time.time() < self._bearer_expiry - 120
+            ):
+                return True
+            return not looks_like_signin_url(self._anchor_page.url)
+        except Exception:
+            # A page mid-navigation has no readable URL. Keep waiting quietly
+            # rather than reloading something we can't identify.
+            return False
 
     async def _async_ensure_logged_in(self) -> dict:
         """Silent re-auth only: confirm (or silently re-acquire) a session.
@@ -802,7 +947,11 @@ class BrowserSession:
 
         async with self._login_lock:
             # Another caller may have finished a login while we waited on the lock.
-            if await self._async_probe_active_session():
+            # Single-attempt on purpose: if someone *just* completed a sign-in the
+            # session is plainly there, and the retrying probe would double the
+            # delay before the window opens for the caller who genuinely needs it
+            # -- _startup has already paid those retries immediately beforehand.
+            if await self._async_warm_and_check():
                 return {"success": True, "message": "Session active.", "browser_shown": False}
 
             if self.headless:
@@ -816,9 +965,22 @@ class BrowserSession:
             await self._async_warm_anchor()
 
             deadline = time.monotonic() + timeout
+            last_confirm = 0.0
             while time.monotonic() < deadline:
                 await asyncio.sleep(poll_seconds)
                 try:
+                    # Quiet check first: the confirmation below reloads the page
+                    # the user is typing into, so it must not run every tick.
+                    if not await self._async_poll_session_signal():
+                        continue
+                    # And not more often than the floor even once the quiet check
+                    # is happy - a page that has left the sign-in flow but is
+                    # still booting would otherwise be reloaded in a tight loop,
+                    # interrupting the very token dance we are waiting for.
+                    now = time.monotonic()
+                    if now - last_confirm < _LOGIN_CONFIRM_MIN_INTERVAL_SECONDS:
+                        continue
+                    last_confirm = now
                     if await self._async_has_active_session():
                         # Left visible on purpose: relaunching headless here would
                         # mean tearing down the context seconds after the session
@@ -835,16 +997,50 @@ class BrowserSession:
                 except Exception:
                     continue  # mid-navigation; try again on the next tick
 
-            failure = await self._async_detect_login_failure(page)
-            if failure:
-                reason, message = failure
-                return {"success": False, "error": message, "reason": reason, "browser_shown": True}
-            return {
+            # One last authoritative look before calling it a failure. The loop
+            # above is deliberately gated and rate-limited, so the final seconds of
+            # the window may not have been confirmed - and reporting "not signed
+            # in" over a session that *is* there is the exact false negative this
+            # whole path is being fixed for. Safe to reload now: the window has
+            # timed out, so nobody is mid-keystroke.
+            try:
+                if await asyncio.wait_for(
+                    self._async_warm_and_check(), timeout=_SESSION_PROBE_ATTEMPT_SECONDS
+                ):
+                    return {
+                        "success": True,
+                        "message": "Signed in successfully (confirmed as the sign-in window "
+                                   "expired). The browser window stays visible for the rest of "
+                                   "this server's lifetime; restart the server to return to "
+                                   "headless.",
+                        "browser_shown": True,
+                    }
+            except Exception:
+                pass
+
+            timed_out = {
                 "success": False,
                 "error": f"Sign-in was not completed within {int(timeout)} seconds.",
                 "reason": LOGIN_TIMEOUT,
                 "browser_shown": True,
             }
+
+            # Bounded, and it degrades to the plain timeout result. The diagnosis
+            # is only ever an *explanation* of an answer we already have, so it
+            # must never be in a position to replace that answer with an
+            # exception -- which is precisely what used to happen: it could eat
+            # interactive_login's entire _run margin, and the bare TimeoutError
+            # that followed threw away the very reason being computed.
+            try:
+                failure = await asyncio.wait_for(
+                    self._async_detect_login_failure(page), timeout=_LOGIN_DIAGNOSIS_SECONDS
+                )
+            except Exception:
+                return timed_out
+            if failure:
+                reason, message = failure
+                return {"success": False, "error": message, "reason": reason, "browser_shown": True}
+            return timed_out
 
     def ensure_logged_in(self, timeout: float = 120) -> dict:
         """Confirm or silently re-acquire a session. Never opens a window, never raises.
@@ -861,19 +1057,34 @@ class BrowserSession:
 
         Blocking: call it from a worker thread (asyncio.to_thread) or a background
         task, never inline in an MCP request handler - `timeout` is minutes, not
-        milliseconds. The extra 30s on the internal deadline lets the coroutine's
-        own timeout report a proper reason instead of dying on _run()'s wait.
+        milliseconds.
+
+        The margin on the internal deadline is what lets the coroutine's own
+        timeout report a proper reason instead of dying on _run()'s wait. It is
+        derived from the diagnosis ceiling (_LOGIN_RUN_MARGIN_SECONDS) rather than
+        hardcoded: as a bare `+ 30` it exactly equalled the diagnosis's worst
+        case, so it had no slack at all and the reason was lost to a bare
+        TimeoutError -- see PROJECT_STATUS.md §4.
         """
         return self._run_with_recovery(
-            lambda: self._async_interactive_login(timeout, poll_seconds), timeout=timeout + 30
+            lambda: self._async_interactive_login(timeout, poll_seconds),
+            timeout=timeout + _LOGIN_RUN_MARGIN_SECONDS,
         )
 
-    def has_active_session(self, timeout: float = 120) -> bool:
+    def has_active_session(self, timeout: float | None = None) -> bool:
         """True if the persistent profile is still signed in, in either auth mode.
 
         The startup check: "can we reuse this profile as-is, or does someone have
         to sign in?"
+
+        `timeout` defaults to the probe's own bounded budget plus slack rather
+        than a fixed number, because the probe retries a negative answer now (see
+        _async_probe_active_session) and a wrapper budget that is *smaller* than
+        the work it wraps is exactly how the useless `TimeoutError: .` in
+        PROJECT_STATUS.md §4 came about. Derived, so the two cannot drift.
         """
+        if timeout is None:
+            timeout = _SESSION_PROBE_BUDGET_SECONDS + _SESSION_PROBE_RUN_MARGIN_SECONDS
         return self._run_with_recovery(self._async_probe_active_session, timeout=timeout)
 
     # ------------------------------------------------------------------
