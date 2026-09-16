@@ -120,6 +120,34 @@ that needs the address imports it from there rather than adding another `os.envi
 and **never** reintroduces a literal address: that is how one got committed to a public
 repository in the first place.
 
+**Stopping a test server: never `taskkill /T`, and confirm the PID against the port first.**
+`/T` kills a process *tree*, and on Windows the tree it walks is wider than the server you started —
+it took out a long-running server on **another port** while tearing down an isolated one on
+2026-09-16, with nothing in the output naming the casualty. The server that dies this way leaves no
+trace of why: its port simply stops listening, and because the browser profile is untouched a
+restart succeeds and looks routine, so the outage is easy to attribute to anything but the teardown.
+
+Resolve the port to a PID, check it is the one you meant, and kill only it:
+
+```bash
+# The PID that owns the port -- field 5 of the LISTENING row, not a TIME_WAIT one
+netstat -ano | grep ":8796 " | grep LISTENING
+taskkill //PID <pid> //F          # no //T
+```
+
+(The doubled slashes are Git Bash, which mangles a single `/…` into a path; from
+PowerShell or cmd it is `taskkill /PID <pid> /F`.)
+
+Then verify **both** sides: the test port has stopped listening *and* every other port you care
+about still is. `netstat -ano | grep -E ":876[0-9]"` in one call shows them together. A teardown
+that only checks its own port cannot tell "stopped correctly" from "stopped, and took a neighbour
+with it" — which is the same shape as every other bug in this codebase's history: a call that looks
+like it worked because nobody read the whole answer.
+
+Nothing here needs killing at all in the normal case: an isolated server is a foreground process,
+and letting it exit closes its profile cleanly (which is what the `ProfileLockedError` machinery in
+"Recovery" below exists to survive when it doesn't).
+
 **Never start the server with `python -m exchange_mcp.server`** — it registers *zero* tools and
 every call fails `Unknown tool`. `-m` loads `server.py` under the name `__main__`, so when each
 tool module does `from exchange_mcp.server import mcp` Python imports the module a *second* time
