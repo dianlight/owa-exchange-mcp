@@ -419,24 +419,78 @@ def test_request_header_omission() -> None:
 # ------------------------------------------------------------------
 
 
+def _legacy_zone_offenders(source: str, label: str = "<source>") -> list[str]:
+    """Where `source` uses the legacy zone id as a value rather than as table data.
+
+    Parsed with `ast` rather than matched as text, because the two cases are
+    indistinguishable line-by-line and only one of them is a bug:
+
+    - `{"Russian Standard Time": "Europe/Moscow"}` is a **key** in
+      `availability_frame`'s Windows->IANA lookup. Moscow is a real timezone and
+      that table has to know it; nothing is being sent.
+    - `{"Id": "Russian Standard Time"}`, or `tz_id or "Russian Standard Time"`, is
+      the bug from issue #8: a value that goes on the wire.
+
+    A text guard flagged the first of those the moment `availability_frame`
+    landed -- a check crying wolf about a table it should never have looked at.
+    Docstrings and comments are invisible here by construction: the modules are
+    *supposed* to explain the bug they used to have.
+    """
+    import ast
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:  # pragma: no cover - a broken module fails elsewhere
+        return [f"{label}: unparseable ({exc})"]
+
+    legacy = mtz.LEGACY_HARDCODED_TIMEZONE_ID
+    exempt: set[int] = set()
+    for node in ast.walk(tree):
+        # Every dict key is table data, never a payload value.
+        if isinstance(node, ast.Dict):
+            for key in node.keys:
+                if isinstance(key, ast.Constant) and key.value == legacy:
+                    exempt.add(id(key))
+        # The module's own record of what the literal used to be.
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and "LEGACY_HARDCODED" in target.id:
+                    exempt.add(id(node.value))
+
+    return [
+        f"{label}:{getattr(node, 'lineno', '?')}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and node.value == legacy and id(node) not in exempt
+    ]
+
+
 def test_no_hardcoded_zone_remains() -> None:
-    print("The literal from issue #8 is gone from every request builder")
+    print("The legacy literal from issue #8 is gone from every request builder")
     from pathlib import Path
+
+    # First prove the guard can fire. A check that cannot fail is worthless, and
+    # this one silently stopped being able to distinguish the cases once already.
+    caught = _legacy_zone_offenders(
+        'HEADER = {"TimeZoneContext": {"Id": "Russian Standard Time"}}', "synthetic"
+    )
+    check("a payload value is caught", len(caught) == 1, repr(caught))
+    caught_default = _legacy_zone_offenders(
+        'def f(tz_id=None):\n    return tz_id or "Russian Standard Time"\n', "synthetic"
+    )
+    check("a keyword default is caught", len(caught_default) == 1, repr(caught_default))
+
+    # And that it does not fire on the legitimate shapes.
+    table = _legacy_zone_offenders('_MAP = {"Russian Standard Time": "Europe/Moscow"}', "synthetic")
+    check("a Windows->IANA table key is not an offender", table == [], repr(table))
+    prose = _legacy_zone_offenders('"""Once sent Russian Standard Time."""\n# and in a comment\n')
+    check("docstrings and comments are not offenders", prose == [], repr(prose))
 
     package = Path(mtz.__file__).parent
     offenders: list[str] = []
     for path in sorted(package.rglob("*.py")):
-        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if mtz.LEGACY_HARDCODED_TIMEZONE_ID not in line:
-                continue
-            # Prose is fine and wanted -- the modules explain the bug they used
-            # to have. Only a string *value* on a code line is a regression.
-            stripped = line.strip()
-            is_prose = stripped.startswith("#") or stripped.startswith("- ") or "`" in line
-            if path.name == "mailbox_timezone.py" and "LEGACY_HARDCODED" in line:
-                continue
-            if not is_prose:
-                offenders.append(f"{path.relative_to(package)}:{number}: {stripped}")
+        offenders += _legacy_zone_offenders(
+            path.read_text(encoding="utf-8"), str(path.relative_to(package))
+        )
     check("no module puts the legacy zone on the wire", not offenders, "; ".join(offenders))
 
 

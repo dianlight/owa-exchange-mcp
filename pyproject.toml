@@ -29,6 +29,20 @@ dependencies = [
     # lifting it means doing that migration, exactly as this one was done.
     "mcp>=2.2.0,<3",
     "playwright",
+    # IANA timezone data for `zoneinfo`, which the availability tools need to
+    # put UTC busy periods on the mailbox's own working-hours grid
+    # (`availability_frame`). Not optional on Windows and not merely a
+    # nicety elsewhere: Windows ships no IANA database at all, so a stock
+    # `python -m pip install -e .` there leaves
+    # `zoneinfo.available_timezones()` **empty** and every zone lookup raises
+    # ZoneInfoNotFoundError (measured on Windows 11 / CPython 3.14). Slim
+    # Linux containers have the same hole. Unpinned and unconditional: it is
+    # pure data, it has no dependencies of its own, and a marker limiting it
+    # to Windows would make the failure environment-specific instead of
+    # impossible - the one shape of bug that is worst to debug from a bug
+    # report. `availability_frame` still degrades to "not shifting, and
+    # saying so" if it is somehow absent.
+    "tzdata",
 ]
 
 [project.urls]
