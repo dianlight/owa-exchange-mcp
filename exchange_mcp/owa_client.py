@@ -7,10 +7,12 @@ requests.Session replaying exported cookies can't replicate.
 """
 
 import re
+import threading
 from datetime import datetime
 from typing import Iterator, NamedTuple
 from urllib.parse import quote
 
+from exchange_mcp import mailbox_timezone as mtz
 from exchange_mcp.auth_errors import (  # noqa: F401
     INTERACTIVE_LOGIN_REQUIRED,
     AuthenticationRequiredError,
@@ -129,6 +131,13 @@ class OWAClient:
         self.browser = browser_session
         self.owa_url = browser_session.owa_url
         self.user_email: str = ""
+        # Resolved once per process, like the folder lookups: see
+        # mailbox_timezone_detail(). A threading.Lock (not asyncio) because
+        # every method here is synchronous and may be called from any of the
+        # SDK's worker threads -- an asyncio.Lock binds to the first loop
+        # that touches it and rejects every other one.
+        self._timezone: mtz.TimezoneResolution | None = None
+        self._timezone_lock = threading.Lock()
 
     @property
     def cookie_file(self):
@@ -261,6 +270,132 @@ class OWAClient:
             raise RuntimeError(body.get("FaultMessage") or f"OWA request failed (ErrorCode {body['ErrorCode']}).")
 
         return data
+
+    # ------------------------------------------------------------------
+    # Mailbox timezone (issue #8)
+    # ------------------------------------------------------------------
+
+    def mailbox_timezone_detail(self) -> mtz.TimezoneResolution:
+        """The timezone every request in this package sends, resolved once.
+
+        Precedence is `EXCHANGE_TIMEZONE` > the mailbox's own OWA
+        configuration > UTC; `mailbox_timezone.choose()` owns that rule and
+        the reasoning behind it. What lives here is only the transport:
+        which actions to ask, and the guarantee that asking happens at most
+        once per process.
+
+        **Never raises, and never blocks a request.** This is called on the
+        way to building a header, so a configuration action that faults --
+        `GetUserConfiguration` is already known to 500 with a
+        NullReferenceException for another config name on this backend (see
+        `tools/categories.py`) -- has to degrade to the fallback rather than
+        take down every write in the process. A `SessionExpiredError` is the
+        one thing not cached: it means we asked too early, before the login
+        landed, and the next call should try again rather than serve UTC for
+        the rest of the process's life.
+        """
+        cached = self._timezone
+        if cached is not None:
+            return cached
+
+        with self._timezone_lock:
+            if self._timezone is not None:
+                return self._timezone
+
+            env_value = mtz.timezone_id_from_env()
+            if env_value:
+                # Skip discovery entirely: the override wins anyway, and an
+                # operator who set it has usually done so *because* the
+                # mailbox lookup misbehaves.
+                self._timezone = mtz.choose(env_value, None)
+                return self._timezone
+
+            discovered, detail, retry = self._probe_mailbox_timezone()
+            resolution = mtz.choose(None, discovered, detail=detail)
+            if retry and resolution.is_fallback:
+                # Don't cache "we asked before sign-in completed".
+                return resolution
+            self._timezone = resolution
+            return self._timezone
+
+    def mailbox_timezone(self) -> str:
+        """The timezone id to put on the wire. Shorthand for the resolution's id."""
+        return self.mailbox_timezone_detail().timezone_id
+
+    def _probe_mailbox_timezone(self) -> tuple[str | None, str, bool]:
+        """Ask OWA for the mailbox's own timezone.
+
+        Returns (timezone_id_or_None, detail, session_expired). The OWA-native
+        action is tried *first*: `GetOwaUserConfiguration` is what OWA's own
+        web client reads its user options from, whereas the EWS
+        `GetUserConfiguration` pair is the one already observed faulting on
+        this backend (see `tools/categories.py`).
+
+        Each probe spells its action out as a literal at its own `request()`
+        call rather than looping over an (action, payload) table, because
+        `capability_inventory.py` `ast`-scans for exactly that shape. Behind a
+        loop variable the action name is invisible to it, and a discovery
+        capture would then report two endpoints we *do* call as unknown APIs --
+        the expensive direction of that error (see CLAUDE.md on why the
+        attribution rules over-credit rather than under-credit).
+        """
+        failures: list[str] = []
+        # The names here are only for the failure message an operator reads --
+        # the action each probe actually sends is the literal inside it.
+        for action, probe in (
+            ("GetOwaUserConfiguration", self._probe_owa_user_configuration),
+            ("GetUserConfiguration", self._probe_ews_user_configuration),
+        ):
+            try:
+                data = probe()
+            except SessionExpiredError as exc:
+                return None, f"{action}: {exc}", True
+            except Exception as exc:  # noqa: BLE001 - any fault degrades to the fallback
+                failures.append(f"{action}: {type(exc).__name__}: {exc}")
+                continue
+            found = mtz.timezone_id_from_config(data)
+            if found:
+                return found, "", False
+            failures.append(f"{action}: no timezone in the response")
+        return None, "; ".join(failures), False
+
+    def _probe_owa_user_configuration(self) -> dict:
+        """OWA's own user-options blob, where its web client reads the zone from."""
+        return self.request("GetOwaUserConfiguration", {
+            "__type": "GetOwaUserConfigurationJsonRequest:#Exchange",
+            "Header": mtz.request_header("Exchange2013"),
+            "Body": {"__type": "GetOwaUserConfigurationRequest:#Exchange"},
+        })
+
+    def _probe_ews_user_configuration(self) -> dict:
+        """The EWS UserConfiguration equivalent, as a fallback for classic OWA."""
+        return self.request("GetUserConfiguration", {
+            "__type": "GetUserConfigurationJsonRequest:#Exchange",
+            "Header": mtz.request_header("Exchange2013"),
+            "Body": {
+                "__type": "GetUserConfigurationRequest:#Exchange",
+                "UserConfigurationName": {
+                    "__type": "UserConfigurationName:#Exchange",
+                    "Name": "OWA.UserOptions",
+                    "BaseFolderId": {
+                        "__type": "DistinguishedFolderId:#Exchange",
+                        "Id": "root",
+                    },
+                },
+                "UserConfigurationProperties": "All",
+            },
+        })
+
+    def request_header(self, server_version: str, *, with_timezone: bool = True) -> dict:
+        """The `JsonRequestHeaders` block for a request, carrying the mailbox's zone.
+
+        Every request builder in this package goes through here instead of
+        writing its own `TimeZoneContext`, which is what let one wrong zone
+        live in nine copies (issue #8). Pass `with_timezone=False` for a read
+        that must not be converted at all -- the task reads depend on that
+        so a UTC-midnight date round-trips exactly (`tools/tasks.py`).
+        """
+        return mtz.request_header(server_version, self.mailbox_timezone() if with_timezone else None)
 
     # ------------------------------------------------------------------
     # File download (attachments)
@@ -772,7 +907,7 @@ class OWAClient:
 
     def get_schedule(
         self, emails: list[str], start: datetime, end: datetime, *,
-        interval_minutes: int = 30, tz_id: str = "Russian Standard Time",
+        interval_minutes: int = 30, tz_id: str | None = None,
     ) -> list[dict]:
         """Fetch free/busy via the modern Outlook Scheduling Assistant's own
         GetSchedule GraphQL query, instead of the broken EWS
@@ -791,7 +926,17 @@ class OWAClient:
         (list of {"start", "end", "subject", "status", "is_recurring"},
         including free-status items - callers filter as they already do
         for CalendarEventArray).
+
+        `tz_id` defaults to the mailbox's own timezone (issue #8; it was a
+        hardcoded `Russian Standard Time`). It is what the *window* is read
+        in, so getting it wrong shifted every requested day by the mailbox's
+        offset from UTC+3 -- and, because `availability_view` comes back as
+        wall-clock in this same zone, shifted the free/busy grid that
+        `_parse_freebusy_string` lays over the caller's working hours.
+        `scheduleItems` timestamps are unaffected: they arrive UTC-offset
+        regardless of what is asked for (see `_parse_schedule_dt`).
         """
+        tz_id = tz_id or self.mailbox_timezone()
         payload = [{
             "operationName": "GetSchedule",
             "variables": {

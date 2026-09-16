@@ -17,6 +17,7 @@ The server requires one environment variable, plus optional ones for the browser
 - `EXCHANGE_MCP_TRANSPORT` — (optional) `stdio` (default) or `http`. Same effect as `--transport`.
 - `EXCHANGE_MCP_HOST` / `EXCHANGE_MCP_PORT` — (optional) Bind address for `--transport http`. Default `127.0.0.1:8765` — never bind non-loopback, the MCP endpoint has no auth of its own.
 - `EXCHANGE_MCP_STABLE` — (optional) Set to `true`/`1`/`yes` to exclude known-buggy tools (`KNOWN_BUGGY_TOOLS` in `server.py`, kept in sync with the KO rows / Stability column in PROJECT_STATUS.md) from the MCP tool listing at startup, instead of exposing them to fail at call time. Same effect as the `--stable` CLI flag.
+- `EXCHANGE_TIMEZONE` — (optional) Windows timezone id (e.g. `W. Europe Standard Time`) that every request's `TimeZoneContext` carries. Unset — which is the normal case — the mailbox's own zone is read from OWA once per process; this overrides that, and exists for the case where the lookup gets it wrong or the server rejects what it returned. Falls back to `UTC`, never to a regional zone (see "Timezone" below).
 - `EXCHANGE_DISCOVERY_DIR` — (optional) Where capability-discovery captures are written. Default comes from `discovery_session.default_discovery_dir()` and mirrors the profile-dir split: `<repo>/.discovery-sessions` in a source checkout, `~/owa-mcp/discovery-sessions` for an installed package. Gitignored — a capture holds real mailbox metadata (see "Capability discovery" below).
 
 **Version**: `exchange_mcp/__version__` is the single source of truth — `pyproject.toml` reads it via `[tool.setuptools.dynamic] version = {attr = ...}`, and the startup banner prints it. Don't hardcode a version in `pyproject.toml`: an editable install doesn't refresh its metadata when the tree changes, so `importlib.metadata.version()` goes stale and a banner that misreports its own version is worse than no banner. `server.json`'s two `version` fields still have to be bumped by hand (it's a published registry manifest and can't read Python attributes).
@@ -29,6 +30,7 @@ Any variable above can also be placed in a gitignored `.env.local` next to `pypr
   - `server.py` — `MCPServer` (mcp SDK v2) with lifespan context; launches the browser on the persistent profile and, if that profile isn't signed in, opens a visible sign-in window (off the handshake path — see "Authentication" below)
   - `browser_session.py` — `BrowserSession`: one persistent Chromium context for the process's lifetime, reused by every OWA call
   - `owa_client.py` — OWA API client; delegates transport to `BrowserSession`, keeps the request/response/folder-resolution logic
+  - `mailbox_timezone.py` — Pure resolution of the timezone id every request carries: the precedence rule (env → mailbox → UTC), the shape guard, the two configuration-response parsers, and the `JsonRequestHeaders`/`TimeZoneContext` builders. No Playwright, unit-testable — see "Timezone" below.
   - `auth_errors.py` — Pure diagnosis of a *timed-out* interactive sign-in: reason codes, the AADSTS/page-text/URL hint tables, per-reason remediation text, and `AuthenticationRequiredError`. Imports nothing else from the package (no Playwright) so it stays unit-testable — see "Authentication" below.
   - `profile_lock.py` — Pure diagnosis of a profile directory that another browser already owns: lock-state probes, stale-vs-live judgement, the launch-error hint table, and `ProfileLockedError`. No Playwright, unit-testable — see "Recovery" below.
   - `discovery_session.py` — `DiscoveryRecorder`: a *second*, independent Chromium on a throwaway profile, visible and driven by the user, recording every API call and UI action. Shares nothing with `BrowserSession` but the OWA URL — see "Capability discovery" below.
@@ -64,6 +66,7 @@ python -m tests.unit
 # ...or one suite at a time, while working on it
 python -m tests.unit.test_auth_errors
 python -m tests.unit.test_profile_lock
+python -m tests.unit.test_mailbox_timezone
 python -m tests.unit.test_recurrence_expansion
 python -m tests.unit.test_capability_classify
 python -m tests.unit.test_item_errors
@@ -172,6 +175,16 @@ Deliberate design points, each of which has a wrong-looking-but-tempting alterna
 
 **RequestServerVersion**: `Exchange2013` for reads, `V2017_08_18` for writes.
 
+**Timezone — build every header with `OWAClient.request_header()`, never a literal (`mailbox_timezone.py`, issue #8).** Every write in this codebase used to send `TimeZoneContext` = `Russian Standard Time` (UTC+3), a constant inherited from the original scripts and copy-pasted into **nine** places across six modules. It was invisible while it only shaped calendar reads and became user-visible when `create_task`/`update_task`'s `reminder` inherited it: a reminder asked for at 09:30 was stored as 09:30 *Moscow*, fired three hours early anywhere outside UTC+3, and the tool reported success. So `request_header(server_version, with_timezone=True)` is now the only place a header is built, and `mailbox_timezone.py` owns the decision. Five things are load-bearing:
+
+- **Precedence is `EXCHANGE_TIMEZONE` → the mailbox's own OWA configuration → `UTC`, and the fallback must never be a regional zone.** UTC is chosen for being *wrong in a self-evident way*: an hour off by the mailbox's own offset reads as a bug, whereas 09:30 Moscow looks like a correct answer, which is exactly how this hid. A local-machine-zone fallback would be the same trap rebuilt — right on the dev box, silently wrong everywhere else. The env override wins over a discovered value because an operator who set it is by definition in the case where discovery got it wrong.
+- **The lookup resolves once per process, never raises, and never blocks a request.** `OWAClient.mailbox_timezone_detail()` is called on the way to building a header, so a configuration action that faults has to degrade to the fallback — `GetUserConfiguration` is already known to 500 with a `NullReferenceException` on this backend for another config name (see `tools/categories.py`), so a fault is the expected case, not an exotic one. The one outcome *not* cached is `SessionExpiredError`: that means we asked before the sign-in landed, and caching it would serve UTC for the rest of the process's life over a mailbox that was merely not ready yet.
+- **The OWA-native action is probed first.** `GetOwaUserConfiguration` is what OWA's own web client reads user options from; the EWS `GetUserConfiguration` pair is the fallback precisely because it is the one already observed faulting here. Neither response shape is documented for this backend, so the parser is table-driven over key *names* (`_TIMEZONE_KEY_HINTS`, matched on the whole key — a substring match on "timezone" returns `TimeZoneDefinition`, i.e. the walk's own furniture) and an unrecognised shape must read as "discovery found nothing", never as a guess.
+- **The value is validated for shape, not against a zone table** (`looks_like_timezone_id()`, same reasoning as `looks_like_folder_id()`). Exchange wants a Windows id, but the modern backend has been seen handing IANA ids to its own client, and no table of either kind stays current here. A zone Exchange refuses surfaces as a request error the operator overrides with `EXCHANGE_TIMEZONE` — which is why that override exists.
+- **`with_timezone=False` omits the block entirely, and that omission is load-bearing.** The task *reads* depend on no conversion happening at all so a UTC-midnight `DueDate`/`StartDate` round-trips exactly (`tasks.py` `_read_header`; `test_task_lifecycle.py` asserts the round-trip). Sending `UTC` there is not the same thing as sending nothing.
+
+Two consequences worth knowing before assuming a read changed: the two `CalendarView` reads never sent a `TimeZoneContext` in the first place, so `get_calendar_events`/`expand_recurrences` are untouched; and `GetUserAvailability` (availability.py, analytics.py) returns a server-side `NotImplementedException` on this tenant (#602), so the live read path is `OWAClient.get_schedule`, whose `tz_id` is what the *window* and the `availabilityView` wall-clock grid are read in — that one genuinely changes, and for the better. Its `scheduleItems` timestamps are unaffected: they arrive UTC-offset regardless of the zone asked for (`_parse_schedule_dt`). Add new signals to the tables in `mailbox_timezone.py`, not to `owa_client.py`, and cover them in `tests/unit/test_mailbox_timezone.py` — which also asserts the legacy literal is gone from every request builder, so a stray copy pasted back in fails CI.
+
 **Recovery**: if the browser process/context crashes, `BrowserSession` relaunches on the same profile directory and retries the call once. If the OWA session expires, `OWAClient` retries once after a silent re-auth attempt — see "Authentication" above for what happens when that can't succeed.
 
 **A profile another browser already owns is refused, not retried (`profile_lock.py`, issue #11)**. One profile directory has exactly one owner, and the failure mode that gap produced was pathological: an orphaned Chromium tree holding `.browser-profile` made every launch — *including the crash recovery's own one-retry* — report only `Target page, context or browser has been closed`, which named neither the profile nor the real cause. So `_async_ensure_context` now inspects the directory *before* launching, waits out a lock that is merely transient, and raises `ProfileLockedError` (naming the directory, the owner PID where knowable, and the remediation) if it is genuinely held; `_run_with_recovery` re-raises that ahead of its `_CRASH_HINTS` check, because relaunching into a live lock is the exact non-recovery this issue is about. Four things are load-bearing:
@@ -194,8 +207,12 @@ non-obvious constraints, all documented at length in the module docstring: reads
 request on this backend), every write-side `FieldURI` spelling lives in the module's `_FIELD` dict
 so a live-test correction is one line, and task `DueDate`/`StartDate` are written as UTC midnight
 (`…T00:00:00.000Z`) because that's how Exchange stores them — a local-midnight write comes back a
-day off. `Status`, `PercentComplete` and `CompleteDate` are three spellings of the same state and
-the last one Exchange processes wins, so never send two in one request. There is no task-list
+day off — and the *reads* deliberately send no `TimeZoneContext` at all (`_read_header`, i.e.
+`request_header(..., with_timezone=False)`) so that date round-trips unconverted; `reminder` is
+the opposite case, a real point in time, written as wall-clock in the mailbox's own zone
+(issue #8, see "Timezone" above). `Status`, `PercentComplete` and `CompleteDate` are three
+spellings of the same state and the last one Exchange processes wins, so never send two in one
+request. There is no task-list
 (folder) CRUD here: a To Do list is a plain folder, so `get_folders(parent_folder_id="tasks")`
 and the `*_folder` tools cover it, *including* creating one — `create_folder(name=…,
 parent_folder_id="tasks", folder_class="IPF.Task")`. Note what that argument has to defend

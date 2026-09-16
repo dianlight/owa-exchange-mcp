@@ -142,17 +142,7 @@ def _get_availability_events(
 
     payload = {
         '__type': 'GetUserAvailabilityJsonRequest:#Exchange',
-        'Header': {
-            '__type': 'JsonRequestHeaders:#Exchange',
-            'RequestServerVersion': 'Exchange2013',
-            'TimeZoneContext': {
-                '__type': 'TimeZoneContext:#Exchange',
-                'TimeZoneDefinition': {
-                    '__type': 'TimeZoneDefinitionType:#Exchange',
-                    'Id': 'Russian Standard Time',
-                },
-            },
-        },
+        'Header': client.request_header('Exchange2013'),
         'Body': {
             '__type': 'GetUserAvailabilityRequest:#Exchange',
             'MailboxDataArray': [{
@@ -518,17 +508,7 @@ def find_meeting_time(
         # Query the full date range at once (API handles multi-day windows)
         payload = {
             '__type': 'GetUserAvailabilityJsonRequest:#Exchange',
-            'Header': {
-                '__type': 'JsonRequestHeaders:#Exchange',
-                'RequestServerVersion': 'Exchange2013',
-                'TimeZoneContext': {
-                    '__type': 'TimeZoneContext:#Exchange',
-                    'TimeZoneDefinition': {
-                        '__type': 'TimeZoneDefinitionType:#Exchange',
-                        'Id': 'Russian Standard Time',
-                    },
-                },
-            },
+            'Header': client.request_header('Exchange2013'),
             'Body': {
                 '__type': 'GetUserAvailabilityRequest:#Exchange',
                 'MailboxDataArray': mailbox_data,

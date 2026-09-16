@@ -20,6 +20,7 @@ from pathlib import Path
 from mcp.server.mcpserver import MCPServer
 
 from exchange_mcp import auth_errors
+from exchange_mcp import mailbox_timezone
 from exchange_mcp import profile_lock
 from exchange_mcp import __version__
 from exchange_mcp.browser_session import BrowserSession, ProfileLockedError, is_source_checkout
@@ -135,9 +136,32 @@ def _log_startup_banner(browser: BrowserSession) -> None:
     # actually refuses to launch.
     _log(f"  lock:      {profile_lock.describe(profile_lock.inspect_profile_lock(browser.profile_dir))}")
     _log(f"Browser:     {'headless' if browser.headless else 'visible window'}")
+    # The zone every write goes out in. Reported because it used to be an
+    # invisible hardcoded UTC+3 (issue #8) - a reminder landed three hours off
+    # with nothing anywhere saying which zone had been applied. Reading it from
+    # the mailbox needs a live session, so at banner time only the override can
+    # be known; _startup logs the resolved value once auth is settled.
+    override = mailbox_timezone.timezone_id_from_env()
+    _log(f"Timezone:    {override} (from {mailbox_timezone.ENV_VAR})" if override
+         else "Timezone:    unset, will be read from the mailbox's OWA configuration "
+              f"(override with {mailbox_timezone.ENV_VAR})")
 
 
-def _startup(browser: BrowserSession) -> None:
+def _log_resolved_timezone(client: OWAClient) -> None:
+    """Report the zone every write will carry, once there's a session to read it with.
+
+    Best-effort and never fatal: `mailbox_timezone_detail()` already degrades
+    to UTC rather than raising, and a banner line is not worth risking the
+    startup thread over. Logged here rather than in the banner because the
+    lookup needs a live session, which at banner time doesn't exist yet.
+    """
+    try:
+        _log(f"Timezone:    {mailbox_timezone.describe(client.mailbox_timezone_detail())}")
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not break startup
+        _log(f"Timezone:    UNKNOWN - {type(exc).__name__}: {exc}")
+
+
+def _startup(browser: BrowserSession, client: OWAClient) -> None:
     """Launch the browser on the persistent profile and make sure it's signed in.
 
     Runs on a plain background thread (see _ensure_started) rather than inline or
@@ -174,6 +198,7 @@ def _startup(browser: BrowserSession) -> None:
 
         if browser.has_active_session():
             _log("Auth status: AUTHENTICATED (the profile's OWA session is still valid). Ready.")
+            _log_resolved_timezone(client)
             return
 
         _log("Auth status: NOT AUTHENTICATED - opening a browser window on the OWA sign-in "
@@ -182,6 +207,7 @@ def _startup(browser: BrowserSession) -> None:
 
         if result.get("success"):
             _log(f"Auth status: AUTHENTICATED. {result.get('message', 'Signed in successfully.')}")
+            _log_resolved_timezone(client)
             return
 
         reason = result.get("reason") or auth_errors.LOGIN_TIMEOUT
@@ -249,7 +275,7 @@ def _ensure_started() -> OWAClient:
 
         _log_startup_banner(browser)
         _shared_startup_thread = threading.Thread(
-            target=_startup, args=(browser,), daemon=True, name="owa-startup"
+            target=_startup, args=(browser, _shared_client), daemon=True, name="owa-startup"
         )
         _shared_startup_thread.start()
         return _shared_client

@@ -66,15 +66,17 @@ would otherwise be a trap for a caller:
 - **`PercentComplete` comes back as a *string*** (`"100"`), not a number,
   so `_to_public` coerces it - a caller comparing `== 100` would silently
   never match otherwise.
-- **Reminders are written in `Russian Standard Time` (UTC+3)** - the
-  timezone this whole codebase hardcodes into `TimeZoneContext` on every
-  write - while reads come back in UTC. A reminder asked for at 09:30
-  therefore reads back as `06:30`. The reminder fires at the moment
-  Exchange stored, which is 09:30 *Moscow* time, not 09:30 in the
-  caller's own timezone: correct for a UTC+3 mailbox, three hours early
-  anywhere else. Fixing it properly means resolving the mailbox's real
-  timezone, which is a codebase-wide change (see PROJECT_STATUS.md §4),
-  not a Task-module one.
+- **Reminders are written in the mailbox's own timezone** (issue #8, fixed
+  2026-09-16), resolved once per process by
+  `OWAClient.mailbox_timezone()` and put on the wire by `_write_header`.
+  Until then every write in this codebase hardcoded
+  `Russian Standard Time` (UTC+3), so a reminder asked for at 09:30 was
+  stored as 09:30 *Moscow* and fired three hours early anywhere outside
+  UTC+3 - while the tool reported success. Two things follow for a
+  caller: `reminder` is a **wall-clock** time in the mailbox's zone, not
+  UTC (`_reminder_datetime` sends it without a suffix on purpose), and a
+  read still returns it in UTC, so a round-trip comparison has to account
+  for the offset rather than expect the same digits back.
 """
 
 import json
@@ -98,24 +100,27 @@ _VALID_IMPORTANCE = ("Low", "Normal", "High")
 _MAX_SCAN = 500
 _PAGE_SIZE = 100
 
-_READ_HEADER = {
-    "__type": "JsonRequestHeaders:#Exchange",
-    "RequestServerVersion": "Exchange2013",
-}
 
-# Writes go out on V2017_08_18 (per CLAUDE.md) with a TimeZoneContext, which
-# ReminderDueBy needs: it's a real point in time, unlike DueDate/StartDate.
-_WRITE_HEADER = {
-    "__type": "JsonRequestHeaders:#Exchange",
-    "RequestServerVersion": "V2017_08_18",
-    "TimeZoneContext": {
-        "__type": "TimeZoneContext:#Exchange",
-        "TimeZoneDefinition": {
-            "__type": "TimeZoneDefinitionType:#Exchange",
-            "Id": "Russian Standard Time",
-        },
-    },
-}
+def _read_header(client: OWAClient) -> dict:
+    """Reads go out on Exchange2013 with **no** TimeZoneContext.
+
+    That omission is load-bearing, not an oversight: without a conversion
+    the UTC-midnight DueDate/StartDate this module writes comes back in the
+    frame it was written in and round-trips exactly (see the module
+    docstring). `test_task_lifecycle.py` asserts that round-trip.
+    """
+    return client.request_header("Exchange2013", with_timezone=False)
+
+
+def _write_header(client: OWAClient) -> dict:
+    """Writes go out on V2017_08_18 with the mailbox's own TimeZoneContext.
+
+    `ReminderDueBy` needs one -- it's a real point in time, unlike
+    DueDate/StartDate. It used to be a hardcoded `Russian Standard Time`,
+    which is what made a 09:30 reminder fire at 09:30 Moscow (issue #8).
+    """
+    return client.request_header("V2017_08_18")
+
 
 # UpdateItem/DeleteItemField property paths. One wrong spelling fails the
 # entire request, so they're collected here to be corrected in one place -
@@ -206,7 +211,7 @@ def _task_date(value: str) -> str:
 
 
 def _reminder_datetime(value: str) -> str:
-    """Normalize a reminder to a local wall-clock timestamp (see _WRITE_HEADER).
+    """Normalize a reminder to a local wall-clock timestamp (see _write_header).
 
     Requires an explicit time - "YYYY-MM-DD HH:MM" or "YYYY-MM-DDTHH:MM"
     (seconds optional). A bare date is rejected rather than silently
@@ -228,7 +233,7 @@ def _get_change_key(client: OWAClient, item_id: str) -> str | None:
     """Fetch the ChangeKey for a task via GetItem (IdOnly) - required on writes."""
     payload = {
         "__type": "GetItemJsonRequest:#Exchange",
-        "Header": _READ_HEADER,
+        "Header": _read_header(client),
         "Body": {
             "__type": "GetItemRequest:#Exchange",
             "ItemShape": {
@@ -321,7 +326,7 @@ def _get_task_body(client: OWAClient, item_id: str) -> tuple[str, str | None]:
     """
     payload = {
         "__type": "GetItemJsonRequest:#Exchange",
-        "Header": _READ_HEADER,
+        "Header": _read_header(client),
         "Body": {
             "__type": "GetItemRequest:#Exchange",
             "ItemShape": {
@@ -364,7 +369,7 @@ def _find_tasks(client: OWAClient, folder_ref: dict) -> list[dict]:
     while offset < _MAX_SCAN:
         payload = {
             "__type": "FindItemJsonRequest:#Exchange",
-            "Header": _READ_HEADER,
+            "Header": _read_header(client),
             "Body": {
                 "__type": "FindItemRequest:#Exchange",
                 "ItemShape": {
@@ -421,7 +426,7 @@ def _apply_updates(
 
     payload = {
         "__type": "UpdateItemJsonRequest:#Exchange",
-        "Header": _WRITE_HEADER,
+        "Header": _write_header(client),
         "Body": {
             "__type": "UpdateItemRequest:#Exchange",
             "ItemChanges": [
@@ -567,7 +572,7 @@ def get_task(
 
         payload = {
             "__type": "GetItemJsonRequest:#Exchange",
-            "Header": _READ_HEADER,
+            "Header": _read_header(client),
             "Body": {
                 "__type": "GetItemRequest:#Exchange",
                 "ItemShape": {
@@ -624,10 +629,10 @@ def create_task(
         categories: Category names to tag the task with. Any string works;
             see create_category to register one in the master list.
         reminder: Reminder time as "YYYY-MM-DD HH:MM" (an explicit time is
-            required). Sets ReminderIsSet automatically. Interpreted in
-            Russian Standard Time (UTC+3), which this codebase sends on
-            every write, and read back in UTC - so a 09:30 reminder reads
-            as 06:30. See the module docstring.
+            required). Sets ReminderIsSet automatically. Interpreted as
+            wall-clock time in the mailbox's own timezone, and read back in
+            UTC - so a 09:30 reminder reads as 09:30 minus the mailbox's
+            offset. `check_session` reports which zone is in use.
         task_folder: Which To Do list to create it in - see get_tasks.
 
     Returns:
@@ -674,7 +679,7 @@ def create_task(
 
         payload = {
             "__type": "CreateItemJsonRequest:#Exchange",
-            "Header": _WRITE_HEADER,
+            "Header": _write_header(client),
             "Body": {
                 "__type": "CreateItemRequest:#Exchange",
                 "Items": [task_item],
@@ -748,8 +753,9 @@ def update_task(
             resolved arbitrarily. 100 marks the task complete.
         importance: Low, Normal, or High.
         categories: Replacement category list.
-        reminder: New reminder time, "YYYY-MM-DD HH:MM" - same UTC+3
-            interpretation as create_task's, see the module docstring.
+        reminder: New reminder time, "YYYY-MM-DD HH:MM" - wall-clock in the
+            mailbox's own timezone, same as create_task's; see the module
+            docstring.
         clear_due_date / clear_start_date: Remove that date entirely.
         clear_reminder: Turn the reminder off.
 
@@ -932,7 +938,7 @@ def delete_task(
 
         payload = {
             "__type": "DeleteItemJsonRequest:#Exchange",
-            "Header": _WRITE_HEADER,
+            "Header": _write_header(client),
             "Body": {
                 "__type": "DeleteItemRequest:#Exchange",
                 "ItemIds": [{"__type": "ItemId:#Exchange", "Id": iid} for iid in item_ids],
