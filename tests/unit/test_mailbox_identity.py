@@ -28,6 +28,7 @@ Run standalone:
 
 import base64
 import json
+import os
 import sys
 
 from exchange_mcp import mailbox_identity as mi
@@ -331,8 +332,8 @@ def test_client_falls_back_to_user_configuration() -> None:
         client.mailbox_address()
     check("repeat reads are cached, not re-requested", len(client.calls) == 1, repr(client.calls))
 
-    client.forget_mailbox_address()
-    check("forget_mailbox_address() re-resolves", client.mailbox_address() == "first.last@example.com")
+    client.forget_mailbox_identity()
+    check("forget_mailbox_identity() re-resolves", client.mailbox_address() == "first.last@example.com")
     check("...with a fresh request", len(client.calls) == 2, repr(client.calls))
 
 
@@ -368,6 +369,98 @@ def test_client_degrades_and_never_raises() -> None:
     )
 
 
+def test_configuration_outranks_a_upn_claim_on_the_client() -> None:
+    print("A bearer upn claim must not pre-empt the configuration (live regression, 2026-09-16)")
+    # test_resolution_priority already pins this *inside*
+    # resolve_mailbox_address(). What it cannot see is the sequencing in
+    # OWAClient.resolve_own_mailbox(), which used to hand the bearer token to a
+    # first pass made without the configuration -- so the claim answered and the
+    # higher-authority configuration was never fetched. Every bearer-mode session
+    # took that path: it surfaced live as get_meeting_contacts resolving from
+    # `bearer_claim:upn` and reporting the "you may appear in your own ranking"
+    # warning, on a mailbox whose configuration answers.
+    upn_token = jwt({"upn": "sign.in.name@example.com"})
+    client = FakeClient(
+        hints={"anchor_mailbox": PUID_ANCHOR, "bearer_token": upn_token},
+        config=USER_CONFIG,
+    )
+    resolved = client.resolve_own_mailbox()
+    check(
+        "the configuration's address wins over the claim",
+        resolved.address == "first.last@example.com",
+        repr(resolved),
+    )
+    check(
+        "...and the source says so",
+        resolved.source.startswith(mi.SOURCE_USER_CONFIGURATION),
+        resolved.source,
+    )
+
+    # The claim is still the last resort, not dead code: with no configuration to
+    # outrank it, it must answer rather than degrade to "".
+    claim_only = FakeClient(hints={"bearer_token": upn_token}, config={"Body": {}})
+    fallback = claim_only.resolve_own_mailbox()
+    check(
+        "a claim still answers when nothing outranks it",
+        fallback.address == "sign.in.name@example.com",
+        repr(fallback),
+    )
+    check(
+        "...reported as a claim",
+        fallback.source.startswith(mi.SOURCE_BEARER_CLAIM),
+        fallback.source,
+    )
+
+
+def test_address_and_timezone_share_one_request() -> None:
+    print("The address and the timezone are answered by one GetOwaUserConfiguration")
+    # An override would skip the timezone probe entirely, so a real one in the
+    # developer's shell would make every request count below meaningless.
+    saved = os.environ.pop("EXCHANGE_TIMEZONE", None)
+    try:
+        client = FakeClient(hints={"anchor_mailbox": PUID_ANCHOR}, config=USER_CONFIG)
+        check(
+            "timezone resolved",
+            client.mailbox_timezone() == "W. Europe Standard Time",
+            client.mailbox_timezone(),
+        )
+        check(
+            "address resolved",
+            client.mailbox_address() == "first.last@example.com",
+            client.mailbox_address(),
+        )
+        check("one request served both", client.calls == ["GetOwaUserConfiguration"], repr(client.calls))
+
+        # Order-independent: whichever question is asked first pays for it.
+        reversed_order = FakeClient(hints={"anchor_mailbox": PUID_ANCHOR}, config=USER_CONFIG)
+        reversed_order.mailbox_address()
+        reversed_order.mailbox_timezone()
+        check(
+            "...whichever of the two is asked first",
+            reversed_order.calls == ["GetOwaUserConfiguration"],
+            repr(reversed_order.calls),
+        )
+
+        # An account switch has to drop the shared blob, not just the address.
+        # Dropping the address alone would re-resolve it out of the *previous*
+        # account's cached configuration, so a stale address would come back
+        # looking freshly probed -- which a value check cannot see, only a
+        # request count can.
+        client.forget_mailbox_identity()
+        check("address re-resolves after an account switch",
+              client.mailbox_address() == "first.last@example.com")
+        check(
+            "...from a fresh request, not the old account's cached blob",
+            len(client.calls) == 2,
+            repr(client.calls),
+        )
+        check("...and so does the timezone", client.mailbox_timezone() == "W. Europe Standard Time")
+        check("...still sharing that one fresh request", len(client.calls) == 2, repr(client.calls))
+    finally:
+        if saved is not None:
+            os.environ["EXCHANGE_TIMEZONE"] = saved
+
+
 def main() -> bool:
     for test in (
         test_smtp_shape,
@@ -382,6 +475,8 @@ def main() -> bool:
         test_client_falls_back_to_user_configuration,
         test_client_rereads_hints_after_the_request,
         test_client_degrades_and_never_raises,
+        test_configuration_outranks_a_upn_claim_on_the_client,
+        test_address_and_timezone_share_one_request,
     ):
         test()
     print()

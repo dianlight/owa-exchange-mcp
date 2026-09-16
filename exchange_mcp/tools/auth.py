@@ -142,10 +142,11 @@ async def login(force: bool = False, ctx: Context = None) -> str:
 
         if result.get("success") and _session_is_valid(client):
             # force=True exists to switch accounts, so the mailbox address
+            # (and timezone, and the configuration blob both are read from)
             # cached from the previous one is now actively wrong - which is the
             # one state worse than not knowing it (see
             # OWAClient.resolve_own_mailbox).
-            client.forget_mailbox_address()
+            client.forget_mailbox_identity()
             return json.dumps({
                 "success": True,
                 "message": "Signed in and session verified.",
