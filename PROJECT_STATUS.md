@@ -1491,6 +1491,72 @@ and under `--transport http` the process is long-lived and shared across clients
 call being mid-probe is the normal case. A lock held across a round-trip widens the window from
 nanoseconds to seconds.
 
+**Update 2026-09-16 (tests) — `create_meeting` had been storing meetings in the wrong zone
+unnoticed, and the one availability branch no live run can reach is now covered.** Tests only.
+
+The finding worth recording, because the fix is in but the lesson was not written down:
+`create_meeting`/`update_meeting` write `Start`/`End` as an **unqualified** wall clock, so the
+request's `TimeZoneContext` decides the instant. While that context was the hardcoded UTC+3
+(issue #8), a meeting asked for at 14:00 on a W. Europe mailbox was stored at `11:00Z` — 13:00
+local in summer, 12:00 in winter. Seasonal, so it never looked like a constant anyone would
+notice. Row 202 read `OK` throughout, and the reason is the one that recurs through this whole
+issue: **`test_calendar_lifecycle.py` sent `start_time: "14:00"` and never read the time back.**
+The meeting existed, at a plausible hour, on the right day. Every check short of comparing the
+number passed, for as long as no check compared the number.
+
+That suite now reads the event back and compares it against the offset `find_free_time` reports,
+failing the row on a mismatch — deliberately in UTC, because re-deriving the expected local wall
+clock would mean the test carrying its own copy of the timezone logic it is meant to be checking.
+The cause is already fixed; what was missing is anything able to notice it coming back. Note this
+is the *only* thing that would have caught it: the tool's response shape, the item id, the day and
+the folder were all correct.
+
+[tests/unit/test_availability_legacy_branch.py](tests/unit/test_availability_legacy_branch.py)
+covers the classic-OWA `GetUserAvailability` fallback, which **no live run can reach** — the action
+answers a permanent `NotImplementedException` on this tenant (#602), so that is a property of the
+backend rather than a gap in the smoke suite. Every other branch of the availability tools has a
+live run behind it; this one has only what a unit test asserts. It is also the one request in the
+package that both *sends* a `TimeZoneContext` and *reads* timestamps back, which is what makes the
+frame rule subtlest there: an unqualified `CalendarEvent` time is already wall clock in the zone we
+asked for and must not be converted, while an offset-bearing one is a real instant and must be. The
+test asserts the two spellings of a single instant land on the same wall clock — a property neither
+half of that rule satisfies alone, so it fails whichever way the conversion is got wrong.
+
+[tests/unit/test_header_invariants.py](tests/unit/test_header_invariants.py) is the third piece,
+and it covers four invariants that hold *at the call sites* rather than inside the builder — which
+is why `test_mailbox_timezone.py` cannot reach them: that suite tests
+`mailbox_timezone.request_header()`, and these are about what each caller asks it for.
+
+- **Task reads must keep `with_timezone=False`.** `tasks._read_header`'s docstring explains why the
+  omission is load-bearing; nothing checked the call kept it. Dropping that one argument makes
+  Exchange convert the UTC-midnight `DueDate`/`StartDate` the module writes, returning the previous
+  day for any mailbox west of UTC. Measured: with it removed, **only this suite fails** —
+  `test_mailbox_timezone` and `test_availability_frame` both still pass, because the builder still
+  omits the context when asked.
+- **`calendar._resolve_attendee` must send no context.** `ResolveNames` carries no timestamps.
+  Pinned because it is the header a bulk migration hits by accident: a blanket replace over
+  `"RequestServerVersion": "V2017_08_18"` matches it, and it is the one header at that version that
+  never had a context. Observed while doing exactly that.
+- **A reminder must stay unqualified.** `_reminder_datetime` emits no `Z` and no offset *precisely
+  so* the write's context governs it. Add a `Z` and the context stops applying and the reminder is
+  stored in UTC whatever zone is sent — #8's symptom back by the other door, with the fix still
+  visibly in place.
+- **Only `mailbox_timezone.py` may construct a `TimeZoneContext`.** #32's
+  `test_no_hardcoded_zone_remains` catches a module reintroducing the legacy *literal*; it does not
+  catch one building its own context from some other id, which is the shape the next copy takes now
+  that there is a builder to copy from.
+
+A note on how these nearly went missing, since it is a process lesson rather than a code one: #32
+carried an independent salvage of the same four guards, so they were dropped from here as
+duplicates — but that commit was removed from its branch before #32 merged, and #32's merge brought
+three commits, none of them the tests. Main ended up with the guards in neither place. Verified by
+grep against `origin/main` rather than inferred from the PR: zero matches for each of the four test
+names.
+
+Not verified live: tests only, and the write path the smoke assertion guards needs real calendar
+items to exercise. The unit suite runs in CI; the smoke assertion runs the next time
+`test_calendar_lifecycle.py` does.
+
 ## 2. How to read the table
 
 - **ID** — a permanent identifier, `<module number><2-digit sequence within that module>`:
@@ -1560,8 +1626,8 @@ nanoseconds to seconds.
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
 | 201 | `get_calendar_events` | List events in a date range, including each event's `categories` — populated in list mode (`include_body=False`) from the list request itself, not a per-item detail call. By default a recurring series appears once, as its master item; `expand_recurrences=True` additionally synthesizes one entry per occurrence client-side (marked `is_synthesized_occurrence`, empty `item_id` — see §4) | `tests/smoke/tests/test_get_calendar_events.py`, `tests/smoke/tests/test_calendar_event_detail.py`, `tests/smoke/tests/test_recurrence_expansion.py`, `tests/unit/test_recurrence_expansion.py` | OK (2026-09-14, re-verified) — `categories` confirmed populated in **list mode** (`include_body=False`, straight from the single `CalendarView` request, no per-item detail call), so a bulk tagging pass needs no COM fallback; previously verified round-tripping a real tag; `expand_recurrences` verified live (46 synthesized occurrences over 14 days, all in-window, all `item_id`-less, no duplicated masters, correct time-of-day) and all 127 recurring series in this mailbox expand, relative patterns included; also re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change | Stable |
-| 202 | `create_meeting` | Create a meeting with attendees, location, reminder, sensitivity | `tests/smoke/tests/test_calendar_lifecycle.py` | Pending (2026-09-16, issue #8: `TimeZoneContext` now carries the mailbox's own timezone instead of a hardcoded `Russian Standard Time`/UTC+3, so the times this tool sends changed — needs a live re-check) — previously OK (2026-09-08) | Stable |
-| 203 | `update_meeting` | Update a meeting (implemented as cancel + recreate — OWA JSON API has no reliable `UpdateItem` for calendar items) | `tests/smoke/tests/test_calendar_lifecycle.py` | Pending (2026-09-16, issue #8: `TimeZoneContext` now carries the mailbox's own timezone instead of a hardcoded `Russian Standard Time`/UTC+3, so the times this tool sends changed — needs a live re-check) — previously OK (2026-09-08) | Stable |
+| 202 | `create_meeting` | Create a meeting with attendees, location, reminder, sensitivity | `tests/smoke/tests/test_calendar_lifecycle.py`  (now verifies the meeting's **time** round-trips, not just that it exists — see the 2026-09-16 note) | Pending (2026-09-16, issue #8: `TimeZoneContext` now carries the mailbox's own timezone instead of a hardcoded `Russian Standard Time`/UTC+3, so the times this tool sends changed — needs a live re-check) — previously OK (2026-09-08) | Stable |
+| 203 | `update_meeting` | Update a meeting (implemented as cancel + recreate — OWA JSON API has no reliable `UpdateItem` for calendar items) | `tests/smoke/tests/test_calendar_lifecycle.py`  (now verifies the meeting's **time** round-trips, not just that it exists — see the 2026-09-16 note) | Pending (2026-09-16, issue #8: `TimeZoneContext` now carries the mailbox's own timezone instead of a hardcoded `Russian Standard Time`/UTC+3, so the times this tool sends changed — needs a live re-check) — previously OK (2026-09-08) | Stable |
 | 204 | `cancel_meeting` | Cancel a meeting and notify attendees (soft-delete only — moves to Deleted Items, no permanent-delete option) | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
 | 205 | `respond_to_meeting` | Accept / decline / tentatively accept a meeting invite | `tests/unit/test_meeting_response.py` covers the `_MEETING_RESPONSES` table (both the EWS `__type` per verb and the message wording). The *live* RSVP path is still uncovered and can't be: a self-invite produces no meeting-request email to respond to (confirmed 2026-09-08; Exchange doesn't ask an organizer to accept their own invite), so no self-contained automated test can reach it | OK (2026-09-08, manual) — verified against a real incoming Google Calendar invite from a different account (Tentative response sent successfully). Wire path unchanged since; the Tentative *message* wording changed 2026-09-15 (#13) and is unit-covered | Stable |
 | 206 | `download_event_attachments` | Download file attachments from a calendar event | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |

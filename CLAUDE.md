@@ -81,6 +81,8 @@ python -m tests.unit.test_recipient_list
 python -m tests.unit.test_folder_id_dict
 python -m tests.unit.test_folder_resolution
 python -m tests.unit.test_meeting_response
+python -m tests.unit.test_availability_legacy_branch
+python -m tests.unit.test_header_invariants
 python -m tests.unit.test_identity_cache_generation
 
 # Live-mailbox smoke tests: one module per tool group, run individually.
