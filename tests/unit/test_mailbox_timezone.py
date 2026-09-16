@@ -54,6 +54,8 @@ import datetime as dt
 import sys
 
 from exchange_mcp.mailbox_timezone import (
+    ENV_VAR,
+    SOURCE_ENV,
     SOURCE_HOST,
     SOURCE_MAILBOX,
     SOURCE_UTC,
@@ -275,6 +277,131 @@ def test_utc_source_is_exactly_the_pre_fix_behaviour() -> None:
 # ------------------------------------------------------------------
 # 3. Degradation is reachable, labelled and non-fatal
 # ------------------------------------------------------------------
+
+def test_a_probed_iana_id_resolves_too() -> None:
+    """A side benefit of accepting both spellings for the override: the *probe*
+    gets it as well. The modern backend has been observed handing IANA ids to
+    its own web client, so a mailbox that reports `Europe/Rome` used to fall all
+    the way through to `host_local` with a warning about `WINDOWS_TO_IANA` —
+    now it is simply used. The wire still goes out as UTC, because an IANA id on
+    an EWS payload is the part that is unverified."""
+    tz = resolve_mailbox_timezone("Europe/Rome", override="")
+    check("resolved from the mailbox, not a fallback", tz.source, SOURCE_MAILBOX)
+    check("iana id kept", tz.iana_id, "Europe/Rome")
+    check("no windows id invented", tz.windows_id, "")
+    check("so the wire stays UTC", tz.wire_id, "UTC")
+    check("no warning needed", tz.warning, None)
+    check("offset is right", tz.utc_offset(dt.datetime(2026, 9, 17, 12)),
+          dt.timedelta(hours=2))
+
+
+def test_env_override_outranks_the_probe() -> None:
+    """`EXCHANGE_TIMEZONE` is the one source that beats the server, and it has to
+    be: every other step is something we *read*, so a mailbox whose backend
+    reports the wrong zone would otherwise leave an operator no lever at all. An
+    override the probe could overrule would be useless."""
+    tz = resolve_mailbox_timezone(
+        "Tokyo Standard Time", override="W. Europe Standard Time"
+    )
+    check("source says where it came from", tz.source, SOURCE_ENV)
+    check("the override's zone won", tz.iana_id, "Europe/Berlin")
+    check("...not the probe's", tz.utc_offset(dt.datetime(2026, 9, 17, 12)),
+          dt.timedelta(hours=2))
+
+    # A Windows id from the override gets the same high-fidelity wire path as the
+    # probe: it is a spelling EWS understands, so there is no reason to demote it.
+    check("a Windows override reaches the wire", tz.wire_id, "W. Europe Standard Time")
+    check("...so from_wire_wallclock stays an identity",
+          tz.from_wire_wallclock(dt.datetime(2026, 9, 17, 9)), dt.datetime(2026, 9, 17, 9))
+
+
+def test_env_override_accepts_an_iana_id() -> None:
+    """The point of the escape hatch: an operator whose zone is missing from
+    `WINDOWS_TO_IANA` can still name it, because an IANA key goes straight to
+    `zoneinfo`. `windows_id` stays empty deliberately — EWS wants Windows ids and
+    this backend's tolerance for IANA on the wire is unverified, so the wire
+    becomes UTC and we convert locally rather than guessing."""
+    tz = resolve_mailbox_timezone("", override="Europe/Rome")
+    check("source is the override", tz.source, SOURCE_ENV)
+    check("iana id kept", tz.iana_id, "Europe/Rome")
+    check("no windows id claimed", tz.windows_id, "")
+    check("so the wire is UTC", tz.wire_id, "UTC")
+    check("and the conversion is real", tz.wire_is_utc, True)
+    check("offset is right", tz.utc_offset(dt.datetime(2026, 9, 17, 12)),
+          dt.timedelta(hours=2))
+
+    # A zone with no Windows-id row here at all, and a sub-hour offset.
+    kolkata = resolve_mailbox_timezone("", override="Asia/Kolkata")
+    check("a zone absent from the table still resolves", kolkata.source, SOURCE_ENV)
+    check("...with its real offset",
+          kolkata.utc_offset(dt.datetime(2026, 1, 17, 12)), dt.timedelta(hours=5, minutes=30))
+
+
+def test_a_bad_override_warns_but_keeps_the_probe() -> None:
+    """One typo in an env file must not silently downgrade a mailbox whose real
+    timezone was available all along — the same "only a positively-determined
+    answer wins" doctrine as `profile_lock.py`. So a junk override is reported
+    and then ignored, rather than either raising or being applied."""
+    tz = resolve_mailbox_timezone("W. Europe Standard Time", override="Nowhere/Bogus")
+    check("the probe still won", tz.source, SOURCE_MAILBOX)
+    check("the zone is the mailbox's", tz.iana_id, "Europe/Berlin")
+    check("but the bad value is named", "Nowhere/Bogus" in (tz.warning or ""), True)
+    check("and the variable is named", ENV_VAR in (tz.warning or ""), True)
+
+    # With nothing to fall back to but the host, the warning survives there too.
+    nothing = resolve_mailbox_timezone("", override="Nowhere/Bogus")
+    check("still a usable object", nothing.source in (SOURCE_HOST, SOURCE_UTC), True)
+    check("still names the bad value", "Nowhere/Bogus" in (nothing.warning or ""), True)
+
+
+def test_override_defaults_to_reading_the_environment() -> None:
+    """`override=None` means "read `EXCHANGE_TIMEZONE`" — that is how the client
+    calls it. Asserted by setting the variable rather than trusted, and every
+    other test in this file passes `override=""` so none of them depend on the
+    environment of the machine they run on."""
+    import os
+
+    saved = os.environ.get(ENV_VAR)
+    try:
+        os.environ[ENV_VAR] = "Tokyo Standard Time"
+        tz = resolve_mailbox_timezone("W. Europe Standard Time")
+        check("the environment was read", tz.source, SOURCE_ENV)
+        check("and applied", tz.iana_id, "Asia/Tokyo")
+
+        os.environ[ENV_VAR] = "   "
+        blank = resolve_mailbox_timezone("W. Europe Standard Time")
+        check("a blank value is not an override", blank.source, SOURCE_MAILBOX)
+
+        del os.environ[ENV_VAR]
+        unset = resolve_mailbox_timezone("W. Europe Standard Time")
+        check("unset is not an override", unset.source, SOURCE_MAILBOX)
+    finally:
+        os.environ.pop(ENV_VAR, None)
+        if saved is not None:
+            os.environ[ENV_VAR] = saved
+
+    # And an explicit "" forces it off even when the variable is set.
+    try:
+        os.environ[ENV_VAR] = "Tokyo Standard Time"
+        forced = resolve_mailbox_timezone("W. Europe Standard Time", override="")
+        check('override="" ignores the environment', forced.source, SOURCE_MAILBOX)
+    finally:
+        os.environ.pop(ENV_VAR, None)
+        if saved is not None:
+            os.environ[ENV_VAR] = saved
+
+
+def test_describe_does_not_call_an_override_the_mailbox_zone() -> None:
+    """`EXCHANGE_TIMEZONE` is whatever the operator said, which need not be the
+    mailbox's own zone — so the reported note must not claim it is. Getting this
+    wrong would put a misdescription of the frame back into the response, which
+    is the whole class of bug this module exists for."""
+    note = resolve_mailbox_timezone("", override="Europe/Rome").describe(
+        dt.datetime(2026, 9, 17, 12)
+    )["note"]
+    check("the note names the override", ENV_VAR in note, True)
+    check("...and does not claim mailbox-local", "mailbox-local" not in note, True)
+
 
 def test_resolution_never_raises_and_always_returns_a_usable_object() -> None:
     """A timezone probe that fails must not be able to take `find_free_time`
@@ -514,6 +641,21 @@ def test_the_zone_the_bug_was_found_on_is_mapped() -> None:
 
 
 def main() -> bool:
+    # Cleared for the whole suite: `resolve_mailbox_timezone` reads
+    # EXCHANGE_TIMEZONE by default, so a developer who has it set would otherwise
+    # see every assertion below measured against *their* override instead of the
+    # id the test passed in. The one test that needs it sets and restores it.
+    import os
+
+    saved_env = os.environ.pop(ENV_VAR, None)
+    try:
+        return _run()
+    finally:
+        if saved_env is not None:
+            os.environ[ENV_VAR] = saved_env
+
+
+def _run() -> bool:
     for test in (
         test_reported_bug_offsets_are_the_measured_ones,
         test_a_late_evening_event_changes_date_not_just_time,
@@ -534,6 +676,12 @@ def main() -> bool:
         test_candidates_are_deduplicated_and_ranked,
         test_every_mapped_zone_actually_resolves,
         test_the_zone_the_bug_was_found_on_is_mapped,
+        test_a_probed_iana_id_resolves_too,
+        test_env_override_outranks_the_probe,
+        test_env_override_accepts_an_iana_id,
+        test_a_bad_override_warns_but_keeps_the_probe,
+        test_override_defaults_to_reading_the_environment,
+        test_describe_does_not_call_an_override_the_mailbox_zone,
     ):
         test()
 

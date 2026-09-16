@@ -81,10 +81,18 @@ So a call site never has to ask which of the two happened -- it passes
 Resolution order, and why every step is allowed to fail
 -------------------------------------------------------
 
-`resolve_mailbox_timezone()` degrades in three steps, and records which one it
+`resolve_mailbox_timezone()` degrades in four steps, and records which one it
 took in `source` -- surfaced in the tool output as `timezone.source`, because a
 two-hour shift that was silent once must not be able to go silent again:
 
+0. `environment` -- `EXCHANGE_TIMEZONE`, the operator override, which **outranks
+   the server**. Every other step is something we *read*, so a mailbox whose
+   backend reports the wrong zone (or none) would otherwise leave an operator no
+   lever at all; an override the server could overrule would be useless. Accepts
+   a Windows id *or* an IANA id, so it resolves even for a zone missing from
+   `WINDOWS_TO_IANA`. A *bad* value does not discard the probe -- it warns and
+   falls through, because one typo in an env file should not silently downgrade
+   a mailbox whose real timezone was available all along.
 1. `mailbox_configuration` -- a Windows timezone id read off
    `GetOwaUserConfiguration` and present in `WINDOWS_TO_IANA`. The good case.
 2. `host_local` -- the machine's own timezone, via `datetime.astimezone()` with
@@ -117,16 +125,29 @@ see tests/unit/test_mailbox_timezone.py. The transport half is
 from __future__ import annotations
 
 import datetime as _dt
-from dataclasses import dataclass
+import os as _os
+from dataclasses import dataclass, replace as _replace
 from typing import Any
 
 # ------------------------------------------------------------------
 # Where the timezone came from (MailboxTimezone.source)
 # ------------------------------------------------------------------
 
+SOURCE_ENV = "environment"
 SOURCE_MAILBOX = "mailbox_configuration"
 SOURCE_HOST = "host_local"
 SOURCE_UTC = "utc"
+
+# The operator override, and the one source that outranks the server. It exists
+# because every other step in the chain is something we *read*, and a mailbox
+# whose backend reports the wrong zone (or none) otherwise leaves an operator no
+# lever at all -- the tools would keep answering shifted times with a warning
+# nobody can act on. Accepts a Windows id or an IANA id (see `_resolve_id`), so
+# it always resolves even for a zone missing from `WINDOWS_TO_IANA`.
+#
+# Carried over from the parallel implementation in PR #29, which reached the
+# same conclusion independently and whose comment specified this precedence.
+ENV_VAR = "EXCHANGE_TIMEZONE"
 
 # ------------------------------------------------------------------
 # Keys that carry a timezone id in a GetOwaUserConfiguration response
@@ -340,12 +361,17 @@ class MailboxTimezone:
     def wire_id(self) -> str:
         """The timezone id to send to the server.
 
-        The mailbox's own Windows id when we have one (what OWA's own client
-        sends, and it makes `from_wire_wallclock()` an identity), else "UTC" --
-        so that the frame we ask for is always one we can convert out of
-        exactly. Never empty.
+        A Windows id when we have one (what OWA's own client sends, and it makes
+        `from_wire_wallclock()` an identity), else "UTC" -- so that the frame we
+        ask for is always one we can convert out of exactly. Never empty.
+
+        Both `mailbox_configuration` and `environment` can supply one: an
+        operator who names a Windows id gets the same high-fidelity path as the
+        probe, while one who names an IANA id gets the UTC wire and a local
+        conversion, because this backend's tolerance for IANA ids on the wire is
+        unverified and guessing there would be a silent wrong answer.
         """
-        if self.source == SOURCE_MAILBOX and self.windows_id:
+        if self.windows_id and self.source in (SOURCE_ENV, SOURCE_MAILBOX):
             return self.windows_id
         return _UTC_WIRE_ID
 
@@ -498,6 +524,8 @@ class MailboxTimezone:
             "note": (
                 "times are UTC: no mailbox timezone could be determined"
                 if self.source == SOURCE_UTC
+                else f"times are wall clock in {ENV_VAR} (operator override)"
+                if self.source == SOURCE_ENV
                 else "times are mailbox-local wall clock"
             ),
         }
@@ -604,46 +632,113 @@ def _host_or_utc(warning: str) -> MailboxTimezone:
     )
 
 
-def resolve_mailbox_timezone(windows_id: str | None) -> MailboxTimezone:
+def _load_zone(iana: str):
+    """`ZoneInfo(iana)`, or None if it cannot be loaded.
+
+    Almost always a missing timezone database -- `zoneinfo` bundles none, and
+    Windows and slim Linux images have no system one either, hence the `tzdata`
+    dependency in pyproject.toml. Caught broadly because every reason lands in
+    the same fallback.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(iana)
+    except Exception:
+        return None
+
+
+def _resolve_id(candidate: str, source: str) -> MailboxTimezone | None:
+    """A timezone id -> `MailboxTimezone`, or None if this build can't read it.
+
+    Accepts **either** spelling, which is what makes the `EXCHANGE_TIMEZONE`
+    override a usable escape hatch rather than a second thing to get wrong:
+
+    - A Windows id (`W. Europe Standard Time`) resolves through
+      `WINDOWS_TO_IANA`, and `windows_id` is kept so it can go on the wire.
+      That is the high-fidelity path -- it is the id OWA's own client sends,
+      and it makes `from_wire_wallclock` an identity.
+    - An IANA id (`Europe/Rome`) is loaded directly, so an operator can always
+      name their zone even when it is missing from the table above. Note
+      `windows_id` stays empty on purpose: EWS wants Windows ids and this
+      backend's tolerance for IANA on the wire is unverified, so `wire_id`
+      falls through to "UTC" and we do the conversion ourselves. Correct
+      either way, and nothing unverified goes on the wire.
+    """
+    iana = WINDOWS_TO_IANA.get(candidate)
+    if iana is not None:
+        tz = _load_zone(iana)
+        if tz is None:
+            return None
+        return MailboxTimezone(source=source, windows_id=candidate, iana_id=iana, tz=tz)
+
+    # Not a Windows id we know. Try it as an IANA key before giving up.
+    tz = _load_zone(candidate)
+    if tz is None:
+        return None
+    return MailboxTimezone(source=source, windows_id="", iana_id=candidate, tz=tz)
+
+
+def resolve_mailbox_timezone(
+    windows_id: str | None, *, override: str | None = None
+) -> MailboxTimezone:
     """Turn a probed Windows timezone id into a usable `MailboxTimezone`.
 
     Never raises and never returns None: see the module docstring for why the
-    three-step degradation is the contract rather than an error. Pass "" or None
-    for "the probe found nothing" -- that is a normal input, not a mistake.
+    degradation chain is the contract rather than an error. Pass "" or None for
+    `windows_id` when the probe found nothing -- that is a normal input, not a
+    mistake.
+
+    `override` is the `EXCHANGE_TIMEZONE` operator escape hatch and **outranks
+    the probe**, because the only reason to set it is that the probe is wrong or
+    silent; an override the server could overrule would be useless. `None` means
+    "read the environment"; pass `""` to force it off (which is what the tests
+    do, so they don't depend on the machine they run on).
+
+    A *bad* override does not discard the probe. It records a warning naming the
+    value and then resolves normally, because the alternative is that one typo
+    in an env file silently downgrades a mailbox whose real timezone was
+    available all along -- the same reasoning as `profile_lock.py`'s "only a
+    positively-detected lock blocks a launch".
     """
+    raw_override = (
+        _os.environ.get(ENV_VAR, "") if override is None else override
+    ).strip()
+
+    override_problem = ""
+    if raw_override:
+        resolved = _resolve_id(raw_override, SOURCE_ENV)
+        if resolved is not None:
+            return resolved
+        override_problem = (
+            f"{ENV_VAR}={raw_override!r} is not a timezone this build can read "
+            f"(give a Windows id such as 'W. Europe Standard Time' or an IANA id "
+            f"such as 'Europe/Rome', and check `tzdata` is installed); it was "
+            f"ignored. "
+        )
+
     candidate = (windows_id or "").strip()
 
     if not candidate:
         return _host_or_utc(
-            "The mailbox timezone could not be read from the server, so this "
+            override_problem
+            + "The mailbox timezone could not be read from the server, so this "
             "machine's local timezone was assumed."
         )
 
-    iana = WINDOWS_TO_IANA.get(candidate)
-    if iana is None:
-        return _host_or_utc(
-            f"Unknown timezone id {candidate!r} (add it to "
-            f"exchange_mcp.mailbox_timezone.WINDOWS_TO_IANA); this machine's "
-            f"local timezone was assumed."
-        )
+    resolved = _resolve_id(candidate, SOURCE_MAILBOX)
+    if resolved is not None:
+        if override_problem:
+            resolved = _replace(resolved, warning=override_problem.strip())
+        return resolved
 
-    try:
-        from zoneinfo import ZoneInfo
-
-        tz = ZoneInfo(iana)
-    except Exception:
-        # Almost always a missing timezone database -- `zoneinfo` has no
-        # bundled one, and Windows and slim Linux images have no system one
-        # either, hence the `tzdata` dependency in pyproject.toml. Caught
-        # broadly because every reason lands in the same fallback.
-        return _host_or_utc(
-            f"The mailbox timezone is {candidate!r} ({iana}) but no timezone "
-            f"database is available to interpret it (is `tzdata` installed?); "
-            f"this machine's local timezone was assumed."
-        )
-
-    return MailboxTimezone(
-        source=SOURCE_MAILBOX, windows_id=candidate, iana_id=iana, tz=tz
+    return _host_or_utc(
+        override_problem
+        + f"The mailbox timezone {candidate!r} could not be resolved -- either it "
+        f"is missing from exchange_mcp.mailbox_timezone.WINDOWS_TO_IANA or no "
+        f"timezone database is available to interpret it (is `tzdata` "
+        f"installed?). This machine's local timezone was assumed; "
+        f"{ENV_VAR} overrides it."
     )
 
 

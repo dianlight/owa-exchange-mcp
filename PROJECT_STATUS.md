@@ -1427,12 +1427,36 @@ fatal — it lands in the `host_local` fallback with a warning that names it.
 
 **The degradation chain is the contract, not an error path**, and it is reported: the tools now
 attach a `timezone` block (`source`, `utc_offset`, `note`, plus `warning` when degraded).
-`mailbox_configuration` → `host_local` (the machine's own zone, via `astimezone()` so the OS
-resolves DST per instant) → `utc` (identity, i.e. the pre-fix behaviour, as the floor). Nothing
-in the chain raises: a timezone probe that fails must not take `find_free_time` offline, since it
-was useful-but-shifted before and useful-with-a-warning is strictly better than an exception.
-A fabricated offset, on the other hand, would be worse than a documented absent one, so every
-undecidable case degrades rather than guesses.
+`environment` → `mailbox_configuration` → `host_local` (the machine's own zone, via
+`astimezone()` so the OS resolves DST per instant) → `utc` (identity, i.e. the pre-fix behaviour,
+as the floor). Nothing in the chain raises: a timezone probe that fails must not take
+`find_free_time` offline, since it was useful-but-shifted before and useful-with-a-warning is
+strictly better than an exception. A fabricated offset, on the other hand, would be worse than a
+documented absent one, so every undecidable case degrades rather than guesses.
+
+**`EXCHANGE_TIMEZONE` is the one source that outranks the server**, and it exists because every
+other step in that chain is something we *read* — a mailbox whose backend reports the wrong zone,
+or none, would otherwise leave an operator no lever at all, just a warning nobody can act on. An
+override the probe could overrule would be useless, so it sits above it. Two details are
+load-bearing:
+
+- **It accepts a Windows id *or* an IANA id.** A Windows id (`W. Europe Standard Time`) gets the
+  high-fidelity path — it goes on the wire, so `from_wire_wallclock` stays an identity. An IANA id
+  (`Europe/Rome`) loads straight from `zoneinfo`, which is what makes the escape hatch actually
+  work for a zone missing from `WINDOWS_TO_IANA`; `windows_id` stays empty there on purpose, so
+  the wire falls back to `"UTC"` and we convert locally rather than putting an IANA id on an EWS
+  payload this backend has never been tested with. A side benefit: the *probe* accepts both too,
+  so a modern backend that reports an IANA id (observed behaviour, per PR #29) now resolves
+  instead of falling through to `host_local`.
+- **A bad override warns and falls through; it does not discard the probe.** One typo in an env
+  file must not silently downgrade a mailbox whose real timezone was available all along. The
+  value is named in `timezone.warning` and ignored — the same "only a positively-determined answer
+  wins" doctrine as `profile_lock.py`.
+
+Carried over from PR #29, a parallel implementation of this same fix that reached the override
+independently and whose comment specified this precedence; the three mutation checks for it are
+in `tests/unit/test_mailbox_timezone.py` (dropping the precedence, discarding the probe on a bad
+value, and rejecting IANA ids each fail distinctly).
 
 Verified live 2026-09-16 on an isolated throwaway profile and port 8791 (production on 8766
 untouched throughout, confirmed still listening after each restart). The before/after table above

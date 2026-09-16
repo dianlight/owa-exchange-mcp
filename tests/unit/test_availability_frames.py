@@ -58,7 +58,7 @@ import types
 
 from exchange_mcp.auth_errors import AuthenticationRequiredError
 from exchange_mcp.browser_session import BearerModeRequiredError
-from exchange_mcp.mailbox_timezone import resolve_mailbox_timezone
+from exchange_mcp.mailbox_timezone import ENV_VAR, resolve_mailbox_timezone
 from exchange_mcp.owa_client import OWAClient
 from exchange_mcp.tools import analytics as an
 from exchange_mcp.tools import availability as av
@@ -595,6 +595,20 @@ def test_forget_mailbox_address_also_forgets_the_timezone() -> None:
 
 
 def main() -> bool:
+    # Same reason as test_mailbox_timezone's: local_tz() resolves a real zone, so
+    # a developer with EXCHANGE_TIMEZONE set would have every payload assertion
+    # below measured against their override.
+    import os
+
+    saved_env = os.environ.pop(ENV_VAR, None)
+    try:
+        return _run()
+    finally:
+        if saved_env is not None:
+            os.environ[ENV_VAR] = saved_env
+
+
+def _run() -> bool:
     if local_tz() is None:
         # Every test here needs a real UTC offset to assert against, and without
         # a timezone database `resolve_mailbox_timezone` degrades to the host's
