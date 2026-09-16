@@ -141,6 +141,11 @@ async def login(force: bool = False, ctx: Context = None) -> str:
             return json.dumps({"success": False, "error": f"Interactive login failed: {e}"})
 
         if result.get("success") and _session_is_valid(client):
+            # force=True exists to switch accounts, so the mailbox address
+            # cached from the previous one is now actively wrong - which is the
+            # one state worse than not knowing it (see
+            # OWAClient.resolve_own_mailbox).
+            client.forget_mailbox_address()
             return json.dumps({
                 "success": True,
                 "message": "Signed in and session verified.",

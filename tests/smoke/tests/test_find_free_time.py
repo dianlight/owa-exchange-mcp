@@ -37,7 +37,19 @@ async def main() -> bool:
             record("find_free_time", ARGS, "EXCEPTION", f"unexpected shape: {info}")
             return False
 
-        record("find_free_time", ARGS, "OK", f"{len(info['free_slots'])} day(s) with free slots")
+        # busy_source is the point of the note, not decoration: "calendar_folder"
+        # means the recurrence-expanding free/busy path did not run, and that
+        # path's absence is invisible in free_slots itself — a slot filled by a
+        # recurring meeting simply appears free. That is how this tool passed
+        # this suite for six days while answering wrongly (PROJECT_STATUS.md §4).
+        note = f"{len(info['free_slots'])} day(s) with free slots"
+        note += f"; busy_source={info.get('busy_source', 'absent')}"
+        if info.get("mailbox"):
+            note += f"; mailbox={info['mailbox']}"
+        warnings = info.get("warnings")
+        if warnings:
+            note += f"; warnings: {warnings}"
+        record("find_free_time", ARGS, "OK", note)
         return True
 
 

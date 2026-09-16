@@ -36,6 +36,12 @@ async def main() -> bool:
             return False
 
         note = f"{info.get('unique_contacts', 0)} unique contact(s), {len(info['contacts'])} returned"
+        # The address this ran against is worth recording: it is resolved from
+        # the session (see exchange_mcp/mailbox_identity.py), it is what
+        # excludes "self" from the ranking, and between 2026-09-10 and
+        # 2026-09-16 its absence made this tool fail on every call.
+        if info.get("mailbox"):
+            note += f"; mailbox={info['mailbox']}"
         warnings = info.get("warnings")
         if warnings:
             note += f"; warnings: {warnings}"

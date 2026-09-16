@@ -17,7 +17,6 @@ via asyncio.run_coroutine_threadsafe(...).result().
 """
 
 import asyncio
-import base64
 import json as _json
 import re
 import threading
@@ -25,6 +24,7 @@ import time
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
+from exchange_mcp import mailbox_identity
 from exchange_mcp.auth_errors import (  # noqa: F401  (re-exported for callers)
     INTERACTIVE_LOGIN_REQUIRED,
     LOGIN_TIMEOUT,
@@ -564,6 +564,28 @@ class BrowserSession:
         """Origin of the modern Outlook SPA once bearer auth has been captured, else owa_url."""
         return self._bearer.get("origin") or self.owa_url
 
+    def identity_hints(self) -> dict:
+        """Signals about *whose* mailbox this session is, taken from what we already hold.
+
+        Both come free with bearer-mode auth (see
+        _async_capture_bearer_context): the `x-anchormailbox` header Exchange
+        routes on, and the session's own Bearer JWT. Empty strings on classic
+        canary OWA, and before the first request in bearer mode - so a caller
+        must treat "no hints" as "ask the server" rather than "no mailbox".
+        See exchange_mcp.mailbox_identity for what may be read out of them.
+
+        Read off the calling thread rather than hopped onto the browser loop,
+        the same way `bearer_origin` above is: `_bearer` is only ever replaced
+        wholesale, never mutated in place, so a reader either sees the old dict
+        or the new one and can't observe a half-written capture.
+        """
+        bearer = self._bearer
+        return {
+            "auth_mode": self._auth_mode,
+            "anchor_mailbox": bearer.get("x-anchormailbox", ""),
+            "bearer_token": bearer.get("authorization", ""),
+        }
+
     # ------------------------------------------------------------------
     # Loop plumbing
     # ------------------------------------------------------------------
@@ -1102,11 +1124,8 @@ class BrowserSession:
     def _decode_jwt_exp(token: str) -> float | None:
         """Best-effort decode of a JWT's `exp` claim, without signature verification."""
         try:
-            payload_b64 = token.split(".")[1]
-            padded = payload_b64 + "=" * (-len(payload_b64) % 4)
-            claims = _json.loads(base64.urlsafe_b64decode(padded))
-            return float(claims["exp"])
-        except Exception:
+            return float(mailbox_identity.decode_jwt_claims(token)["exp"])
+        except (KeyError, TypeError, ValueError):
             return None
 
     async def _async_capture_bearer_context(self, timeout: float = 20.0) -> bool:
