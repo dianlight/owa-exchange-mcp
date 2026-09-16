@@ -524,6 +524,10 @@ class OWAClient:
         `_owa_user_configuration()` that `mailbox_timezone_detail()` has
         typically already paid for.
 
+        The signal order is `mailbox_identity`'s, and the *sequencing* below
+        exists to preserve it rather than to save a request -- see the comment
+        on the first `resolve_mailbox_address()` call.
+
         **Degrades, never raises.** Every caller here is a tool that has
         something useful to do without the address (`find_free_time` reads the
         calendar folder directly; `get_schedule` can send an attendee's id as
@@ -544,10 +548,22 @@ class OWAClient:
         if self._mailbox_address is not None and not refresh:
             return self._mailbox_address
 
+        # Only the *authoritative* request-free signal may short-circuit. The
+        # bearer token is deliberately withheld here even though it costs
+        # nothing to read: a `upn` claim would otherwise answer on this first
+        # pass and the configuration -- which outranks it, because a UPN is not
+        # guaranteed to equal the primary SMTP address on a hybrid tenant --
+        # would never be consulted at all. Passing it here inverted the
+        # documented priority for every bearer-mode session, observed live on
+        # 2026-09-16 as `get_meeting_contacts` resolving from
+        # `bearer_claim:upn` (and emitting the "you may appear in your own
+        # ranking" warning) on a mailbox whose configuration answers perfectly
+        # well. The extra request that costs is usually not a request at all:
+        # `_owa_user_configuration()` is shared with the timezone lookup, which
+        # startup has already performed.
         hints = self.browser.identity_hints()
         resolved = mailbox_identity.resolve_mailbox_address(
             anchor_mailbox=hints.get("anchor_mailbox", ""),
-            bearer_token=hints.get("bearer_token", ""),
         )
 
         if not resolved.address:
