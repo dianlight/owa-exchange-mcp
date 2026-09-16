@@ -153,6 +153,20 @@ class OWAClient:
         # -- see _owa_user_configuration() for why it is shared.
         self._user_configuration: dict | None = None
         self._user_configuration_lock = threading.Lock()
+        # Bumped by forget_mailbox_identity(); every cache above is only written
+        # if this still matches what the writer read before it made its request.
+        #
+        # A marker rather than a lock because the two locks above cannot help
+        # here: `resolve_own_mailbox()` holds neither while it probes, so there
+        # is nothing for a clear to serialise against, and taking the two it
+        # *could* take would additionally block `login` behind an in-flight
+        # round-trip. See forget_mailbox_identity() for the failure this closes.
+        #
+        # No lock of its own either: only "did this change" is ever asked of it,
+        # so a lost increment from two concurrent clears is harmless -- the value
+        # still changed, and every writer in flight still discards. Plain int
+        # reads and assignments are atomic under the GIL.
+        self._identity_generation: int = 0
 
     @property
     def cookie_file(self):
@@ -325,10 +339,16 @@ class OWAClient:
                 self._timezone = mtz.choose(env_value, None)
                 return self._timezone
 
+            generation = self._identity_generation
             discovered, detail, retry = self._probe_mailbox_timezone()
             resolution = mtz.choose(None, discovered, detail=detail)
             if retry and resolution.is_fallback:
                 # Don't cache "we asked before sign-in completed".
+                return resolution
+            if generation != self._identity_generation:
+                # The account changed while we were probing. Return what this
+                # caller asked for -- its request was made in the old account's
+                # context -- but don't leave that zone behind for the new one.
                 return resolution
             self._timezone = resolution
             return self._timezone
@@ -421,6 +441,7 @@ class OWAClient:
         with self._user_configuration_lock:
             if self._user_configuration is not None:
                 return self._user_configuration
+            generation = self._identity_generation
             # 8s, not the default 30s, and it applies to both readers on
             # purpose. Measured 2026-09-16 on a cold process: this action either
             # answers in a few seconds or does not answer at all (a Playwright
@@ -434,7 +455,9 @@ class OWAClient:
                 "Header": mtz.request_header("Exchange2013"),
                 "Body": {"__type": "GetOwaUserConfigurationRequest:#Exchange"},
             }, timeout=8)
-            if isinstance(data, dict):
+            if isinstance(data, dict) and generation == self._identity_generation:
+                # Discarded rather than cached if the account changed while this
+                # request was in flight -- see forget_mailbox_identity().
                 self._user_configuration = data
             return data
 
@@ -603,6 +626,7 @@ class OWAClient:
         # well. The extra request that costs is usually not a request at all:
         # `_owa_user_configuration()` is shared with the timezone lookup, which
         # startup has already performed.
+        generation = self._identity_generation
         hints = self.browser.identity_hints()
         resolved = mailbox_identity.resolve_mailbox_address(
             anchor_mailbox=hints.get("anchor_mailbox", ""),
@@ -652,8 +676,13 @@ class OWAClient:
         # The fingerprint is written first. Either order costs a concurrent
         # reader at most one redundant probe, but this one never pairs a fresh
         # address with a stale fingerprint.
-        self._mailbox_signals = mailbox_identity.signal_state(hints)
-        self._mailbox_address = resolved
+        if generation == self._identity_generation:
+            self._mailbox_signals = mailbox_identity.signal_state(hints)
+            self._mailbox_address = resolved
+        # Else: the account changed while this was resolving. `resolved` is still
+        # returned -- the caller asked in the old account's context -- but caching
+        # it would hand the *new* account the old one's address, which is the one
+        # state resolve_own_mailbox() calls worse than not knowing.
         return resolved
 
     def mailbox_address(self, *, refresh: bool = False) -> str:
@@ -678,7 +707,20 @@ class OWAClient:
         stale address would come back looking freshly probed. The timezone goes
         with them for the same reason -- the new account can sit in a different
         zone, and it was read from that same blob.
+
+        **Clearing them is not enough on its own**, which is why the generation
+        marker is bumped first. Each cache is written *after* the request that
+        fills it returns, so a clear landing in between was simply overwritten by
+        the previous account's result -- reproduced before this guard existed:
+        after switching accounts mid-probe, `_timezone` held the old account's
+        zone and `mailbox_address()` returned the old account's address, looking
+        freshly resolved. Two of the three writers hold a lock while they wait,
+        but `resolve_own_mailbox()` holds none, so there was nothing to
+        serialise against; the marker covers all three uniformly and does not
+        block `login` behind an in-flight round-trip. Each writer re-reads it
+        before assigning and discards its result if it moved.
         """
+        self._identity_generation += 1
         self._mailbox_address = None
         self._mailbox_signals = ""
         self._user_configuration = None
