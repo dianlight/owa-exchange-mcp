@@ -289,6 +289,15 @@ class FakeBrowser:
         if self._hints_after_request is not None:
             self._hints = self._hints_after_request
 
+    def arrive_late(self, hints: dict) -> None:
+        """Signals appearing later in the process, e.g. after a substrate call.
+
+        The case `signal_state()` exists for: nothing about the *session*
+        changed except that a Bearer context now exists, and that is precisely
+        when a cached "nothing answered yet" is worth re-asking.
+        """
+        self._hints = hints
+
 
 class FakeClient(OWAClient):
     """OWAClient whose GetOwaUserConfiguration is served from memory."""
@@ -367,6 +376,113 @@ def test_client_degrades_and_never_raises() -> None:
         len(client.calls) == 1,
         repr(client.calls),
     )
+
+
+def test_signal_state_and_is_retryable() -> None:
+    print("The two rules the retry is built on, named in the pure module")
+    cold = {"auth_mode": "canary", "anchor_mailbox": "", "bearer_token": ""}
+    warm = {"auth_mode": "bearer", "anchor_mailbox": PUID_ANCHOR, "bearer_token": "Bearer abc"}
+    check("cold != warm", mi.signal_state(cold) != mi.signal_state(warm))
+    check("None is a state", mi.signal_state(None) == mi.signal_state({}))
+    # A refreshed token names the same mailbox: it must not force a re-probe.
+    check("a rotated token is the same state",
+          mi.signal_state(warm) == mi.signal_state(dict(warm, bearer_token="Bearer zzz")))
+    # auth_mode can move without a hint appearing, and that *is* worth a look.
+    check("auth_mode counts",
+          mi.signal_state(cold) != mi.signal_state(dict(cold, auth_mode="bearer")))
+
+    check("no signals -> retryable",
+          mi.is_retryable(mi.MailboxAddress("", "", mi.UNRESOLVED_NO_SIGNALS)))
+    check("signals without an address -> not",
+          not mi.is_retryable(mi.MailboxAddress("", "", mi.UNRESOLVED_NO_ADDRESS)))
+    check("a resolved address -> never",
+          not mi.is_retryable(mi.MailboxAddress("a@b.com", mi.SOURCE_ANCHOR_MAILBOX)))
+
+
+def test_no_signals_is_retried_but_no_address_is_cached() -> None:
+    print("'Nothing could answer yet' retries; 'this backend has no address' caches")
+    # Which failure it was decides whether caching it is right, and getting that
+    # wrong is not cosmetic. None of the three signals exists until a bearer
+    # token has been captured, and this codebase mints one lazily, so on a
+    # freshly started server the first availability call can lose the race.
+    # Caching that miss pinned find_free_time to the calendar-folder scan --
+    # which reports booked recurring time as *free* -- for the life of the
+    # process, and an stdio server is a fresh process per client session, so
+    # that was the common path rather than an edge case (PROJECT_STATUS.md §4,
+    # found live 2026-09-16).
+    cold = FakeClient(hints={}, fail_with=RuntimeError("Timeout 8000ms exceeded"))
+    first = cold.resolve_own_mailbox()
+    check("cold start reports no signals", first.reason == mi.UNRESOLVED_NO_SIGNALS, first.reason)
+    check("and says why, rather than swallowing it", "Timeout" in first.detail, repr(first.detail))
+    for _ in range(3):
+        cold.mailbox_address()
+    check(
+        # The retry is *bounded by the signal state*, not unconditional. An
+        # unconditional one re-probes on every availability call while
+        # unresolved, and the flake this guards against is sticky per session:
+        # measured 2026-09-16, four cold processes resolved twice on the first
+        # call and, in the two that didn't, failed all three further attempts --
+        # 0 for 6, at ~30s each. See mailbox_identity.signal_state().
+        "while the session's signals are unchanged, it is not re-probed",
+        len(cold.calls) == 1,
+        repr(cold.calls),
+    )
+
+    # ...and the moment a signal turns up, the retry picks it up rather than
+    # returning a stale empty. This is the behaviour the retry exists *for*.
+    cold.browser.arrive_late({"auth_mode": "bearer", "anchor_mailbox": "SMTP:warm@example.com",
+                              "bearer_token": "Bearer abc"})
+    healed = cold.resolve_own_mailbox()
+    check("a changed signal state re-resolves", healed.address == "warm@example.com", repr(healed))
+    check("...for free, from the hint", len(cold.calls) == 1, repr(cold.calls))
+
+    warmed = FakeClient(
+        hints={},
+        hints_after_request={"anchor_mailbox": "SMTP:warm@example.com", "bearer_token": ""},
+        config={"Body": {}},
+    )
+    check("a hint captured during the probe still answers",
+          warmed.resolve_own_mailbox().address == "warm@example.com")
+
+    # The other failure caches, and that asymmetry is the point: a signal *was*
+    # present and carried no address, which is a backend that will not start
+    # answering mid-process. Re-probing it would add a request to every
+    # availability call forever.
+    no_address = FakeClient(hints={"anchor_mailbox": PUID_ANCHOR}, config={"Body": {"UserOptions": {}}})
+    resolved = no_address.resolve_own_mailbox()
+    check(
+        "a signal with no address in it",
+        resolved.reason == mi.UNRESOLVED_NO_ADDRESS,
+        repr(resolved),
+    )
+    for _ in range(5):
+        no_address.mailbox_address()
+    check(
+        "...is cached: one request for the life of the process",
+        len(no_address.calls) == 1,
+        repr(no_address.calls),
+    )
+
+
+def test_signal_state_and_is_retryable() -> None:
+    print("The two rules the retry is built on, named in the pure module")
+    cold = {"auth_mode": "canary", "anchor_mailbox": "", "bearer_token": ""}
+    warm = {"auth_mode": "bearer", "anchor_mailbox": PUID_ANCHOR, "bearer_token": "Bearer abc"}
+    check("cold != warm", mi.signal_state(cold) != mi.signal_state(warm))
+    check("None is a state", mi.signal_state(None) == mi.signal_state({}))
+    # A refreshed token names the same mailbox: it must not force a re-probe.
+    check("a rotated token is the same state",
+          mi.signal_state(warm) == mi.signal_state(dict(warm, bearer_token="Bearer zzz")))
+    # auth_mode can move without a hint appearing, and that *is* worth a look.
+    check("auth_mode counts",
+          mi.signal_state(cold) != mi.signal_state(dict(cold, auth_mode="bearer")))
+
+    check("no signals -> retryable",
+          mi.is_retryable(mi.MailboxAddress("", "", mi.UNRESOLVED_NO_SIGNALS)))
+    check("signals without an address -> not",
+          not mi.is_retryable(mi.MailboxAddress("", "", mi.UNRESOLVED_NO_ADDRESS)))
+    check("a resolved address -> never",
+          not mi.is_retryable(mi.MailboxAddress("a@b.com", mi.SOURCE_ANCHOR_MAILBOX)))
 
 
 def test_configuration_outranks_a_upn_claim_on_the_client() -> None:
@@ -475,6 +591,8 @@ def main() -> bool:
         test_client_falls_back_to_user_configuration,
         test_client_rereads_hints_after_the_request,
         test_client_degrades_and_never_raises,
+        test_no_signals_is_retried_but_no_address_is_cached,
+        test_signal_state_and_is_retryable,
         test_configuration_outranks_a_upn_claim_on_the_client,
         test_address_and_timezone_share_one_request,
     ):

@@ -138,6 +138,10 @@ class OWAClient:
         # credential store; see mailbox_identity's module docstring for what
         # removing them broke and for how long.
         self._mailbox_address: mailbox_identity.MailboxAddress | None = None
+        # Which identity signals the cached resolution was made against, so a
+        # failure meaning "nothing had answered yet" is re-asked when that
+        # changes and *not* on every call. See resolve_own_mailbox().
+        self._mailbox_signals: str = ""
         # Resolved once per process, the same way: see mailbox_timezone_detail().
         # A threading.Lock (not asyncio) because every method here is synchronous
         # and may be called from any of the SDK's worker threads -- an
@@ -417,11 +421,19 @@ class OWAClient:
         with self._user_configuration_lock:
             if self._user_configuration is not None:
                 return self._user_configuration
+            # 8s, not the default 30s, and it applies to both readers on
+            # purpose. Measured 2026-09-16 on a cold process: this action either
+            # answers in a few seconds or does not answer at all (a Playwright
+            # `expect_response` timeout, sticky for the session), so the extra
+            # 22s buys nothing and is spent inside whichever tool call happened
+            # to be first. Both callers have a documented fallback for "no
+            # answer" -- UTC for the timezone, an empty address for identity --
+            # so a bounded miss is strictly better than an unbounded stall.
             data = self.request("GetOwaUserConfiguration", {
                 "__type": "GetOwaUserConfigurationJsonRequest:#Exchange",
                 "Header": mtz.request_header("Exchange2013"),
                 "Body": {"__type": "GetOwaUserConfigurationRequest:#Exchange"},
-            })
+            }, timeout=8)
             if isinstance(data, dict):
                 self._user_configuration = data
             return data
@@ -538,15 +550,45 @@ class OWAClient:
         this value, so a wrong address silently keeps the user in their own
         contact ranking, while an absent one is visible.
 
-        Failures are cached too, deliberately. The realistic failure is a
-        backend with no such surface, which will not start having one mid-
-        process, and re-probing per call would add a request to every
-        availability call for the life of the server. `refresh=True` is for the
-        one case where the answer can genuinely change: an interactive
-        `login(force=True)` that switched accounts.
+        Failures are cached too, deliberately: the realistic failure is a
+        backend with no such surface, which will not start having one
+        mid-process, and re-probing per call would add a request to every
+        availability call for the life of the server.
+
+        **What makes that safe is the fingerprint stored alongside it.** A
+        failure meaning `UNRESOLVED_NO_SIGNALS` — nothing had answered *yet*,
+        as opposed to "this backend has no address" — is re-asked when
+        `mailbox_identity.signal_state()` moves, and not otherwise. Caching it
+        with no escape hatch is the 2026-09-16 cold-start bug: the first
+        availability call of a process pinned `find_free_time` to its
+        recurrence-blind calendar-folder fallback (booked time reported as
+        *free*) for that process's life, and under `stdio` a process is one
+        client session, so that was the common path. Re-probing on every call
+        instead is the opposite error and measurably worse — see the comment at
+        the cache check, and PROJECT_STATUS.md §4 for the numbers.
+
+        `refresh=True` is for the one case where a *successful* answer can
+        change: an interactive `login(force=True)` that switched accounts.
         """
-        if self._mailbox_address is not None and not refresh:
-            return self._mailbox_address
+        cached = self._mailbox_address
+        if cached is not None and not refresh:
+            if not mailbox_identity.is_retryable(cached):
+                return cached
+            # A retryable miss, re-asked only when the session holds signals it
+            # didn't. That check is free, and the retry it allows usually is
+            # too: what changed is normally a captured Bearer token, which
+            # answers from memory, or a configuration blob the timezone lookup
+            # has since fetched into the shared cache.
+            #
+            # The alternative — re-probing on every call while unresolved — is
+            # what this replaced, and the numbers are why. Four cold processes
+            # against one profile, 2026-09-16: two resolved on the first call
+            # (8.1s, 9.5s); in the two that did not, all three further attempts
+            # failed too, 0 for 6. The `GetOwaUserConfiguration` flake is
+            # sticky per *session*, so an unconditional retry pays ~30s on
+            # every availability call of that session and never wins.
+            if mailbox_identity.signal_state(self.browser.identity_hints()) == self._mailbox_signals:
+                return cached
 
         # Only the *authoritative* request-free signal may short-circuit. The
         # bearer token is deliberately withheld here even though it costs
@@ -567,7 +609,7 @@ class OWAClient:
         )
 
         if not resolved.address:
-            config = self._user_configuration_or_none()
+            config, config_error = self._user_configuration_or_none()
             # Re-read the hints afterwards even when the config call failed:
             # that call is what establishes auth on a session whose first tool
             # call this is, so a bearer capture (and with it the anchormailbox
@@ -578,7 +620,39 @@ class OWAClient:
                 user_configuration=config,
                 bearer_token=hints.get("bearer_token", ""),
             )
+            if not resolved.address and config_error:
+                # Carry *why* forward. The tool-level symptom of the 2026-09-16
+                # cold start was a bare `no_identity_signals`, and the cause --
+                # a TimeoutError on this action -- had been swallowed, which
+                # cost three live probes and one wrong published mechanism to
+                # recover. See MailboxAddress.detail.
+                resolved = resolved._replace(detail=config_error)
 
+        # Every outcome is cached, including failures: the realistic failure is
+        # a backend with no such surface, and re-probing per call would add a
+        # request to every availability call for the life of the server.
+        #
+        # What makes that safe is the *fingerprint* recorded alongside it. A
+        # `UNRESOLVED_NO_SIGNALS` miss means we asked before anything could
+        # answer -- none of the three signals exists until a Bearer token has
+        # been captured, and this codebase mints one lazily -- so it is re-asked
+        # when `signal_state()` moves, which is checked at the top of this
+        # method. Caching it *without* that escape hatch is the bug being fixed:
+        # it pinned `find_free_time` to the calendar-folder scan, which reports
+        # booked recurring time as *free*, for the life of a process -- and an
+        # stdio server is a fresh process per client session, so that was the
+        # common path. Re-probing on every call instead is the other extreme,
+        # and measurably worse than either (see the comment at the top).
+        #
+        # UNRESOLVED_NO_ADDRESS never re-probes: a signal *was* there and
+        # carried no address, which is a backend that will not start answering
+        # mid-process. Same distinction `mailbox_timezone_detail()` draws for a
+        # SessionExpiredError.
+        #
+        # The fingerprint is written first. Either order costs a concurrent
+        # reader at most one redundant probe, but this one never pairs a fresh
+        # address with a stale fingerprint.
+        self._mailbox_signals = mailbox_identity.signal_state(hints)
         self._mailbox_address = resolved
         return resolved
 
@@ -606,10 +680,11 @@ class OWAClient:
         zone, and it was read from that same blob.
         """
         self._mailbox_address = None
+        self._mailbox_signals = ""
         self._user_configuration = None
         self._timezone = None
 
-    def _user_configuration_or_none(self) -> dict | None:
+    def _user_configuration_or_none(self) -> tuple[dict | None, str]:
         """The shared user-options blob, or None if this backend won't serve it.
 
         `_owa_user_configuration()` is OWA's own bootstrap call for the
@@ -624,12 +699,19 @@ class OWAClient:
         place to surface that. That swallowing is exactly why the *cache* lives
         one level down in `_owa_user_configuration()` and not here -- the
         timezone path needs those same exceptions to stay visible.
+
+        Returns `(response_or_None, error_text)`. Swallowing the exception is
+        right; swallowing it *silently* is what made the cold-start miss read as
+        a bare `no_identity_signals` at the tool level, so the text rides along
+        in `MailboxAddress.detail` for whoever debugs the next one.
         """
         try:
             data = self._owa_user_configuration()
-        except Exception:
-            return None
-        return data if isinstance(data, dict) else None
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            return None, f"GetOwaUserConfiguration: {type(exc).__name__}: {exc}".strip()
+        if isinstance(data, dict):
+            return data, ""
+        return None, f"GetOwaUserConfiguration answered {type(data).__name__}, not an object"
 
     # ------------------------------------------------------------------
     # Folder helpers
