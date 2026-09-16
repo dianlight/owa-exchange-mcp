@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Iterator, NamedTuple
 from urllib.parse import quote
 
+from exchange_mcp import availability_frame as frame
 from exchange_mcp import mailbox_identity
 from exchange_mcp.auth_errors import (  # noqa: F401
     INTERACTIVE_LOGIN_REQUIRED,
@@ -853,31 +854,29 @@ class OWAClient:
         Unlike availabilityView (wall-clock in the requested tz_id),
         scheduleItems' startTime/endTime always come back UTC-offset
         (confirmed live - "Z"/"+00:00" regardless of the requested
-        tz_id). Stripped to naive the same way the rest of this module
-        already treats GetUserAvailability's CalendarEventArray timestamps
-        (see the pre-existing _get_availability_events in
-        tools/availability.py) - not a real timezone conversion, just the
-        established (if imprecise) convention every caller downstream
-        already assumes. Fractional seconds can run to 7 digits (.NET
-        ticks), one more than datetime.fromisoformat's 6-digit limit.
+        tz_id). Returned as naive **UTC**: the established (if imprecise)
+        convention every caller downstream already assumes, matching how
+        the rest of this module treats GetUserAvailability's
+        CalendarEventArray timestamps.
+
+        Naive is not the same as unconverted, and the difference used to
+        be latent here: an offset that is not zero (nothing has been seen
+        sending one, but nothing on the wire promises it either) had its
+        tzinfo stripped outright, which keeps *that* zone's wall clock and
+        labels it UTC. `availability_frame.to_utc_naive` normalises first,
+        so the convention this docstring states is the one the value
+        actually has. Callers that need wall-clock time -- anything
+        comparing against working hours -- convert with
+        `availability_frame.to_wall_clock`; see that module on why the
+        conversion lives in the tools rather than here.
         """
         if not t:
             return None
-        raw = t.get("dateTime", "")
-        if not raw:
-            return None
-        # Trim fractional digits beyond microsecond precision (datetime.fromisoformat's
-        # limit) wherever they fall, before the Z/offset suffix rather than at a fixed
-        # string offset - .NET ticks can run to 7 digits.
-        raw = re.sub(r"(\.\d{6})\d+", r"\1", raw).replace("Z", "+00:00")
-        try:
-            return datetime.fromisoformat(raw).replace(tzinfo=None)
-        except ValueError:
-            return None
+        return frame.to_utc_naive(t.get("dateTime", ""))
 
     def get_schedule(
         self, emails: list[str], start: datetime, end: datetime, *,
-        interval_minutes: int = 30, tz_id: str = "Russian Standard Time",
+        interval_minutes: int = 30, tz_id: str | None = None,
     ) -> list[dict]:
         """Fetch free/busy via the modern Outlook Scheduling Assistant's own
         GetSchedule GraphQL query, instead of the broken EWS
@@ -896,7 +895,19 @@ class OWAClient:
         (list of {"start", "end", "subject", "status", "is_recurring"},
         including free-status items - callers filter as they already do
         for CalendarEventArray).
+
+        `tz_id` is the zone the *window* is read in and, more importantly,
+        the zone `availability_view` is answered in - unlike
+        `scheduleItems`, which comes back UTC-offset whatever is asked for
+        (see `_parse_schedule_dt`). So a caller that lays the view over a
+        local working-hours grid has to ask for it in that same zone;
+        `availability_frame.schedule_tz_id()` is what the availability
+        tools pass. `None` keeps the codebase-wide default below, which is
+        the hardcoded UTC+3 issue #8 exists to replace - once that lands,
+        this fallback becomes `self.mailbox_timezone()` and the literal
+        goes away.
         """
+        tz_id = tz_id or "Russian Standard Time"
         payload = [{
             "operationName": "GetSchedule",
             "variables": {
