@@ -372,9 +372,11 @@ def find_free_time(
 
     Returns:
         JSON object with free_slots keyed by date, each containing an
-        array of {start, end, duration_minutes} objects, plus a timezone
-        block naming the zone the times are in (and a warning if that
-        zone could not be resolved, in which case they are UTC).
+        array of {start, end, duration_minutes} objects, plus busy_source
+        naming where the busy periods came from, a timezone block naming
+        the zone the times are in, and warnings when either of those is
+        the degraded case (a calendar-folder scan, or a zone that could
+        not be resolved and so left the times in UTC).
     """
     client = _get_client(ctx)
 
@@ -384,23 +386,56 @@ def find_free_time(
     except ValueError as e:
         return json.dumps({"error": f"Invalid date format: {e}"})
 
-    # Resolved once for the whole call: the working hours below are wall-clock
-    # and the busy periods arrive UTC, so this is the only thing that puts
-    # them on the same grid.
+    # Resolved once for the whole call, and before either source is queried:
+    # the working hours below are wall-clock while both sources answer in UTC,
+    # so this is the only thing that puts them on the same grid.
     zone = frame.mailbox_zone(client)
+    warnings: list[str] = []
+    if zone.warning:
+        # Also reported structurally in the `timezone` block below, but it
+        # belongs here too: a grid displaced by the mailbox's UTC offset makes
+        # this answer untrustworthy in exactly the way `warnings` exists to say.
+        warnings.append(f"Times may not be in the mailbox's timezone: {zone.warning}")
 
-    try:
-        # Use GetUserAvailability for accurate recurring event expansion
-        if client.user_email:
-            all_busy = _get_availability_events(client, client.user_email, sd, ed, zone)
-        else:
-            # Fallback to FindItem (misses recurring event occurrences)
+    # Two sources, and which one answered changes how much the answer is
+    # worth. Free/busy (GetSchedule, or GetUserAvailability on classic OWA)
+    # expands recurring masters into occurrences; the calendar-folder scan
+    # below does not, so a weekly stand-up reads as free time there. That is a
+    # *wrong* answer rather than an incomplete one, which is why the fallback
+    # is reported instead of quietly taken -- it was taken on every call
+    # between 2026-09-10 and this change, when the own-address read this
+    # branches on had no writer left (see mailbox_identity's docstring).
+    own = client.resolve_own_mailbox()
+    all_busy = None
+    busy_source = ""
+
+    if own.address:
+        try:
+            all_busy = _get_availability_events(client, own.address, sd, ed, zone)
+            busy_source = "free_busy"
+        except Exception as e:
+            warnings.append(
+                f"Free/busy lookup for {own.address} failed ({e}); fell back to a "
+                "calendar-folder scan, which does not expand recurring meetings, so "
+                "slots occupied by a recurring occurrence may be reported as free."
+            )
+    else:
+        warnings.append(
+            f"Could not determine this mailbox's own address ({own.reason}), so free/busy "
+            "could not be queried; used a calendar-folder scan instead, which does not "
+            "expand recurring meetings, so slots occupied by a recurring occurrence may "
+            "be reported as free."
+        )
+
+    if all_busy is None:
+        try:
             folder_id = client.get_folder_id("calendar")
             if not folder_id:
                 return json.dumps({"error": "Could not find calendar folder. Session may have expired."})
             all_busy = _get_calendar_events(client, folder_id, sd, ed, zone)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+            busy_source = "calendar_folder"
+        except Exception as e:
+            return json.dumps({"error": str(e)})
 
     # Convert event dicts to (start, end) tuples for _find_free_slots
     busy_periods = [(ev['start'], ev['end']) for ev in all_busy]
@@ -425,9 +460,16 @@ def find_free_time(
                 ]
         current_date += timedelta(days=1)
 
-    return json.dumps(
-        {"free_slots": result, "timezone": zone.as_dict()}, ensure_ascii=False
-    )
+    payload = {
+        "free_slots": result,
+        "busy_source": busy_source,
+        "timezone": zone.as_dict(),
+    }
+    if own.address:
+        payload["mailbox"] = own.address
+    if warnings:
+        payload["warnings"] = warnings
+    return json.dumps(payload, ensure_ascii=False)
 
 
 # ------------------------------------------------------------------
