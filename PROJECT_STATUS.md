@@ -1557,8 +1557,8 @@ Not verified live: tests only, and the write path the smoke assertion guards nee
 items to exercise. The unit suite runs in CI; the smoke assertion runs the next time
 `test_calendar_lifecycle.py` does.
 
-**Update 2026-09-16 — the write paths are verified live; issue #8 has no `Pending` rows left.**
-Rows 202/203 were the last two, and the measurement is the one the rows themselves asked for:
+**Update 2026-09-16 — the calendar and task write paths are verified live.** Rows 202/203/1003/1004
+are `OK`; the measurement is the one those rows themselves asked for:
 
 | tool | asked | stored | mailbox-local |
 |---|---|---|---|
@@ -1590,6 +1590,16 @@ Run on an isolated server and profile (port 8795; production on 8766 untouched a
 listening afterwards), driving the tools directly rather than through `test_calendar_lifecycle.py`:
 that suite needs `EXCHANGE_SMOKE_SELF_EMAIL` because it self-invites, and attendees have nothing to
 do with what these rows ask. Every item created was uniquely tagged and removed.
+
+**Correction to this entry as first written:** it claimed issue #8 had no `Pending` rows left. It
+does — **208 `assign_event_categories` and 209 `remove_event_categories`**, which were reset for the
+same reason and are not covered by the run above. Their write goes through
+`_set_event_categories` (the bespoke `UpdateCalendarEvent` action), whose header now carries the
+mailbox zone like every other. That payload sends `Categories` and no timestamps, so the zone is
+expected to be cosmetic there — but "expected to be cosmetic" is exactly the kind of reasoning this
+issue kept punishing, which is why the rows are `Pending` rather than assumed. The check is a
+round-trip they already document: tag a real event, confirm the tag in `get_calendar_events` list
+mode, remove it, confirm the original tags survive.
 
 One note on the cleanup, because it is a trap in the *tool surface* rather than in the run:
 `delete_task` takes `item_ids` (plural, a list). The first cleanup pass passed `item_id` and got a
