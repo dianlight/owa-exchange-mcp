@@ -1557,6 +1557,47 @@ Not verified live: tests only, and the write path the smoke assertion guards nee
 items to exercise. The unit suite runs in CI; the smoke assertion runs the next time
 `test_calendar_lifecycle.py` does.
 
+**Update 2026-09-16 — the write paths are verified live; issue #8 has no `Pending` rows left.**
+Rows 202/203 were the last two, and the measurement is the one the rows themselves asked for:
+
+| tool | asked | stored | mailbox-local |
+|---|---|---|---|
+| `create_meeting` | 14:00 | `12:00Z` | **14:00** |
+| `update_meeting` | 15:00 | `13:00Z` | **15:00** |
+| `create_task` reminder | 09:30 | `07:30Z` | **09:30** |
+| `update_task` reminder | 10:45 | `08:45Z` | **10:45** |
+| `create_task` `due_date` | 2026-09-21 | — | **2026-09-21** (unchanged) |
+
+Offset was +02:00 on the target day (a Monday, so `find_free_time` would report it). Before the fix
+`create_meeting` stored `11:00Z` for the same request — 13:00 local in summer, 12:00 in winter — so
+the middle column is the one that used to be wrong.
+
+Two things make this more than four numbers agreeing:
+
+- **`find_free_time` corroborated it in wall clock, with no decoding at all.** The day's free slots
+  moved from `12:00-13:00, 16:30-18:00` to bracket the new 14:00 block. The `timezone` block reports
+  the zone *id* but not its offset, so the table above decodes the id through the same CLDR
+  Windows→IANA table the server uses; the slot boundaries are the check that does not.
+- **The `due_date` row is the control.** Task dates are written `Z`-qualified UTC midnight and read
+  through a header that deliberately sends *no* `TimeZoneContext`, so a change that made reads
+  symmetrical with writes would move them a day. They did not move, which is that asymmetry working
+  rather than being untested.
+
+Also confirmed in passing: the zone resolved with `source: "mailbox"`, not a fallback — so the
+`GetOwaUserConfiguration` probe answers on this tenant, which is what #33's retry bounding assumed.
+
+Run on an isolated server and profile (port 8795; production on 8766 untouched and confirmed still
+listening afterwards), driving the tools directly rather than through `test_calendar_lifecycle.py`:
+that suite needs `EXCHANGE_SMOKE_SELF_EMAIL` because it self-invites, and attendees have nothing to
+do with what these rows ask. Every item created was uniquely tagged and removed.
+
+One note on the cleanup, because it is a trap in the *tool surface* rather than in the run:
+`delete_task` takes `item_ids` (plural, a list). The first cleanup pass passed `item_id` and got a
+validation error back — which it did not check, so two tasks survived a run that reported success.
+Same shape as the bug this whole issue is about: a call that looks like it worked because nobody
+read the answer. Caught by listing the folder afterwards rather than trusting the delete, which is
+what `tools/tasks.py`'s docstring already says to do for deletions.
+
 ## 2. How to read the table
 
 - **ID** — a permanent identifier, `<module number><2-digit sequence within that module>`:
@@ -1626,8 +1667,8 @@ items to exercise. The unit suite runs in CI; the smoke assertion runs the next 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
 | 201 | `get_calendar_events` | List events in a date range, including each event's `categories` — populated in list mode (`include_body=False`) from the list request itself, not a per-item detail call. By default a recurring series appears once, as its master item; `expand_recurrences=True` additionally synthesizes one entry per occurrence client-side (marked `is_synthesized_occurrence`, empty `item_id` — see §4) | `tests/smoke/tests/test_get_calendar_events.py`, `tests/smoke/tests/test_calendar_event_detail.py`, `tests/smoke/tests/test_recurrence_expansion.py`, `tests/unit/test_recurrence_expansion.py` | OK (2026-09-14, re-verified) — `categories` confirmed populated in **list mode** (`include_body=False`, straight from the single `CalendarView` request, no per-item detail call), so a bulk tagging pass needs no COM fallback; previously verified round-tripping a real tag; `expand_recurrences` verified live (46 synthesized occurrences over 14 days, all in-window, all `item_id`-less, no duplicated masters, correct time-of-day) and all 127 recurring series in this mailbox expand, relative patterns included; also re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change | Stable |
-| 202 | `create_meeting` | Create a meeting with attendees, location, reminder, sensitivity | `tests/smoke/tests/test_calendar_lifecycle.py`  (now verifies the meeting's **time** round-trips, not just that it exists — see the 2026-09-16 note) | Pending (2026-09-16, issue #8: `TimeZoneContext` now carries the mailbox's own timezone instead of a hardcoded `Russian Standard Time`/UTC+3, so the times this tool sends changed — needs a live re-check) — previously OK (2026-09-08) | Stable |
-| 203 | `update_meeting` | Update a meeting (implemented as cancel + recreate — OWA JSON API has no reliable `UpdateItem` for calendar items) | `tests/smoke/tests/test_calendar_lifecycle.py`  (now verifies the meeting's **time** round-trips, not just that it exists — see the 2026-09-16 note) | Pending (2026-09-16, issue #8: `TimeZoneContext` now carries the mailbox's own timezone instead of a hardcoded `Russian Standard Time`/UTC+3, so the times this tool sends changed — needs a live re-check) — previously OK (2026-09-08) | Stable |
+| 202 | `create_meeting` | Create a meeting with attendees, location, reminder, sensitivity | `tests/smoke/tests/test_calendar_lifecycle.py`  (now verifies the meeting's **time** round-trips, not just that it exists — see the 2026-09-16 note) | OK (2026-09-16, verified live for issue #8) — asked for 14:00 on a W. Europe mailbox (offset +02:00 on the target day) and the event read back as `12:00Z`, i.e. **14:00 mailbox-local**. Before the fix the same request stored `11:00Z` (13:00 local in summer, 12:00 in winter), so this is the number that was wrong. `find_free_time` corroborated it in wall clock with no decoding: the day's free slots moved from `12:00-13:00, 16:30-18:00` to bracket the new 14:00 block. Run on an isolated server and profile (port 8795; production on 8766 untouched), driving the tool directly rather than via `test_calendar_lifecycle.py` — the suite needs `EXCHANGE_SMOKE_SELF_EMAIL` because it self-invites, and attendees are irrelevant to the question these rows ask. The meeting was cancelled afterwards. Previously OK (2026-09-08), but that predates the fix and could not have caught it: the suite never read the time back. | Stable |
+| 203 | `update_meeting` | Update a meeting (implemented as cancel + recreate — OWA JSON API has no reliable `UpdateItem` for calendar items) | `tests/smoke/tests/test_calendar_lifecycle.py`  (now verifies the meeting's **time** round-trips, not just that it exists — see the 2026-09-16 note) | OK (2026-09-16, verified live for issue #8) — the same run moved the meeting to 15:00 and it read back as `13:00Z`, i.e. **15:00 mailbox-local**, through the cancel+recreate this tool is implemented as (the item id changes, and the check followed the new one). Same isolated server, same cleanup. Previously OK (2026-09-08), predating the fix. | Stable |
 | 204 | `cancel_meeting` | Cancel a meeting and notify attendees (soft-delete only — moves to Deleted Items, no permanent-delete option) | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
 | 205 | `respond_to_meeting` | Accept / decline / tentatively accept a meeting invite | `tests/unit/test_meeting_response.py` covers the `_MEETING_RESPONSES` table (both the EWS `__type` per verb and the message wording). The *live* RSVP path is still uncovered and can't be: a self-invite produces no meeting-request email to respond to (confirmed 2026-09-08; Exchange doesn't ask an organizer to accept their own invite), so no self-contained automated test can reach it | OK (2026-09-08, manual) — verified against a real incoming Google Calendar invite from a different account (Tentative response sent successfully). Wire path unchanged since; the Tentative *message* wording changed 2026-09-15 (#13) and is unit-covered | Stable |
 | 206 | `download_event_attachments` | Download file attachments from a calendar event | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
