@@ -1448,7 +1448,50 @@ Two things this fix depends on, one of them an ordinary dependency and one a cav
   marked for deletion once #8 merges; what it is *not* is a second copy of the precedence
   rule — when the method is present, its answer is taken whole.
 
-**Update 2026-09-16 (last) — `create_meeting` had been storing meetings in the wrong zone
+**Update 2026-09-16 — clearing the identity caches was not enough to survive an account
+switch.** Found reviewing #32 after it merged; #33 closed the other finding from that review (the
+unbounded identity re-probe, now bounded by the signal fingerprint — measured 1 request per 5 calls
+where it had been 5).
+
+`forget_mailbox_identity()` clears four caches, and every one of them is written *after* the request
+that fills it returns. So a clear landing in that gap was simply overwritten by the previous
+account's result. Reproduced with a transport that blocks mid-request: after `login(force=True)`
+switched accounts while a probe was in flight, `_timezone` held the old account's zone and
+`mailbox_address()` returned the old account's address — looking freshly resolved.
+
+That is precisely the state `resolve_own_mailbox()` already argues is worse than not knowing:
+`get_meeting_contacts` excludes "self" by comparing against that address, so the user silently stays
+in their own ranking, and every write in the process carries the wrong zone. The existing docstring
+reasons correctly that clearing the address alone would be worse than useless and clears all four —
+the gap is that four assignments are not atomic against a writer already in flight.
+
+Fixed with a generation marker: `forget_mailbox_identity()` bumps `_identity_generation` before
+clearing, and each writer re-reads it after its request and discards its result if it moved. Two
+details are the reasons it is a marker and not a lock:
+
+- **`resolve_own_mailbox()` holds no lock while it probes**, so for the address there is nothing a
+  clear could serialise against. Acquiring the two locks that *do* exist (`_timezone_lock`,
+  `_user_configuration_lock`) would fix two of the three writers and leave the third — which is the
+  one whose stale value corrupts a result rather than a header.
+- Taking those locks would also block `login` behind an in-flight round-trip, and introduce a
+  lock-ordering constraint (`_timezone_lock` → `_user_configuration_lock`) that nothing currently
+  needs.
+
+A discarded result is still *returned* to the caller that asked for it — that request was made in
+the old account's context — it is only not left behind for the new one.
+
+[tests/unit/test_identity_cache_generation.py](tests/unit/test_identity_cache_generation.py) pins
+both directions, because a guard that discarded too eagerly would be just as wrong: it would turn
+one probe per process into one per call. The fake transport blocks on an event, so the interleaving
+is deterministic rather than timing-dependent. Without the bump, all four assertions fail with the
+literal stale values (`account.one@example.com`, `Russian Standard Time`).
+
+Reachable in ordinary use rather than contrived: `login(force=True)` *is* the account-switch path,
+and under `--transport http` the process is long-lived and shared across clients, so another tool
+call being mid-probe is the normal case. A lock held across a round-trip widens the window from
+nanoseconds to seconds.
+
+**Update 2026-09-16 (tests) — `create_meeting` had been storing meetings in the wrong zone
 unnoticed, and the one availability branch no live run can reach is now covered.** Tests only.
 
 The finding worth recording, because the fix is in but the lesson was not written down:
