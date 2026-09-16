@@ -1011,17 +1011,7 @@ def create_meeting(
     # Build request - uses CreateCalendarEvent action and V2017_08_18
     payload = {
         "__type": "CreateItemJsonRequest:#Exchange",
-        "Header": {
-            "__type": "JsonRequestHeaders:#Exchange",
-            "RequestServerVersion": "V2017_08_18",
-            "TimeZoneContext": {
-                "__type": "TimeZoneContext:#Exchange",
-                "TimeZoneDefinition": {
-                    "__type": "TimeZoneDefinitionType:#Exchange",
-                    "Id": "Russian Standard Time",
-                },
-            },
-        },
+        "Header": client.request_header("V2017_08_18"),
         "Body": {
             "__type": "CreateItemRequest:#Exchange",
             "Items": [calendar_item],
@@ -1261,17 +1251,7 @@ def update_meeting(
 
     create_payload = {
         "__type": "CreateItemJsonRequest:#Exchange",
-        "Header": {
-            "__type": "JsonRequestHeaders:#Exchange",
-            "RequestServerVersion": "V2017_08_18",
-            "TimeZoneContext": {
-                "__type": "TimeZoneContext:#Exchange",
-                "TimeZoneDefinition": {
-                    "__type": "TimeZoneDefinitionType:#Exchange",
-                    "Id": "Russian Standard Time",
-                },
-            },
-        },
+        "Header": client.request_header("V2017_08_18"),
         "Body": {
             "__type": "CreateItemRequest:#Exchange",
             "Items": [calendar_item],
@@ -1707,17 +1687,7 @@ def _set_event_categories(client: OWAClient, item_ids: list[str], categories: li
         item_id_dict = {"__type": "ItemId:#Exchange", "Id": iid}
         payload = {
             "__type": "UpdateCalendarEventJsonRequest:#Exchange",
-            "Header": {
-                "__type": "JsonRequestHeaders:#Exchange",
-                "RequestServerVersion": "V2018_01_08",
-                "TimeZoneContext": {
-                    "__type": "TimeZoneContext:#Exchange",
-                    "TimeZoneDefinition": {
-                        "__type": "TimeZoneDefinitionType:#Exchange",
-                        "Id": "Russian Standard Time",
-                    },
-                },
-            },
+            "Header": client.request_header("V2018_01_08"),
             "Body": {
                 "__type": "UpdateCalendarEventRequest:#Exchange",
                 "EventId": item_id_dict,

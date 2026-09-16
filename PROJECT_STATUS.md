@@ -1491,6 +1491,71 @@ Two things this run could **not** cover, both recorded rather than assumed:
   naive input when the mailbox timezone is known, so the worst case there is unchanged behaviour
   rather than a double shift.
 
+**Update 2026-09-16 (later) — the write paths follow the mailbox's timezone too, and
+`create_meeting` turns out to have been storing meetings 1-2 hours early.** Issue #8 is now
+closed: the stray `"Russian Standard Time"` (UTC+3) is gone from every payload in the package.
+Its acceptance criterion was "grep for the literal; there should be no remaining hardcoded
+occurrence", and that grep is now a test
+([tests/unit/test_request_headers.py](tests/unit/test_request_headers.py)) rather than a habit.
+
+The headline is not the reminder bug the issue was filed about. `create_meeting` and
+`update_meeting` write `Start`/`End` as an **unqualified** wall clock
+(`strftime("%Y-%m-%dT%H:%M:%S.000")`, no `Z`), so whatever `TimeZoneContext` goes with the request
+is what decides the instant — and that context was the hardcoded UTC+3. On the W. Europe mailbox
+this repository is developed against:
+
+| asked for | stored | appeared in the mailbox |
+|---|---|---|
+| 14:00, summer (DST, +02:00) | 11:00Z | **13:00** — 1 hour early |
+| 14:00, winter (+01:00) | 11:00Z | **12:00** — 2 hours early |
+
+The error was seasonal, which is why it never looked like a constant offset anyone would notice.
+Row 202 has read `OK` throughout, and the reason is worth recording because it is the same reason
+#601 survived six days: **`test_calendar_lifecycle.py` sent `start_time: "14:00"` and never read
+the time back.** The meeting existed, at a plausible hour, so every check short of comparing the
+number passed. That test now reads the event back and compares it against the mailbox offset
+`find_free_time` reports, failing the row rather than recording `OK` on a mismatch — deliberately
+in UTC, so the test doesn't carry its own copy of the timezone logic it is checking.
+
+The reminder bug #8 *was* filed about is fixed by the same mechanism: `_reminder_datetime` writes
+`ReminderDueBy` unqualified for exactly this reason, so a reminder asked for at 09:30 was stored
+as 09:30 Moscow. Note the two halves are one mechanism — give `_reminder_datetime` a `Z` and the
+context stops applying, and the symptom returns by the other door. Both are pinned.
+
+**One builder, because a constant cannot be fixed per-call.** `OWAClient.request_header(version)`
+is now the only thing that constructs a `TimeZoneContext`; `mailbox_timezone.request_header()`
+does the building. That mattered structurally: of the nine call sites, the ones in `tasks.py` and
+`folders.py` were **module-level constants**, which no per-call value can reach — that is what made
+a one-literal bug a codebase-wide change rather than a one-line fix, and why the fix is a builder
+rather than nine edits. Two tests hold the line: no hardcoded `TimeZoneDefinition` id anywhere in
+the package, and no `TimeZoneContext` constructed outside `mailbox_timezone.py`. The second is the
+one that catches the *next* module to grow a private copy.
+
+**Two headers deliberately carry no `TimeZoneContext`, and both look like oversights**, so both are
+pinned:
+
+- `tasks.py`'s `_READ_HEADER`. Task `DueDate`/`StartDate` are stored as UTC midnight and written
+  `Z`-qualified, so a context on a *read* would have Exchange convert them and return the previous
+  day for any mailbox west of UTC — the classic off-by-one-day task date. Making the read and write
+  headers symmetrical is the obvious tidy-up and it breaks dates silently.
+- `calendar._resolve_attendee`. `ResolveNames` has no timestamps, so a context is meaningless
+  there. This one is pinned because the first pass of this migration **added one to it by
+  accident**: a blanket string replace matched a header that had never had a context. Harmless in
+  effect, caught before commit, and exactly the kind of unintended edit a mechanical migration
+  produces.
+
+Everything else that changed is cosmetic in effect: the folder actions and the calendar
+category write (`_set_event_categories`, `V2018_01_08`) carry no timestamps, so the zone they send
+never mattered — they were migrated anyway, because a module keeping a private copy "that happens
+to be harmless" is how this spread in the first place.
+
+Not verified live. Rows 202/203/1003/1004 go to `Pending`: these are *write* paths, so checking
+them means creating real calendar items and reminders in a real mailbox, and the arithmetic is
+covered by unit tests plus the smoke assertion above rather than by a run. The check that closes
+them is one pass of `test_calendar_lifecycle.py` and `test_task_lifecycle.py` against a live
+mailbox, watching that a meeting asked for at 14:00 reads back at 14:00 and a reminder asked for
+at 09:30 reads back at 09:30 in the mailbox's own zone.
+
 ## 2. How to read the table
 
 - **ID** — a permanent identifier, `<module number><2-digit sequence within that module>`:
@@ -1560,8 +1625,8 @@ Two things this run could **not** cover, both recorded rather than assumed:
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
 | 201 | `get_calendar_events` | List events in a date range, including each event's `categories` — populated in list mode (`include_body=False`) from the list request itself, not a per-item detail call. By default a recurring series appears once, as its master item; `expand_recurrences=True` additionally synthesizes one entry per occurrence client-side (marked `is_synthesized_occurrence`, empty `item_id` — see §4) | `tests/smoke/tests/test_get_calendar_events.py`, `tests/smoke/tests/test_calendar_event_detail.py`, `tests/smoke/tests/test_recurrence_expansion.py`, `tests/unit/test_recurrence_expansion.py` | OK (2026-09-14, re-verified) — `categories` confirmed populated in **list mode** (`include_body=False`, straight from the single `CalendarView` request, no per-item detail call), so a bulk tagging pass needs no COM fallback; previously verified round-tripping a real tag; `expand_recurrences` verified live (46 synthesized occurrences over 14 days, all in-window, all `item_id`-less, no duplicated masters, correct time-of-day) and all 127 recurring series in this mailbox expand, relative patterns included; also re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change | Stable |
-| 202 | `create_meeting` | Create a meeting with attendees, location, reminder, sensitivity | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
-| 203 | `update_meeting` | Update a meeting (implemented as cancel + recreate — OWA JSON API has no reliable `UpdateItem` for calendar items) | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
+| 202 | `create_meeting` | Create a meeting with attendees, location, reminder, sensitivity | `tests/smoke/tests/test_calendar_lifecycle.py`, `tests/unit/test_request_headers.py` | **Pending** (was OK 2026-09-08) — **Timezone (issue #8, 2026-09-16):** was silently storing meetings 1-2 hours early. `Start`/`End` go out as an unqualified wall clock, so the request's `TimeZoneContext` decides the instant, and that context was a hardcoded UTC+3 — asking for 14:00 on a W. Europe mailbox produced 13:00 in summer and 12:00 in winter. It now sends the mailbox's own zone. The `OK` above predates the fix and could not have caught it: this suite passed `start_time: "14:00"` and never read the time back. It does now, comparing against the offset `find_free_time` reports and failing on a mismatch. Re-verify: a meeting asked for at 14:00 must read back at 14:00 in the mailbox's zone. | Stable |
+| 203 | `update_meeting` | Update a meeting (implemented as cancel + recreate — OWA JSON API has no reliable `UpdateItem` for calendar items) | `tests/smoke/tests/test_calendar_lifecycle.py`, `tests/unit/test_request_headers.py` | **Pending** (was OK 2026-09-08) — **Timezone (issue #8, 2026-09-16):** same unqualified `Start`/`End` write as #202 and the same 1-2 hour error, through the recreate half of its cancel+recreate. Fixed by the same header builder; re-verify the same way (the suite updates the meeting to 15:00, which must read back as 15:00 locally). | Stable |
 | 204 | `cancel_meeting` | Cancel a meeting and notify attendees (soft-delete only — moves to Deleted Items, no permanent-delete option) | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
 | 205 | `respond_to_meeting` | Accept / decline / tentatively accept a meeting invite | `tests/unit/test_meeting_response.py` covers the `_MEETING_RESPONSES` table (both the EWS `__type` per verb and the message wording). The *live* RSVP path is still uncovered and can't be: a self-invite produces no meeting-request email to respond to (confirmed 2026-09-08; Exchange doesn't ask an organizer to accept their own invite), so no self-contained automated test can reach it | OK (2026-09-08, manual) — verified against a real incoming Google Calendar invite from a different account (Tentative response sent successfully). Wire path unchanged since; the Tentative *message* wording changed 2026-09-15 (#13) and is unit-covered | Stable |
 | 206 | `download_event_attachments` | Download file attachments from a calendar event | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
@@ -1653,8 +1718,8 @@ visible to these tools — use `set_email_flag` (#115).
 |---|---|---|---|---|---|
 | 1001 | `get_tasks` | List tasks from a To Do list / task folder, due-date ascending with undated last; filters completed client-side (`include_completed`), skips non-`Task` items (a mail folder would otherwise yield subject-only pseudo-tasks — reported as `skipped_non_task_items`), optional per-task body with per-item `body_error` degradation, reports `scanned` so "no matches" is distinguishable from the 500-item scan ceiling | `tests/smoke/tests/test_task_lifecycle.py`, `tests/smoke/tests/test_task_folder_targeting.py`, `tests/unit/test_folder_id_dict.py` | OK (2026-09-14) — 14 tasks listed from the default list, completed-filter verified both ways; non-task filter verified by pointing it at `deleteditems` (500 scanned, 499 skipped, the 1 real task found). **`task_folder` resolution is now covered too** (2026-09-14): all three non-default spellings — bare list name, `tasks/<list>` path, raw opaque folder ID — plus the negative "a child-list task must not show up in the default list" case, against a To Do list the test creates for itself now that #503 can make one | Stable |
 | 1002 | `get_task` | Get one task's full detail (status, dates, reminder, importance, categories, owner, body, change_key) | `tests/smoke/tests/test_task_lifecycle.py` | OK (2026-09-11) — subject, UTC-midnight due date, status, body, categories, importance and reminder all verified round-tripping. `PercentComplete` arrives as a *string* (`"100"`) from this backend and is coerced to int | Stable |
-| 1003 | `create_task` | Create a task with due/start dates, note body, status, importance, categories and reminder, in any To Do list | `tests/smoke/tests/test_task_lifecycle.py`, `tests/smoke/tests/test_task_folder_targeting.py`, `tests/unit/test_folder_id_dict.py` | OK (2026-09-14) — created in the default list with every optional field set, and (2026-09-14) into a named child To Do list addressed by bare name, which is the `task_folder` path that used to be untestable (see #1001) | Stable |
-| 1004 | `update_task` | Partial update — only the arguments passed are written; `clear_due_date`/`clear_start_date`/`clear_reminder` erase a field (`DeleteItemField`), and `status`+`percent_complete` together is rejected client-side (Exchange resolves the two against each other by whichever it processes last) | `tests/smoke/tests/test_task_lifecycle.py` | OK (2026-09-11) — subject + due date + `Status` + `clear_reminder` written in one request and verified by re-read, i.e. every `_FIELD` spelling exercised there is confirmed accepted (`item:Subject`, `item:ReminderIsSet`, `task:DueDate`, `task:Status`) | Stable |
+| 1003 | `create_task` | Create a task with due/start dates, note body, status, importance, categories and reminder, in any To Do list | `tests/smoke/tests/test_task_lifecycle.py`, `tests/smoke/tests/test_task_folder_targeting.py`, `tests/unit/test_folder_id_dict.py`, `tests/unit/test_request_headers.py` | **Pending** (was OK 2026-09-14) — created in the default list with every optional field set, and (2026-09-14) into a named child To Do list addressed by bare name, which is the `task_folder` path that used to be untestable (see #1001). **Timezone (issue #8, 2026-09-16):** this is the bug #8 was filed about. `reminder` is written as an unqualified wall clock so the request's `TimeZoneContext` decides the instant, and that context was a hardcoded UTC+3 — a reminder asked for at 09:30 was stored as 09:30 Moscow, i.e. three hours early on a UTC mailbox. It now sends the mailbox's own zone. `DueDate`/`StartDate` are unaffected: they are written `Z`-qualified UTC midnight and read back through a context-free header, which is an asymmetry `tests/unit/test_request_headers.py` now pins. Re-verify: a reminder asked for at 09:30 must fire at 09:30 in the mailbox's own zone. | Stable |
+| 1004 | `update_task` | Partial update — only the arguments passed are written; `clear_due_date`/`clear_start_date`/`clear_reminder` erase a field (`DeleteItemField`), and `status`+`percent_complete` together is rejected client-side (Exchange resolves the two against each other by whichever it processes last) | `tests/smoke/tests/test_task_lifecycle.py`, `tests/unit/test_request_headers.py` | **Pending** (was OK 2026-09-11) — subject + due date + `Status` + `clear_reminder` written in one request and verified by re-read, i.e. every `_FIELD` spelling exercised there is confirmed accepted (`item:Subject`, `item:ReminderIsSet`, `task:DueDate`, `task:Status`). **Timezone (issue #8, 2026-09-16):** same reminder write as #1003, same fix, same re-verification. | Stable |
 | 1005 | `complete_task` | Mark tasks complete / reopen them, writing `Status` only; returns per-item results including the *new* ItemId Exchange mints when a recurring occurrence is completed | `tests/smoke/tests/test_task_lifecycle.py` | OK (2026-09-11) — `Status=Completed` verified on the item (`is_complete`, `complete_date` = today, `percent_complete` 100 set by the server from `Status` alone) and through both listing filters. The recurring-task ID-split path is untested (no recurring task to hand) | Stable |
 | 1006 | `delete_task` | Delete tasks (soft to Deleted Items, or `permanent` HardDelete), `AffectedTaskOccurrences: AllOccurrences` | `tests/smoke/tests/test_task_lifecycle.py`, `tests/smoke/tests/test_task_folder_targeting.py` | OK (2026-09-11) — verified by absence from the folder listing. A deleted task's **ItemId stays resolvable**, so `get_task` keeps returning the item afterwards with a bumped ChangeKey; the first test run failed on exactly that wrong post-condition before the tool was cleared | Stable |
 
@@ -1690,6 +1755,32 @@ hold a request open for.
 | 1106 | `get_discovery_detail` | Return the real captured requests for one endpoint — full request payload with its `__type` annotations, whether it rode in `X-OWA-UrlPostData`, and the response field/type skeleton. What you call to actually implement against a proposal | None | **Pending** — new module | Stable |
 
 ## 4. Gaps worth closing
+
+- **~~All writes send `TimeZoneContext` = Russian Standard Time (UTC+3)~~ — closed 2026-09-16
+  (issue #8).** The literal is gone from every payload in the package, which was the issue's own
+  acceptance criterion ("grep for the literal; there should be no remaining hardcoded occurrence"),
+  and that grep is now two tests in
+  [test_request_headers.py](tests/unit/test_request_headers.py) rather than a habit: no hardcoded
+  `TimeZoneDefinition` id anywhere, and no `TimeZoneContext` constructed outside
+  `mailbox_timezone.py`. The second is the one that catches the *next* module to grow a private
+  copy.
+
+  The issue predicted its own biggest finding — "anything that was silently compensating for UTC+3
+  will change behaviour" — and understated it. The user-visible symptom it was filed about was task
+  reminders landing 3h off. The larger one was **`create_meeting`/`update_meeting` storing meetings
+  1-2 hours early** (seasonally, on a W. Europe mailbox), because `Start`/`End` are written
+  unqualified and the hardcoded context decided the instant. Row 202 read `OK` throughout, for the
+  reason that recurs all through this file: the smoke test sent `start_time: "14:00"` and never
+  read the time back. It does now.
+
+  The structural half is worth keeping in mind for the next codebase-wide literal: two of the nine
+  call sites were **module-level constants**, which no per-call value can reach. That, not the
+  count, is what made this a codebase-wide change — hence one builder
+  (`OWAClient.request_header`) rather than nine edits.
+
+  **Still open:** none of it is verified live. These are write paths, so checking them means
+  creating real meetings and reminders; rows 202/203/1003/1004 are `Pending` and name the exact
+  check (14:00 must read back as 14:00, 09:30 must fire at 09:30 in the mailbox's zone).
 
 - **~~`OWAClient.user_email` is never assigned~~ — fixed 2026-09-16 by making the address
   discoverable (`exchange_mcp/mailbox_identity.py`), not by deleting the reads.** Found while

@@ -742,6 +742,47 @@ def resolve_mailbox_timezone(
     )
 
 
+# ------------------------------------------------------------------
+# The request header every builder in the package goes through
+# ------------------------------------------------------------------
+
+def request_header(server_version: str, tz: MailboxTimezone | None) -> dict:
+    """The `JsonRequestHeaders` block for an OWA request.
+
+    One builder, because a hand-written `TimeZoneContext` is precisely how one
+    wrong literal came to live in nine places: `"Russian Standard Time"` (UTC+3)
+    was copied into five modules, and the copies in `tasks.py` and `folders.py`
+    were *module-level constants*, so nothing short of editing each file could
+    have made them follow the mailbox. Issue #8. Now the zone has one source and
+    a module that wants a header has to ask for one.
+
+    `tz=None` omits the `TimeZoneContext` entirely, and that is a real
+    requirement rather than a convenience: **the task reads depend on its
+    absence.** `DueDate`/`StartDate` are stored as UTC midnight and written
+    `Z`-qualified, so a read carrying a `TimeZoneContext` would have Exchange
+    convert them into the mailbox's zone and hand back the previous day for any
+    mailbox west of UTC — the classic off-by-one-day task date, reintroduced by
+    an apparently tidying change. See `tools/tasks.py`'s `_READ_HEADER`.
+
+    Returns a fresh dict each call. The constants this replaces were shared
+    mutable objects that every request handed to the transport, so a builder
+    that mutated its header would have leaked into the next call.
+    """
+    header: dict[str, Any] = {
+        "__type": "JsonRequestHeaders:#Exchange",
+        "RequestServerVersion": server_version,
+    }
+    if tz is not None:
+        header["TimeZoneContext"] = {
+            "__type": "TimeZoneContext:#Exchange",
+            "TimeZoneDefinition": {
+                "__type": "TimeZoneDefinitionType:#Exchange",
+                "Id": tz.wire_id,
+            },
+        }
+    return header
+
+
 # The floor, exposed so a caller with no client at all (a unit test, an
 # offline code path) has the same object shape to work with.
 UTC_TIMEZONE = MailboxTimezone(source=SOURCE_UTC, windows_id="UTC", iana_id="UTC")

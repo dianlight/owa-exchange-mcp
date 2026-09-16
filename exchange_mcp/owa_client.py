@@ -25,6 +25,7 @@ from exchange_mcp.browser_session import (  # noqa: F401
 from exchange_mcp.mailbox_timezone import (
     MailboxTimezone,
     parse_mailbox_timezone_id,
+    request_header as _build_request_header,
     resolve_mailbox_timezone,
 )
 
@@ -875,6 +876,24 @@ class OWAClient:
     # ------------------------------------------------------------------
     # Mailbox timezone (probed once per process)
     # ------------------------------------------------------------------
+
+    def request_header(self, server_version: str, *, with_timezone: bool = True) -> dict:
+        """The `JsonRequestHeaders` block for a request, carrying the mailbox's zone.
+
+        Every request builder in this package should come through here rather
+        than writing its own `TimeZoneContext` — that is what let one wrong zone
+        live in nine copies, two of them module-level constants no per-call
+        value could reach (issue #8).
+
+        `with_timezone=False` omits the context, which the task *reads* require:
+        their UTC-midnight dates must not be converted or they come back a day
+        off. See `mailbox_timezone.request_header`, which explains that trap in
+        full, and note that resolving the zone costs nothing extra — it is the
+        cached probe `resolve_own_mailbox` already paid for.
+        """
+        return _build_request_header(
+            server_version, self.mailbox_timezone() if with_timezone else None
+        )
 
     def mailbox_timezone(self, *, refresh: bool = False) -> MailboxTimezone:
         """The mailbox's timezone -- the frame every wall-clock number means.

@@ -65,7 +65,51 @@ async def main() -> bool:
                    err or f"unexpected shape: {create_info}")
             return False
         organizer_item_id = create_info["item_id"]
-        record("create_meeting", create_args, "OK", f"item_id={organizer_item_id}")
+
+        # Read the meeting back and compare the *time*, which this suite never
+        # did. That omission is why `create_meeting` sat at OK while it was
+        # storing meetings 1-2 hours early: the write sends Start/End as an
+        # unqualified wall clock, so whatever TimeZoneContext goes with it decides
+        # the instant, and that context was a hardcoded UTC+3 (issue #8, fixed
+        # 2026-09-16). Asking for 14:00 in a W. Europe mailbox produced 13:00 in
+        # summer and 12:00 in winter -- a meeting that plainly existed, at a
+        # plausible-looking hour, so every check short of comparing the number
+        # passed.
+        #
+        # Compared in UTC rather than against "14:00": get_calendar_events returns
+        # Z-suffixed instants, and re-deriving the expected local wall clock here
+        # would mean this test carrying its own copy of the timezone logic it is
+        # supposed to be checking. The mailbox's offset comes from the tool that
+        # reports it.
+        tz_probe = await call(s, "find_free_time", start_date=MEETING_DATE)
+        offset = (tz_probe or {}).get("timezone", {}).get("utc_offset", "")
+        events = await call(s, "get_calendar_events", start_date=MEETING_DATE,
+                            end_date=MEETING_DATE, include_body=False)
+        actual_start = ""
+        if isinstance(events, list):
+            for ev in events:
+                if TAG in ev.get("subject", ""):
+                    actual_start = ev.get("start", "")
+                    break
+
+        note = f"item_id={organizer_item_id}"
+        if not actual_start:
+            note += "; WARNING could not read the meeting back to check its time"
+        elif offset and len(offset) == 6:
+            sign, hh, mm = offset[0], int(offset[1:3]), int(offset[4:6])
+            delta = (hh * 60 + mm) * (1 if sign == "+" else -1)
+            asked = 14 * 60
+            got_utc_hhmm = actual_start[11:16]
+            got_local = (int(got_utc_hhmm[:2]) * 60 + int(got_utc_hhmm[3:5]) + delta) % (24 * 60)
+            verdict = "matches" if got_local == asked else "MISMATCH"
+            note += (f"; asked 14:00, stored {got_utc_hhmm}Z, mailbox offset {offset} "
+                     f"-> {got_local // 60:02d}:{got_local % 60:02d} local ({verdict})")
+            if got_local != asked:
+                record("create_meeting", create_args, "TOOL_ERROR", note)
+                return False
+        else:
+            note += f"; stored {actual_start} (no mailbox offset available to check it against)"
+        record("create_meeting", create_args, "OK", note)
 
         # 2. get_event_links
         links_args = {"item_id": organizer_item_id}

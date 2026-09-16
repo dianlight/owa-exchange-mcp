@@ -11,17 +11,18 @@ from exchange_mcp.server import mcp, AppContext
 from exchange_mcp.owa_client import AuthenticationRequiredError, OWAClient
 
 
-_HEADER_TZ = {
-    "__type": "JsonRequestHeaders:#Exchange",
-    "RequestServerVersion": "Exchange2013",
-    "TimeZoneContext": {
-        "__type": "TimeZoneContext:#Exchange",
-        "TimeZoneDefinition": {
-            "__type": "TimeZoneDefinitionType:#Exchange",
-            "Id": "Russian Standard Time",
-        },
-    },
-}
+def _header(client: OWAClient) -> dict:
+    """The folder-action request header, carrying the mailbox's own timezone.
+
+    Was a module-level constant with a hardcoded `Russian Standard Time`
+    (issue #8). Folder actions carry no timestamps, so the zone never actually
+    mattered *here* -- but a module-level constant is exactly how one wrong
+    literal reached five modules, and a copy no per-call value can reach is the
+    part that made #8 a codebase-wide change rather than a one-line fix. So this
+    goes through the same builder as everything else instead of keeping a
+    private copy that happens to be harmless.
+    """
+    return client.request_header("Exchange2013")
 
 
 def _get_client(ctx: Context) -> OWAClient:
@@ -207,7 +208,7 @@ def create_folder(
 
     payload = {
         "__type": "CreateFolderJsonRequest:#Exchange",
-        "Header": _HEADER_TZ,
+        "Header": _header(client),
         "Body": {
             "__type": "CreateFolderRequest:#Exchange",
             "ParentFolderId": {
@@ -265,7 +266,7 @@ def rename_folder(
 
     payload = {
         "__type": "UpdateFolderJsonRequest:#Exchange",
-        "Header": _HEADER_TZ,
+        "Header": _header(client),
         "Body": {
             "__type": "UpdateFolderRequest:#Exchange",
             "FolderChanges": [
@@ -334,7 +335,7 @@ def empty_folder(
 
     payload = {
         "__type": "EmptyFolderJsonRequest:#Exchange",
-        "Header": _HEADER_TZ,
+        "Header": _header(client),
         "Body": {
             "__type": "EmptyFolderRequest:#Exchange",
             "FolderIds": [
@@ -380,7 +381,7 @@ def delete_folder(
 
     payload = {
         "__type": "DeleteFolderJsonRequest:#Exchange",
-        "Header": _HEADER_TZ,
+        "Header": _header(client),
         "Body": {
             "__type": "DeleteFolderRequest:#Exchange",
             "FolderIds": [
@@ -423,7 +424,7 @@ def move_folder(
 
     payload = {
         "__type": "MoveFolderJsonRequest:#Exchange",
-        "Header": _HEADER_TZ,
+        "Header": _header(client),
         "Body": {
             "__type": "MoveFolderRequest:#Exchange",
             "FolderIds": [
