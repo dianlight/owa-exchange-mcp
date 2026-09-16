@@ -1388,6 +1388,20 @@ def cancel_meeting(
 # Tool 5: respond_to_meeting
 # ------------------------------------------------------------------
 
+# The three meeting responses OWA accepts, each carrying *both* facts a
+# response needs: the EWS item type to POST, and how to say it in the
+# human-readable message. One row per verb on purpose — the message used to be
+# built as f"Meeting {response.lower()}ed", which reads correctly for
+# Accept/Decline and produced "tentativeed" for Tentative (issue #13). A
+# separate past-tense table would have fixed that one word while leaving the
+# next verb free to be added to the wire mapping and forgotten in the wording;
+# keeping them in one tuple makes that drift impossible rather than unlikely.
+_MEETING_RESPONSES = {
+    "Accept": ("AcceptItem:#Exchange", "accepted"),
+    "Decline": ("DeclineItem:#Exchange", "declined"),
+    "Tentative": ("TentativelyAcceptItem:#Exchange", "marked tentative"),
+}
+
 
 @mcp.tool()
 def respond_to_meeting(
@@ -1408,18 +1422,13 @@ def respond_to_meeting(
     """
     client = _get_client(ctx)
 
-    # Map response to the correct __type
-    response_types = {
-        "Accept": "AcceptItem:#Exchange",
-        "Decline": "DeclineItem:#Exchange",
-        "Tentative": "TentativelyAcceptItem:#Exchange",
-    }
-
-    response_type = response_types.get(response)
-    if not response_type:
+    # Map response to the correct __type and its past-tense wording
+    mapped = _MEETING_RESPONSES.get(response)
+    if not mapped:
         return json.dumps({
             "error": f"Invalid response: {response}. Must be Accept, Decline, or Tentative."
         })
+    response_type, past_tense = mapped
 
     response_item = {
         "__type": response_type,
@@ -1458,7 +1467,7 @@ def respond_to_meeting(
             return json.dumps({
                 "success": True,
                 "response": response,
-                "message": f"Meeting {response.lower()}ed",
+                "message": f"Meeting {past_tense}",
             })
         else:
             return json.dumps({

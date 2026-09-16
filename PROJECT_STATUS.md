@@ -1349,7 +1349,7 @@ stringifies to nothing and printed `startup failed: .`
 | 202 | `create_meeting` | Create a meeting with attendees, location, reminder, sensitivity | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
 | 203 | `update_meeting` | Update a meeting (implemented as cancel + recreate — OWA JSON API has no reliable `UpdateItem` for calendar items) | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
 | 204 | `cancel_meeting` | Cancel a meeting and notify attendees (soft-delete only — moves to Deleted Items, no permanent-delete option) | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
-| 205 | `respond_to_meeting` | Accept / decline / tentatively accept a meeting invite | None — self-invite produces no meeting-request email to respond to (confirmed 2026-09-08; Exchange doesn't ask an organizer to accept their own invite), so this can't be covered by a self-contained automated test | OK (2026-09-08, manual) — verified against a real incoming Google Calendar invite from a different account (Tentative response sent successfully) | Stable |
+| 205 | `respond_to_meeting` | Accept / decline / tentatively accept a meeting invite | `tests/unit/test_meeting_response.py` covers the `_MEETING_RESPONSES` table (both the EWS `__type` per verb and the message wording). The *live* RSVP path is still uncovered and can't be: a self-invite produces no meeting-request email to respond to (confirmed 2026-09-08; Exchange doesn't ask an organizer to accept their own invite), so no self-contained automated test can reach it | OK (2026-09-08, manual) — verified against a real incoming Google Calendar invite from a different account (Tentative response sent successfully). Wire path unchanged since; the Tentative *message* wording changed 2026-09-15 (#13) and is unit-covered | Stable |
 | 206 | `download_event_attachments` | Download file attachments from a calendar event | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
 | 207 | `get_event_links` | Extract hyperlinks from an event's HTML description | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
 | 208 | `assign_event_categories` | Add one or more categories to events, keeping any already present | `tests/smoke/tests/test_calendar_category_tagging.py` | OK (2026-09-14, re-verified) — full round-trip on a real event against this tenant (tag → visible in `get_calendar_events` list mode → removed → original tags intact), so calendar tagging needs no Outlook COM fallback; attendees are never notified. Originally fixed by switching `_set_event_categories` to the bespoke `UpdateCalendarEvent` action captured from OWA's own web client; see "Update 2026-09-08 (continued) — fixed the category write-path" below. | Stable |
@@ -1938,9 +1938,16 @@ hold a request open for.
   has met a real recurring task — the smoke test builds a single, non-recurring one, and
   `create_task` deliberately exposes no `recurrence` argument, so the module can't create one
   to test with either.
-- **Cosmetic message bug in `respond_to_meeting`.** Its success message is built as
-  `f"Meeting {response.lower()}ed"` ([calendar.py:1106](exchange_mcp/tools/calendar.py:1106)),
-  which reads fine for "Accept"/"Decline" ("accepted"/"declined") but produces
-  "tentativeed" for a Tentative response. Purely cosmetic — `success`/`response` fields
-  are correct — but worth a one-line fix (e.g. an explicit map) next time that function is
-  touched.
+- ~~**Cosmetic message bug in `respond_to_meeting`.** Its success message is built as
+  `f"Meeting {response.lower()}ed"`, which reads fine for "Accept"/"Decline"
+  ("accepted"/"declined") but produces "tentativeed" for a Tentative response.~~
+  **Closed 2026-09-15** (issue #13) — the wire mapping and the wording are now one table,
+  `_MEETING_RESPONSES` ([calendar.py](exchange_mcp/tools/calendar.py)), with one row per verb
+  carrying both the EWS item type and the past-tense phrase ("marked tentative"). Deliberately
+  *not* the separate past-tense map the issue proposed: two parallel dicts are what would let
+  the next response verb be added to the wire mapping and forgotten in the wording, which is
+  the bug class rather than the one word. Pinned by
+  [test_meeting_response.py](tests/unit/test_meeting_response.py) — which asserts the three
+  `__type` spellings literally, since a transposition there sends a *different RSVP than the
+  user asked for* and still reports `{"success": true}`, a far worse failure than the wording
+  bug that prompted the change.
