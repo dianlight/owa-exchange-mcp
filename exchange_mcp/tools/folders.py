@@ -11,17 +11,16 @@ from exchange_mcp.server import mcp, AppContext
 from exchange_mcp.owa_client import AuthenticationRequiredError, OWAClient
 
 
-_HEADER_TZ = {
-    "__type": "JsonRequestHeaders:#Exchange",
-    "RequestServerVersion": "Exchange2013",
-    "TimeZoneContext": {
-        "__type": "TimeZoneContext:#Exchange",
-        "TimeZoneDefinition": {
-            "__type": "TimeZoneDefinitionType:#Exchange",
-            "Id": "Russian Standard Time",
-        },
-    },
-}
+def _header_tz(client: OWAClient) -> dict:
+    """The folder-action request header, carrying the mailbox's own timezone.
+
+    Was a module-level constant with a hardcoded `Russian Standard Time`
+    (issue #8). Folder actions carry no timestamps, so the zone never
+    mattered here -- but a constant is exactly how one wrong literal ended
+    up in nine places, so this goes through the same builder as every other
+    request rather than keeping a private copy that happens to be harmless.
+    """
+    return client.request_header("Exchange2013")
 
 
 def _get_client(ctx: Context) -> OWAClient:
@@ -46,6 +45,15 @@ def check_session(ctx: Context = None) -> str:
     all, only Folders, so authentication there is inferred from ResponseClass
     and mailbox/unread are simply omitted.
 
+    On success it also reports `timezone` / `timezone_source` -- the zone
+    every write in this server sends. That is here because the *previous*
+    behaviour (a hardcoded UTC+3, issue #8) was undiagnosable from the
+    outside: a reminder came back three hours off with nothing in any
+    response saying which zone had been applied. `timezone_source` is
+    "env" (EXCHANGE_TIMEZONE), "mailbox" (read from OWA's own
+    configuration) or "fallback" (neither answered - the zone is UTC and
+    `timezone_detail` says why).
+
     Returns:
         JSON object with authenticated (bool), mailbox name, and details.
     """
@@ -54,6 +62,10 @@ def check_session(ctx: Context = None) -> str:
     payload = {
         "__type": "FindFolderJsonRequest:#Exchange",
         "Header": {
+            # Deliberately not client.request_header(): resolving the mailbox
+            # timezone issues its own request, and the tool whose job is
+            # "can we talk to OWA at all" must not depend on a second call
+            # succeeding first.
             "__type": "JsonRequestHeaders:#Exchange",
             "RequestServerVersion": "Exchange2013",
         },
@@ -105,6 +117,13 @@ def check_session(ctx: Context = None) -> str:
         if parent_folder:
             result["mailbox"] = parent_folder.get("DisplayName", "")
             result["unread"] = parent_folder.get("UnreadCount", 0)
+        # Only after authentication is confirmed: the lookup needs a live
+        # session, and it can never turn a successful check into a failure.
+        tz = client.mailbox_timezone_detail()
+        result["timezone"] = tz.timezone_id
+        result["timezone_source"] = tz.source
+        if tz.detail:
+            result["timezone_detail"] = tz.detail
         return json.dumps(result)
 
     return json.dumps({
@@ -207,7 +226,7 @@ def create_folder(
 
     payload = {
         "__type": "CreateFolderJsonRequest:#Exchange",
-        "Header": _HEADER_TZ,
+        "Header": _header_tz(client),
         "Body": {
             "__type": "CreateFolderRequest:#Exchange",
             "ParentFolderId": {
@@ -265,7 +284,7 @@ def rename_folder(
 
     payload = {
         "__type": "UpdateFolderJsonRequest:#Exchange",
-        "Header": _HEADER_TZ,
+        "Header": _header_tz(client),
         "Body": {
             "__type": "UpdateFolderRequest:#Exchange",
             "FolderChanges": [
@@ -334,7 +353,7 @@ def empty_folder(
 
     payload = {
         "__type": "EmptyFolderJsonRequest:#Exchange",
-        "Header": _HEADER_TZ,
+        "Header": _header_tz(client),
         "Body": {
             "__type": "EmptyFolderRequest:#Exchange",
             "FolderIds": [
@@ -380,7 +399,7 @@ def delete_folder(
 
     payload = {
         "__type": "DeleteFolderJsonRequest:#Exchange",
-        "Header": _HEADER_TZ,
+        "Header": _header_tz(client),
         "Body": {
             "__type": "DeleteFolderRequest:#Exchange",
             "FolderIds": [
@@ -423,7 +442,7 @@ def move_folder(
 
     payload = {
         "__type": "MoveFolderJsonRequest:#Exchange",
-        "Header": _HEADER_TZ,
+        "Header": _header_tz(client),
         "Body": {
             "__type": "MoveFolderRequest:#Exchange",
             "FolderIds": [

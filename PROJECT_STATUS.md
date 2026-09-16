@@ -597,7 +597,9 @@ now fixed or documented in code:
 Reminders carry the codebase-wide hardcoded-timezone quirk into user-visible territory: written
 in `Russian Standard Time` (UTC+3) and read back in UTC, so an 09:30 reminder reads as `06:30`
 and fires at 09:30 Moscow time — right for a UTC+3 mailbox, three hours early elsewhere. Logged
-in §4; it's a codebase-wide fix, not a Task-module one.
+in §4; it's a codebase-wide fix, not a Task-module one. **Fixed 2026-09-16 (issue #8)** — the
+zone is now the mailbox's own, resolved once per process; see the §4 entry for what changed and
+what live re-verification is still owed.
 
 Both tests are self-cleaning (every task is `permanent`-deleted, including on failure paths).
 The one leftover from the first, failed run was found and purged: the mailbox's Tasks and
@@ -1515,14 +1517,14 @@ Two things this fix depends on, one of them an ordinary dependency and one a cav
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
 | 201 | `get_calendar_events` | List events in a date range, including each event's `categories` — populated in list mode (`include_body=False`) from the list request itself, not a per-item detail call. By default a recurring series appears once, as its master item; `expand_recurrences=True` additionally synthesizes one entry per occurrence client-side (marked `is_synthesized_occurrence`, empty `item_id` — see §4) | `tests/smoke/tests/test_get_calendar_events.py`, `tests/smoke/tests/test_calendar_event_detail.py`, `tests/smoke/tests/test_recurrence_expansion.py`, `tests/unit/test_recurrence_expansion.py` | OK (2026-09-14, re-verified) — `categories` confirmed populated in **list mode** (`include_body=False`, straight from the single `CalendarView` request, no per-item detail call), so a bulk tagging pass needs no COM fallback; previously verified round-tripping a real tag; `expand_recurrences` verified live (46 synthesized occurrences over 14 days, all in-window, all `item_id`-less, no duplicated masters, correct time-of-day) and all 127 recurring series in this mailbox expand, relative patterns included; also re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change | Stable |
-| 202 | `create_meeting` | Create a meeting with attendees, location, reminder, sensitivity | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
-| 203 | `update_meeting` | Update a meeting (implemented as cancel + recreate — OWA JSON API has no reliable `UpdateItem` for calendar items) | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
+| 202 | `create_meeting` | Create a meeting with attendees, location, reminder, sensitivity | `tests/smoke/tests/test_calendar_lifecycle.py` | Pending (2026-09-16, issue #8: `TimeZoneContext` now carries the mailbox's own timezone instead of a hardcoded `Russian Standard Time`/UTC+3, so the times this tool sends changed — needs a live re-check) — previously OK (2026-09-08) | Stable |
+| 203 | `update_meeting` | Update a meeting (implemented as cancel + recreate — OWA JSON API has no reliable `UpdateItem` for calendar items) | `tests/smoke/tests/test_calendar_lifecycle.py` | Pending (2026-09-16, issue #8: `TimeZoneContext` now carries the mailbox's own timezone instead of a hardcoded `Russian Standard Time`/UTC+3, so the times this tool sends changed — needs a live re-check) — previously OK (2026-09-08) | Stable |
 | 204 | `cancel_meeting` | Cancel a meeting and notify attendees (soft-delete only — moves to Deleted Items, no permanent-delete option) | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
 | 205 | `respond_to_meeting` | Accept / decline / tentatively accept a meeting invite | `tests/unit/test_meeting_response.py` covers the `_MEETING_RESPONSES` table (both the EWS `__type` per verb and the message wording). The *live* RSVP path is still uncovered and can't be: a self-invite produces no meeting-request email to respond to (confirmed 2026-09-08; Exchange doesn't ask an organizer to accept their own invite), so no self-contained automated test can reach it | OK (2026-09-08, manual) — verified against a real incoming Google Calendar invite from a different account (Tentative response sent successfully). Wire path unchanged since; the Tentative *message* wording changed 2026-09-15 (#13) and is unit-covered | Stable |
 | 206 | `download_event_attachments` | Download file attachments from a calendar event | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
 | 207 | `get_event_links` | Extract hyperlinks from an event's HTML description | `tests/smoke/tests/test_calendar_lifecycle.py` | OK (2026-09-08) | Stable |
-| 208 | `assign_event_categories` | Add one or more categories to events, keeping any already present | `tests/smoke/tests/test_calendar_category_tagging.py` | OK (2026-09-14, re-verified) — full round-trip on a real event against this tenant (tag → visible in `get_calendar_events` list mode → removed → original tags intact), so calendar tagging needs no Outlook COM fallback; attendees are never notified. Originally fixed by switching `_set_event_categories` to the bespoke `UpdateCalendarEvent` action captured from OWA's own web client; see "Update 2026-09-08 (continued) — fixed the category write-path" below. | Stable |
-| 209 | `remove_event_categories` | Remove one or more categories from events, keeping any others present | `tests/smoke/tests/test_calendar_category_tagging.py` | OK (2026-09-14, re-verified) — untag verified live in the same round-trip as `assign_event_categories`; same fix as `assign_event_categories` above (shares `_set_event_categories`). | Stable |
+| 208 | `assign_event_categories` | Add one or more categories to events, keeping any already present | `tests/smoke/tests/test_calendar_category_tagging.py` | Pending (2026-09-16, issue #8: `TimeZoneContext` now carries the mailbox's own timezone instead of a hardcoded `Russian Standard Time`/UTC+3, so the times this tool sends changed — needs a live re-check) — previously OK (2026-09-14, re-verified) — full round-trip on a real event against this tenant (tag → visible in `get_calendar_events` list mode → removed → original tags intact), so calendar tagging needs no Outlook COM fallback; attendees are never notified. Originally fixed by switching `_set_event_categories` to the bespoke `UpdateCalendarEvent` action captured from OWA's own web client; see "Update 2026-09-08 (continued) — fixed the category write-path" below. | Stable |
+| 209 | `remove_event_categories` | Remove one or more categories from events, keeping any others present | `tests/smoke/tests/test_calendar_category_tagging.py` | Pending (2026-09-16, issue #8: `TimeZoneContext` now carries the mailbox's own timezone instead of a hardcoded `Russian Standard Time`/UTC+3, so the times this tool sends changed — needs a live re-check) — previously OK (2026-09-14, re-verified) — untag verified live in the same round-trip as `assign_event_categories`; same fix as `assign_event_categories` above (shares `_set_event_categories`). | Stable |
 | 210 | `find_events_by_category` | Find events tagged with a given category within a date range | `tests/smoke/tests/test_calendar_category_tagging.py` | OK (2026-09-08, re-verified) — pure `FindItem`+`CalendarView` read, unaffected by the write-path bug above; its date-range filtering had the same silent no-op bug as `get_calendar_events` (see below) and is now fixed by the same client-side filter. | Stable |
 | 211 | `get_calendar_event` | Get full details for a single calendar event by ItemId (subject, start/end, location, body, organizer, attendees, categories, change_key, recurrence) | `tests/smoke/tests/test_calendar_event_detail.py` | OK (2026-09-10) — verified against a disposable tagged event: subject/start/end/categories/change_key all returned, assigned category round-tripped, bogus item_id rejected cleanly | Stable |
 
@@ -1545,7 +1547,7 @@ Two things this fix depends on, one of them an ordinary dependency and one a cav
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 501 | `check_session` | Lightweight auth check (`FindFolder` on inbox) — reports mailbox name + unread count when the backend's response includes them (omitted on the modern OAuth/Bearer backend, which never returns `ParentFolder`). An unauthenticated profile now comes back as `authorization_required` + `reason` + `remediation` rather than a generic error string, pointing the caller at the `login` tool (see the 2026-09-10 update below) | `tests/smoke/tests/test_check_session.py`, `tests/smoke/tests/test_mcp_session_lifecycle.py` (transport-session reuse / dead-session-id 404, issue #18) | OK (2026-09-07) for the authenticated/generic-error paths, re-confirmed live 2026-09-14 while triaging issue #18 (whose "Session not found" is the MCP transport's 404, not this tool — see the 2026-09-14 update above); the new `authorization_required` branch is `Pending`; re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change | Stable |
+| 501 | `check_session` | Lightweight auth check (`FindFolder` on inbox) — reports mailbox name + unread count when the backend's response includes them (omitted on the modern OAuth/Bearer backend, which never returns `ParentFolder`). An unauthenticated profile now comes back as `authorization_required` + `reason` + `remediation` rather than a generic error string, pointing the caller at the `login` tool (see the 2026-09-10 update below). Also reports `timezone` / `timezone_source` / `timezone_detail` — the zone every write goes out in and how it was decided (`env` / `mailbox` / `fallback`), which is what makes issue #8's class of bug diagnosable from the outside at all | `tests/smoke/tests/test_check_session.py`, `tests/smoke/tests/test_mcp_session_lifecycle.py` (transport-session reuse / dead-session-id 404, issue #18), `tests/unit/test_mailbox_timezone.py` (the resolution it reports) | OK (2026-09-16, re-verified live for issue #8) — the new `timezone` / `timezone_source` fields report `W. Europe Standard Time` / `mailbox` on this tenant, confirming the configuration probe answers here rather than falling back to UTC; previously OK (2026-09-07) for the authenticated/generic-error paths, re-confirmed live 2026-09-14 while triaging issue #18 (whose "Session not found" is the MCP transport's 404, not this tool — see the 2026-09-14 update above); the new `authorization_required` branch is `Pending`; re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change | Stable |
 | 502 | `get_folders` | List mail folders (shallow or recursive) with counts. Pages through the whole listing rather than returning one 200-entry request, which silently truncated large mailboxes | `tests/smoke/tests/test_get_folders.py`, `tests/unit/test_folder_resolution.py`, `tests/unit/test_folder_id_dict.py` | OK (2026-09-14, re-verified) — paging added; see "Update 2026-09-14 — move_email couldn't reach a custom folder" above; also re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change | Stable |
 | 503 | `create_folder` | Create a new folder — mail folder by default, or any Exchange folder class via `folder_class` (`IPF.Task` under `parent_folder_id="tasks"` makes a **Microsoft To Do list**). Echoes the class the server actually stored, because an unrecognised prefix is silently downgraded to `IPF.Note` rather than rejected | `tests/smoke/tests/test_folder_lifecycle.py` (default `IPF.Note` path), `tests/smoke/tests/test_task_folder_targeting.py` (`IPF.Task` To Do list), `tests/unit/test_folder_id_dict.py` | OK (2026-09-14) — `folder_class` added and re-verified live on both paths: the mail-folder default is unchanged (folder-lifecycle test still green) and `folder_class="IPF.Task"` under the `tasks` root produces a real To Do list that the task tools can address by name, by path and by raw ID. Both `IPF.Task` and `IPF.Task.Todo` are accepted and stored verbatim — the latter only because folder classes are *prefixes* (EWS treats `IPF.Task.*` as a task folder), so the plain `IPF.Task` is what the docstring recommends | Stable |
 | 504 | `rename_folder` | Rename an existing folder | `tests/smoke/tests/test_folder_lifecycle.py` | OK (2026-09-08) | Stable |
@@ -1557,15 +1559,15 @@ Two things this fix depends on, one of them an ordinary dependency and one a cav
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 601 | `find_free_time` | Find free slots in your own calendar within working hours, on the mailbox's own clock — free/busy (recurrence-expanding) when this mailbox's own address resolves, otherwise a calendar-folder scan; the response names both the source (`busy_source`) and the timezone it used | `tests/unit/test_availability_frame.py`, `tests/unit/test_mailbox_identity.py`, `tests/smoke/tests/test_find_free_time.py` | OK (2026-09-16, verified live post-merge on both of its data sources) — two independent 2026-09-16 changes landed here (timezone frame + own-address discovery) and the combination was run on an isolated server/profile afterwards. Busy periods are converted from UTC to the mailbox's wall clock before being compared with `start_hour`/`end_hour`, and the slots reproduce a known day's real gaps exactly on **both** branches: the `FindItem` calendar scan (`09:00-09:30, 11:30-12:00, 13:00-14:00, 15:00-16:00, 16:30-18:00` against single meetings only) and the free/busy path (`11:30-12:00, 15:00-16:00, 17:00-18:00` once recurring occurrences are counted, which is byte-identical to what #602's independent `availabilityView` surface reports for the same day — two different surfaces, one grid). The previous answer offered a slot inside a meeting and a four-hour block covering two more; table in the 2026-09-16 timezone update above. **Two conditions this depended on, both visible in the response:** `timezone.source` must not be `unknown` (on this branch the zone comes from `EXCHANGE_TIMEZONE`, since issue #8's `mailbox_timezone()` is not merged here), and `busy_source` must be `free_busy` — which, on this tenant, requires a bearer token to have been captured *before* the first availability call of the process; see the cold-start entry in §4. Previously OK (2026-09-08), against the skewed grid. | Stable |
-| 602 | `find_meeting_time` | Find common free slots across multiple attendees — tries the modern-backend `GetSchedule` GraphQL operation first, falling back to EWS `GetUserAvailability` only on classic/on-prem OWA | `tests/unit/test_availability_frame.py`, `tests/smoke/tests/test_find_meeting_time.py` | OK (2026-09-16, verified live post-merge) — both this branch's frame fix and main's `userId` payload change ran together on the isolated server; the suite passed and the day checked in detail agreed slot-for-slot with #601's free/busy answer. Verified: the `scheduleItems`/`CalendarEventArray` paths are converted to the mailbox's wall clock while the `availabilityView` path deliberately is **not** — it is already wall-clock in the requested zone, so it is *requested* in the resolved zone instead (`frame.schedule_tz_id`). This tool took that view branch live and its free windows moved exactly one hour (UTC+3 → UTC+2) onto real calendar gaps. It reports more busy time than #601 does, which is coverage rather than skew: the server-side view expands recurring masters that the item-level path doesn't return. Also unit-pinned now: converting the events while still *requesting* UTC+3 makes this tool and #601 disagree with each other, which is worse than the original bug. Not yet verified: `get_schedule` now sends this mailbox's resolved own address as the request's `userId` — the *requesting* user, which the Scheduling Assistant sends its own address for — instead of `emails[0]`, a queried attendee (see §4). The old value was accepted by this tenant, so that is a payload change on a working call rather than a fix, and it is the one thing to watch when re-running the suite; the post-merge run accepted it (the tenant answers a `GetSchedule` carrying the resolved own address as `userId` exactly as it answered one carrying an attendee's). `GetUserAvailability` still returns `{ErrorCode: 500, ExceptionName: NotImplementedException}` on this tenant and is unfixable server-side, but the Scheduling Assistant UI's own `GetSchedule` operation works correctly here (confirmed via live network capture) and returns free/busy data in the same `MergedFreeBusy`-compatible encoding; see "Update 2026-09-09 — found a working replacement for the broken GetUserAvailability path" above. Also fixes `get_meeting_stats`/`get_meeting_contacts` (below), which share the underlying helper. A prior fix (2026-09-08) to the legacy fallback's error path (`FaultMessage`→`ExceptionName` when the former is present-but-`null`) still applies to that branch. | Stable |
+| 601 | `find_free_time` | Find free slots in your own calendar within working hours, on the mailbox's own clock — free/busy (recurrence-expanding) when this mailbox's own address resolves, otherwise a calendar-folder scan; the response names both the source (`busy_source`) and the timezone it used | `tests/unit/test_availability_frame.py`, `tests/unit/test_mailbox_identity.py`, `tests/smoke/tests/test_find_free_time.py` | OK (2026-09-16, verified live post-merge on both of its data sources) — two independent 2026-09-16 changes landed here (timezone frame + own-address discovery) and the combination was run on an isolated server/profile afterwards. Busy periods are converted from UTC to the mailbox's wall clock before being compared with `start_hour`/`end_hour`, and the slots reproduce a known day's real gaps exactly on **both** branches: the `FindItem` calendar scan (`09:00-09:30, 11:30-12:00, 13:00-14:00, 15:00-16:00, 16:30-18:00` against single meetings only) and the free/busy path (`11:30-12:00, 15:00-16:00, 17:00-18:00` once recurring occurrences are counted, which is byte-identical to what #602's independent `availabilityView` surface reports for the same day — two different surfaces, one grid). The previous answer offered a slot inside a meeting and a four-hour block covering two more; table in the 2026-09-16 timezone update above. **Two conditions this depended on, both visible in the response:** `timezone.source` must not be `unknown` (on this branch the zone comes from `EXCHANGE_TIMEZONE`, since issue #8's `mailbox_timezone()` is not merged here), and `busy_source` must be `free_busy` — which, on this tenant, requires a bearer token to have been captured *before* the first availability call of the process; see the cold-start entry in §4. Previously OK (2026-09-08), against the skewed grid. **Post-merge with issue #8 (this PR):** the first of those two conditions no longer needs an operator to arrange it — `OWAClient.mailbox_timezone()` now exists, so `timezone.source` is `mailbox` rather than `env` and the zone resolves without `EXCHANGE_TIMEZONE` being set. Same resolved value on this tenant (`W. Europe Standard Time`), so the verification above still stands; what changes is that it no longer depends on a manual step. | Stable |
+| 602 | `find_meeting_time` | Find common free slots across multiple attendees — tries the modern-backend `GetSchedule` GraphQL operation first, falling back to EWS `GetUserAvailability` only on classic/on-prem OWA | `tests/unit/test_availability_frame.py`, `tests/smoke/tests/test_find_meeting_time.py` | OK (2026-09-16, verified live post-merge) — both this branch's frame fix and main's `userId` payload change ran together on the isolated server; the suite passed and the day checked in detail agreed slot-for-slot with #601's free/busy answer. Verified: the `scheduleItems`/`CalendarEventArray` paths are converted to the mailbox's wall clock while the `availabilityView` path deliberately is **not** — it is already wall-clock in the requested zone, so it is *requested* in the resolved zone instead (`frame.schedule_tz_id`). This tool took that view branch live and its free windows moved exactly one hour (UTC+3 → UTC+2) onto real calendar gaps. It reports more busy time than #601 does, which is coverage rather than skew: the server-side view expands recurring masters that the item-level path doesn't return. Also unit-pinned now: converting the events while still *requesting* UTC+3 makes this tool and #601 disagree with each other, which is worse than the original bug. Not yet verified: `get_schedule` now sends this mailbox's resolved own address as the request's `userId` — the *requesting* user, which the Scheduling Assistant sends its own address for — instead of `emails[0]`, a queried attendee (see §4). The old value was accepted by this tenant, so that is a payload change on a working call rather than a fix, and it is the one thing to watch when re-running the suite; the post-merge run accepted it (the tenant answers a `GetSchedule` carrying the resolved own address as `userId` exactly as it answered one carrying an attendee's). `GetUserAvailability` still returns `{ErrorCode: 500, ExceptionName: NotImplementedException}` on this tenant and is unfixable server-side, but the Scheduling Assistant UI's own `GetSchedule` operation works correctly here (confirmed via live network capture) and returns free/busy data in the same `MergedFreeBusy`-compatible encoding; see "Update 2026-09-09 — found a working replacement for the broken GetUserAvailability path" above. Also fixes `get_meeting_stats`/`get_meeting_contacts` (below), which share the underlying helper. A prior fix (2026-09-08) to the legacy fallback's error path (`FaultMessage`→`ExceptionName` when the former is present-but-`null`) still applies to that branch. **Post-merge with issue #8 (this PR):** the zone this depends on now comes from `OWAClient.mailbox_timezone()` instead of requiring `EXCHANGE_TIMEZONE` to be set by hand (see #601). Same resolved value on this tenant, one fewer precondition. | Stable |
 
 ### Analytics — [exchange_mcp/tools/analytics.py](exchange_mcp/tools/analytics.py) (2)
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
-| 701 | `get_meeting_stats` | Meeting-count statistics for one or more people over a date range | `tests/unit/test_availability_frame.py`, `tests/smoke/tests/test_get_meeting_stats.py` | OK (2026-09-16, live re-run post-merge with the zone resolved) — every count here is per-day (meetings/day, busiest weekday, unique days) and the event date came from a UTC timestamp, so a meeting near either end of the day was attributed to the wrong day and, for a Monday or Friday, the wrong week. Now dated in the mailbox's own zone (see #601 and the 2026-09-16 timezone update above); an unresolvable zone adds a "Day attribution may be off by one" line to the existing `warnings`. The error is bounded by one day rather than by the offset, which is why it read as slightly-off statistics rather than a fault. The same `userId` payload change as #602 reaches `get_schedule` through the shared helper and was covered by the same post-merge run; this tool's own arguments and response shape are unchanged. Previously — used to fail at the `ResolveNames` step (same `NullReferenceException` as `find_person` #401) before ever reaching availability data. `_resolve_to_email()` tries the Substrate Search path first (see #401, above) and falls back to `ResolveNames` only in classic canary-cookie auth mode. Its shared `_get_availability_events()` helper now tries `GetSchedule` first (see #602, above) and only falls back to the still-unimplemented `GetUserAvailability` on classic OWA, so this tool now returns real per-person stats without needing the `warnings` fallback in the common case — `warnings` remains for the classic-OWA/`GetUserAvailability`-failure path. | Stable |
-| 702 | `get_meeting_contacts` | Weighted "who you meet with most" connection matrix from your own calendar; reports the `mailbox` it analysed | `tests/unit/test_availability_frame.py`, `tests/unit/test_mailbox_identity.py`, `tests/smoke/tests/test_get_meeting_contacts.py` | OK (2026-09-16, live re-run post-merge: 173 unique contacts, 10 returned, `mailbox` reported) — **this tool failed on every call from 2026-09-10 to 2026-09-16**, and the `OK` above predates the cause by one day: it guarded on `client.user_email`, whose writers left with the credential store, and returned `"User email not available. Call the login tool first."` — a remediation that could not work, since no `login` path wrote that field any more (see §4). Reproduced live on 2026-09-16 while re-verifying the timezone fix, then fixed by the own-address change: the address is now resolved via `OWAClient.resolve_own_mailbox()` and reported as `mailbox`, and the unresolved case still errors (this tool's *only* data source is own-mailbox free/busy, so there is nothing to degrade to) but names the reason instead of pointing at `login`. It also shares `_get_availability_events()` with #701 and so the same UTC-vs-local day attribution fix; the weighting is per meeting, not per day, so that effect is confined to meetings near a day boundary. `Stability` stays `Stable` and `KNOWN_BUGGY_TOOLS` untouched throughout: that column tracks *unfixable server-side* failures, and this was a fixable client-side one. That warning about the address's provenance did fire on the live run and was correct to: the address resolved as `bearer_claim:upn`, so self-exclusion is comparing against a token claim rather than a confirmed primary SMTP address, and the response says so. Note also that this tool only worked because the process had already made a bearer-mode call — see the cold-start entry in §4. Everything below still applies. — doesn't call `ResolveNames`, so it doesn't hit that bug. Its sole data source (own-mailbox availability via the shared `_get_availability_events()` helper) now tries `GetSchedule` first (see #602, above) and returns real meeting/contact data instead of the empty result `GetUserAvailability` always produced on this tenant. A real bug fixed while diagnosing this originally (2026-09-08): `_get_availability_events()` silently swallowed the `GetUserAvailability` failure (`except Exception: pass`) and never checked for an `ErrorCode` in a successfully-parsed error body either, so both this tool and `get_meeting_stats` were reporting a false-clean empty result instead of a diagnosable one — it now returns `(results, errors)`, and both tools add a `"warnings"` field when `errors` is non-empty (still relevant on classic OWA, where the legacy fallback is the only option). [test_get_meeting_contacts.py](tests/smoke/tests/test_get_meeting_contacts.py)/[test_get_meeting_stats.py](tests/smoke/tests/test_get_meeting_stats.py) include `warnings` in their recorded note when present. | Stable |
+| 701 | `get_meeting_stats` | Meeting-count statistics for one or more people over a date range | `tests/unit/test_availability_frame.py`, `tests/smoke/tests/test_get_meeting_stats.py` | OK (2026-09-16, live re-run post-merge with the zone resolved) — every count here is per-day (meetings/day, busiest weekday, unique days) and the event date came from a UTC timestamp, so a meeting near either end of the day was attributed to the wrong day and, for a Monday or Friday, the wrong week. Now dated in the mailbox's own zone (see #601 and the 2026-09-16 timezone update above); an unresolvable zone adds a "Day attribution may be off by one" line to the existing `warnings`. The error is bounded by one day rather than by the offset, which is why it read as slightly-off statistics rather than a fault. The same `userId` payload change as #602 reaches `get_schedule` through the shared helper and was covered by the same post-merge run; this tool's own arguments and response shape are unchanged. Previously — used to fail at the `ResolveNames` step (same `NullReferenceException` as `find_person` #401) before ever reaching availability data. `_resolve_to_email()` tries the Substrate Search path first (see #401, above) and falls back to `ResolveNames` only in classic canary-cookie auth mode. Its shared `_get_availability_events()` helper now tries `GetSchedule` first (see #602, above) and only falls back to the still-unimplemented `GetUserAvailability` on classic OWA, so this tool now returns real per-person stats without needing the `warnings` fallback in the common case — `warnings` remains for the classic-OWA/`GetUserAvailability`-failure path. **Post-merge with issue #8 (this PR):** the zone this depends on now comes from `OWAClient.mailbox_timezone()` instead of requiring `EXCHANGE_TIMEZONE` to be set by hand (see #601). Same resolved value on this tenant, one fewer precondition. | Stable |
+| 702 | `get_meeting_contacts` | Weighted "who you meet with most" connection matrix from your own calendar; reports the `mailbox` it analysed | `tests/unit/test_availability_frame.py`, `tests/unit/test_mailbox_identity.py`, `tests/smoke/tests/test_get_meeting_contacts.py` | OK (2026-09-16, live re-run post-merge: 173 unique contacts, 10 returned, `mailbox` reported) — **this tool failed on every call from 2026-09-10 to 2026-09-16**, and the `OK` above predates the cause by one day: it guarded on `client.user_email`, whose writers left with the credential store, and returned `"User email not available. Call the login tool first."` — a remediation that could not work, since no `login` path wrote that field any more (see §4). Reproduced live on 2026-09-16 while re-verifying the timezone fix, then fixed by the own-address change: the address is now resolved via `OWAClient.resolve_own_mailbox()` and reported as `mailbox`, and the unresolved case still errors (this tool's *only* data source is own-mailbox free/busy, so there is nothing to degrade to) but names the reason instead of pointing at `login`. It also shares `_get_availability_events()` with #701 and so the same UTC-vs-local day attribution fix; the weighting is per meeting, not per day, so that effect is confined to meetings near a day boundary. `Stability` stays `Stable` and `KNOWN_BUGGY_TOOLS` untouched throughout: that column tracks *unfixable server-side* failures, and this was a fixable client-side one. That warning about the address's provenance did fire on the live run and was correct to: the address resolved as `bearer_claim:upn`, so self-exclusion is comparing against a token claim rather than a confirmed primary SMTP address, and the response says so. Note also that this tool only worked because the process had already made a bearer-mode call — see the cold-start entry in §4. Everything below still applies. — doesn't call `ResolveNames`, so it doesn't hit that bug. Its sole data source (own-mailbox availability via the shared `_get_availability_events()` helper) now tries `GetSchedule` first (see #602, above) and returns real meeting/contact data instead of the empty result `GetUserAvailability` always produced on this tenant. A real bug fixed while diagnosing this originally (2026-09-08): `_get_availability_events()` silently swallowed the `GetUserAvailability` failure (`except Exception: pass`) and never checked for an `ErrorCode` in a successfully-parsed error body either, so both this tool and `get_meeting_stats` were reporting a false-clean empty result instead of a diagnosable one — it now returns `(results, errors)`, and both tools add a `"warnings"` field when `errors` is non-empty (still relevant on classic OWA, where the legacy fallback is the only option). [test_get_meeting_contacts.py](tests/smoke/tests/test_get_meeting_contacts.py)/[test_get_meeting_stats.py](tests/smoke/tests/test_get_meeting_stats.py) include `warnings` in their recorded note when present. **Post-merge with issue #8 (this PR):** the zone this depends on now comes from `OWAClient.mailbox_timezone()` instead of requiring `EXCHANGE_TIMEZONE` to be set by hand (see #601). Same resolved value on this tenant, one fewer precondition. | Stable |
 
 ### Auth — [exchange_mcp/tools/auth.py](exchange_mcp/tools/auth.py) (1)
 
@@ -1608,8 +1610,8 @@ visible to these tools — use `set_email_flag` (#115).
 |---|---|---|---|---|---|
 | 1001 | `get_tasks` | List tasks from a To Do list / task folder, due-date ascending with undated last; filters completed client-side (`include_completed`), skips non-`Task` items (a mail folder would otherwise yield subject-only pseudo-tasks — reported as `skipped_non_task_items`), optional per-task body with per-item `body_error` degradation, reports `scanned` so "no matches" is distinguishable from the 500-item scan ceiling | `tests/smoke/tests/test_task_lifecycle.py`, `tests/smoke/tests/test_task_folder_targeting.py`, `tests/unit/test_folder_id_dict.py` | OK (2026-09-14) — 14 tasks listed from the default list, completed-filter verified both ways; non-task filter verified by pointing it at `deleteditems` (500 scanned, 499 skipped, the 1 real task found). **`task_folder` resolution is now covered too** (2026-09-14): all three non-default spellings — bare list name, `tasks/<list>` path, raw opaque folder ID — plus the negative "a child-list task must not show up in the default list" case, against a To Do list the test creates for itself now that #503 can make one | Stable |
 | 1002 | `get_task` | Get one task's full detail (status, dates, reminder, importance, categories, owner, body, change_key) | `tests/smoke/tests/test_task_lifecycle.py` | OK (2026-09-11) — subject, UTC-midnight due date, status, body, categories, importance and reminder all verified round-tripping. `PercentComplete` arrives as a *string* (`"100"`) from this backend and is coerced to int | Stable |
-| 1003 | `create_task` | Create a task with due/start dates, note body, status, importance, categories and reminder, in any To Do list | `tests/smoke/tests/test_task_lifecycle.py`, `tests/smoke/tests/test_task_folder_targeting.py`, `tests/unit/test_folder_id_dict.py` | OK (2026-09-14) — created in the default list with every optional field set, and (2026-09-14) into a named child To Do list addressed by bare name, which is the `task_folder` path that used to be untestable (see #1001) | Stable |
-| 1004 | `update_task` | Partial update — only the arguments passed are written; `clear_due_date`/`clear_start_date`/`clear_reminder` erase a field (`DeleteItemField`), and `status`+`percent_complete` together is rejected client-side (Exchange resolves the two against each other by whichever it processes last) | `tests/smoke/tests/test_task_lifecycle.py` | OK (2026-09-11) — subject + due date + `Status` + `clear_reminder` written in one request and verified by re-read, i.e. every `_FIELD` spelling exercised there is confirmed accepted (`item:Subject`, `item:ReminderIsSet`, `task:DueDate`, `task:Status`) | Stable |
+| 1003 | `create_task` | Create a task with due/start dates, note body, status, importance, categories and reminder, in any To Do list. `reminder` is wall-clock in the mailbox's own timezone (issue #8; it used to be UTC+3 whatever the mailbox) | `tests/smoke/tests/test_task_lifecycle.py`, `tests/smoke/tests/test_task_folder_targeting.py`, `tests/unit/test_folder_id_dict.py`, `tests/unit/test_mailbox_timezone.py` (the zone its `reminder` is written in) | OK (2026-09-16, re-verified live for issue #8) — `reminder: "2026-09-19 09:30"` now reads back as `07:30` UTC, i.e. 09:30 in the mailbox's own `W. Europe Standard Time`; the same call previously read back `06:30` (09:30 Moscow). This is the issue's own reproduction case; previously OK (2026-09-14) — created in the default list with every optional field set, and (2026-09-14) into a named child To Do list addressed by bare name, which is the `task_folder` path that used to be untestable (see #1001) | Stable |
+| 1004 | `update_task` | Partial update — only the arguments passed are written; `clear_due_date`/`clear_start_date`/`clear_reminder` erase a field (`DeleteItemField`), and `status`+`percent_complete` together is rejected client-side (Exchange resolves the two against each other by whichever it processes last) | `tests/smoke/tests/test_task_lifecycle.py` | OK (2026-09-16, re-verified live for issue #8) — the `clear_reminder` path re-run in the same green `test_task_lifecycle` pass that confirmed the reminder round-trip on #1003; previously OK (2026-09-11) — subject + due date + `Status` + `clear_reminder` written in one request and verified by re-read, i.e. every `_FIELD` spelling exercised there is confirmed accepted (`item:Subject`, `item:ReminderIsSet`, `task:DueDate`, `task:Status`) | Stable |
 | 1005 | `complete_task` | Mark tasks complete / reopen them, writing `Status` only; returns per-item results including the *new* ItemId Exchange mints when a recurring occurrence is completed | `tests/smoke/tests/test_task_lifecycle.py` | OK (2026-09-11) — `Status=Completed` verified on the item (`is_complete`, `complete_date` = today, `percent_complete` 100 set by the server from `Status` alone) and through both listing filters. The recurring-task ID-split path is untested (no recurring task to hand) | Stable |
 | 1006 | `delete_task` | Delete tasks (soft to Deleted Items, or `permanent` HardDelete), `AffectedTaskOccurrences: AllOccurrences` | `tests/smoke/tests/test_task_lifecycle.py`, `tests/smoke/tests/test_task_folder_targeting.py` | OK (2026-09-11) — verified by absence from the folder listing. A deleted task's **ItemId stays resolvable**, so `get_task` keeps returning the item afterwards with a bumped ChangeKey; the first test run failed on exactly that wrong post-condition before the tool was cleared | Stable |
 
@@ -2118,6 +2120,173 @@ hold a request open for.
   `profile_lock.py` will ever terminate a process. Killing a browser that might still be
   serving another instance of this server is not a recovery, and an operator who is told which
   directory is held and by which PID has a one-step fix already.
+- ~~**Reminder times are written in a hardcoded timezone, and for tasks that's now
+  user-visible.**~~ **Closed 2026-09-16 (issue #8), verified live.**
+  Every write in this codebase sent `TimeZoneContext` = `Russian Standard Time` (UTC+3) —
+  inherited from the original scripts, and harmless while it only affected calendar reads.
+  `create_task`/`update_task`'s `reminder` inherited it, so a reminder asked for at 09:30 was
+  stored as 09:30 Moscow and read back as `06:30` UTC (confirmed live 2026-09-11): correct for
+  a UTC+3 mailbox, three hours early anywhere else — while the tool reported success.
+
+  The literal lived in **nine** copies across six modules, so the fix is as much about
+  centralising it as about changing the value. New `exchange_mcp/mailbox_timezone.py` (pure,
+  stdlib-only, unit-testable like `auth_errors.py`/`profile_lock.py`) owns the decision;
+  `OWAClient.request_header()` is now the single place any `JsonRequestHeaders` block is
+  built, and `OWAClient.mailbox_timezone_detail()` resolves the zone once per process from
+  `EXCHANGE_TIMEZONE` → the mailbox's own OWA configuration (`GetOwaUserConfiguration`, then
+  EWS `GetUserConfiguration`) → `UTC`. `check_session` and the startup banner both report the
+  resolved zone and its source, which is the part that was missing before: nothing in any
+  response said which zone had been applied.
+
+  Five decisions worth not re-litigating, each with a tempting wrong alternative:
+
+  1. **The fallback is UTC, never a regional zone and never the local machine's.** A
+     local-zone fallback is right on the dev box and silently wrong everywhere else — the
+     Moscow hardcode rebuilt. UTC is wrong in a way somebody notices.
+  2. **The lookup never raises and never blocks a request.** It runs while building a header,
+     and `GetUserConfiguration` already 500s with a `NullReferenceException` on this backend
+     for another config name (`tools/categories.py`), so a fault is the expected case. It
+     degrades to the fallback instead of taking down every write in the process.
+  3. **A `SessionExpiredError` is the one outcome not cached.** It means we asked before the
+     sign-in landed; caching it would serve UTC for the process's whole life over a mailbox
+     that was merely not ready yet.
+  4. **An unrecognised response shape reads as "found nothing", not as a guess.** Neither
+     configuration shape is documented for this backend, so the parser is table-driven over
+     whole key *names* — a substring match on "timezone" returns `TimeZoneDefinition`, i.e.
+     the walk's own furniture.
+  5. **The task *reads* still send no `TimeZoneContext` at all** (`with_timezone=False`).
+     That omission is load-bearing: it's what makes their UTC-midnight `DueDate` round-trip
+     exactly. Sending `UTC` there is not the same as sending nothing.
+
+  **Blast radius — smaller than the issue assumed in one place, larger in another.** The two
+  `CalendarView` reads never sent a `TimeZoneContext`, so `get_calendar_events` /
+  `expand_recurrences` are untouched; the "calendar reads were masking it" worry doesn't apply
+  to them. And `GetUserAvailability` returns a server-side `NotImplementedException` on this
+  tenant (#602), so the two availability call sites and the analytics one are the classic-OWA
+  fallback path, not the live one. What *does* change live is `OWAClient.get_schedule`, whose
+  `tz_id` carried the same hardcode as a keyword default: it is the frame the requested window
+  and the `availabilityView` wall-clock grid are read in, so #601/#602/#701/#702 were reading a
+  window shifted by the mailbox's offset from UTC+3 and are now correct. Its `scheduleItems`
+  timestamps are unaffected (they arrive UTC-offset whatever is asked for). The five folder
+  actions send the block too but carry no timestamps at all, so their rows are left `OK`
+  rather than reset — a zone cannot change a `RenameFolder`.
+
+  Covered by `tests/unit/test_mailbox_timezone.py` (60 checks: precedence, both response
+  shapes, the shape guard, probe order, caching, degrade-don't-raise, and a guard that the
+  legacy literal is gone from every request builder, so a pasted-back copy fails CI).
+
+  **Live run 2026-09-16** (isolated port 8771 + its own `.browser-profile-tz`, so the always-on
+  8766 instance and its profile were untouched). Three results, one of them the issue's own
+  reproduction case:
+
+  1. **Discovery works on this tenant.** `check_session` reports
+     `"timezone": "W. Europe Standard Time", "timezone_source": "mailbox"` — so the configuration
+     probe answers here and the UTC fallback is not what this mailbox gets. That was the one
+     thing no unit test could settle.
+  2. **The reminder round-trip is fixed.** `test_task_lifecycle` writes `reminder:
+     "2026-09-19 09:30"` and reads back `reminder_due_by=2026-09-19 07:30` — 09:30 minus two
+     hours, i.e. exactly 09:30 CEST. The same call previously read back `06:30` (09:30 Moscow).
+     Whole suite green in 7s, self-cleaning as before.
+  3. **The reads behaved as predicted.** `get_calendar_events` returned its 4 known events
+     unchanged (it never sent a `TimeZoneContext`, so there was nothing to shift), and
+     `find_free_time` returned 6 days of slots. `get_meeting_contacts` fails, but on the
+     unrelated `user_email` bug below, not on anything this change touched.
+
+  #501, #601, #1003 and #1004 went back to `OK` on the strength of that run. **Updated after
+  merging main:** #601, #602, #701 and #702 are now `OK` too — not from this branch's run but
+  from the post-merge live verification recorded on their own rows, which exercised the
+  availability tools with the zone resolved. That leaves **four** rows `Pending`, all of them
+  the calendar **write** path: #202 `create_meeting`, #203 `update_meeting`, and #208/#209 the
+  category write-path.
+
+  Those four are blocked on one thing, and it is not doubt about the fix: both suites covering
+  them (`test_calendar_lifecycle`, `test_calendar_category_tagging`) require
+  `EXCHANGE_SMOKE_SELF_EMAIL`, which is deliberately not in the source (public repo — see
+  `tests/smoke/config.py`) and was not set for any run here. So what remains unverified is
+  narrow and specific: that the calendar write actions (`CreateCalendarEvent`,
+  `UpdateCalendarEvent`) accept the resolved zone and store the intended wall-clock time.
+  Note that `discover_self_email()`'s Sent-Items fallback is *not* an acceptable substitute
+  without the mailbox owner's say-so — `require_self_email()` is strict by design because these
+  suites send mail and create calendar items.
+
+- ~~**The startup auth poll reports a false negative, and its timeout skips the diagnosis that
+  exists to explain it.**~~ **Fixed 2026-09-16.** The banner logged
+  `Auth status: NOT AUTHENTICATED - opening a browser window...` while a `check_session` issued
+  moments later returned `"authenticated": true` — SSO had carried the profile all along.
+  Observed on two fresh profiles; on the first, the window then expired into
+  `Auth status: UNKNOWN - startup failed: TimeoutError: .` (the second run was stopped before
+  its window closed, so only the false negative itself was seen twice). **Three** distinct
+  faults sat behind that one symptom, and the middle one is the worst:
+
+  1. **One probe attempt was treated as decisive.** On a cold profile the first top-level
+     navigation to `/owa/` lands on an account-selection redirect even with a perfectly good SSO
+     session (already documented in `_async_ensure_logged_in`), so the single bearer capture can
+     give up before the SPA has minted a token — while the *request* path
+     (`_async_ensure_auth`) simply captures again later on a settled page and succeeds. That is
+     the entire gap between the two answers. `_async_probe_active_session()` now retries a
+     **negative** verdict (`_SESSION_PROBE_ATTEMPTS`), returning early on a positive one. The
+     direction follows the same asymmetry as `profile_lock.py`: a false "not signed in" opens a
+     sign-in window nobody asked for and replaces a working server with a minutes-long wait,
+     while a false "signed in" costs one failed request that `_relogin_or_raise()` already
+     retries and reports properly.
+  2. **The login poll reloaded the page the user was typing into.**
+     `_async_has_active_session()` confirms a modern-backend session via
+     `_async_capture_bearer_context()`, which calls `page.reload()` — and during an interactive
+     login that page *is* the sign-in form. Polling it every couple of seconds is hostile on its
+     face and plausibly why a sign-in could sit unfinished for a whole 10-minute window. The
+     loop now asks a new **non-destructive** `_async_poll_session_signal()` first (canary cookie,
+     a bearer already held, or the page having left the sign-in flow per
+     `auth_errors.SIGNIN_HOST_HINTS`) and only pays for the reloading confirmation once that
+     says so — and then no more often than `_LOGIN_CONFIRM_MIN_INTERVAL_SECONDS`. Note the
+     one-directional rule on that host table: matching means "still signing in", but *not*
+     matching is only a trigger to check properly, never a verdict that a session exists.
+     A final authoritative check now also runs once the window expires, because "the poll said
+     no, the next request said yes" was the reported symptom.
+  3. **A wrapper budget smaller than the work it wraps.** `interactive_login()` handed `_run()`
+     a budget of `timeout + 30`, and 30s was *exactly* the diagnosis's worst case — 10
+     `VISIBLE_ERROR_SELECTORS` × 3 nodes × two 500 ms Playwright calls = 30.0s — before
+     `page.content()` on a heavy SPA page was even counted. Zero slack by arithmetic. So
+     `future.result()` raised `concurrent.futures.TimeoutError`, which *is* the builtin
+     `TimeoutError` whose `str()` is empty (hence the useless `TimeoutError: .`), and
+     `_startup`'s generic handler discarded the reason and remediation being computed at that
+     very moment. The diagnosis is now capped (`_LOGIN_DIAGNOSIS_SECONDS`) and degrades to the
+     plain timeout result rather than replacing the answer with an exception, and the margin is
+     **derived** from the post-deadline work instead of hardcoded. `_startup` also maps a
+     `TimeoutError` from that one call to `LOGIN_TIMEOUT` with remediation — scoped to that call
+     site deliberately, since the same exception out of `browser.start()` means an unreachable
+     host, not an unattended window.
+
+  The derived-budget discipline is not decoration: this regressed **twice**, the second time
+  while the fix itself was being written (adding the final authoritative check silently pushed
+  the post-deadline work past the margin again). `tests/unit/test_login_probe.py` therefore
+  asserts the arithmetic as an invariant, alongside the retry behaviour, the host table, and —
+  the property that actually matters — that the reloading check is **not** called while a user
+  is signing in.
+
+  **What is verified, and what isn't.** Faults 2 and 3 are structural and unit-covered: the
+  reloading check provably isn't called while the quiet signal says "still signing in", and the
+  margin provably covers the post-deadline work. Fault 1 is unit-covered for its *logic* (a
+  negative is retried, a positive returns early, a hung attempt is abandoned) but has **not**
+  been re-observed live against a cold profile, because reproducing it needs a fresh profile plus
+  a completed interactive sign-in and the window went unattended both times it was tried.
+
+  One operational gotcha learned the hard way while trying: **force-killing the server
+  (`taskkill /F`) destroys the profile's session.** `context.close()` is what flushes cookies to
+  disk (see `_async_relaunch`), and a killed process never runs it — so a profile that was signed
+  in minutes earlier comes back with no session at all, and the *next* startup's
+  `NOT AUTHENTICATED` is then perfectly correct rather than a false negative. That is exactly
+  what happened on the third attempt here, and it is a good way to mistake a healthy probe for
+  a broken one. Stop a test server gracefully if the profile is meant to survive it.
+
+- ~~**`OWAClient.user_email` is never assigned, and it breaks `get_meeting_contacts` outright.**~~
+  **Reported from here while tracing the availability read path for issue #8, and fixed
+  separately the same day** — see the `user_email` entry above, which supersedes this one and
+  carries the full account (including the commit that removed the writers). The one thing this
+  side contributed is the live confirmation that made it more than a code reading:
+  `get_meeting_contacts` (#702) returned `"User email not available. Call the login tool first."`
+  before making a single request, because `analytics.py`'s `if not own_email` guard could never
+  be false. Recorded here as `KO` at the time; row #702 now reflects the fix instead.
+
 - ~~**`find_free_time`/`find_meeting_time` compare naive-UTC busy periods against local
   working hours.**~~ **Closed 2026-09-16** — see the 2026-09-16 update in §1 for the fix and
   for the three things that kept it invisible. History, because the shape of the mistake
@@ -2152,6 +2321,7 @@ hold a request open for.
   confirmation available here, because they are wrong in *different* directions when the frame
   is wrong. Rows #601/#602/#701/#702 are `OK`. One thing that run turned up about the
   *other* 2026-09-16 change is logged separately below (cold-start identity caching).
+
 - **`resolve_own_mailbox()` caches a cold-start failure, so the first tool call of a process
   decides `find_free_time`'s data source for the rest of that process's life.** Found live
   2026-09-16 while verifying the timezone fix against the merged tree, and reproduced twice in
@@ -2176,16 +2346,6 @@ hold a request open for.
   surface" (worth caching) from "asked before anything could answer" (worth retrying), the same
   distinction `OWAClient.mailbox_timezone_detail()` already makes for a `SessionExpiredError`.
   Logged here rather than patched: it belongs to `mailbox_identity`'s change, one PR over.
-- **Reminder times are written in a hardcoded timezone, and for tasks that's now
-  user-visible.** Every write in this codebase sends `TimeZoneContext` =
-  `Russian Standard Time` (UTC+3) — inherited from the original scripts, and harmless while
-  it only affected calendar reads. `create_task`/`update_task`'s `reminder` inherits it, so a
-  reminder asked for at 09:30 is stored as 09:30 Moscow and read back as `06:30` UTC
-  (confirmed live 2026-09-11): correct for a UTC+3 mailbox, three hours early anywhere else.
-  The real fix is resolving the mailbox's own timezone once (OWA exposes it in its session
-  config) and threading it through every `TimeZoneContext`/`CalendarView` — a codebase-wide
-  change touching calendar, availability and tasks, hence logged here rather than patched
-  locally. Documented in `tasks.py`'s module docstring and both tool docstrings meanwhile.
 - ~~**`task_folder` name/path resolution is written but untested, because no To Do list exists
   to test it against.**~~ **Closed 2026-09-14** — `create_folder` (#503) now takes
   `folder_class`, so `test_task_folder_targeting.py` creates its own disposable `IPF.Task`
