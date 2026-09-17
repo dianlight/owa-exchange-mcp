@@ -26,7 +26,7 @@ Any variable above can also be placed in a gitignored `.env.local` next to `pypr
 
 ## Structure
 
-- `exchange_mcp/` — MCP server package (61 tools)
+- `exchange_mcp/` — MCP server package (62 tools)
   - `server.py` — `MCPServer` (mcp SDK v2) with lifespan context; launches the browser on the persistent profile and, if that profile isn't signed in, opens a visible sign-in window (off the handshake path — see "Authentication" below)
   - `browser_session.py` — `BrowserSession`: one persistent Chromium context for the process's lifetime, reused by every OWA call
   - `owa_client.py` — OWA API client; delegates transport to `BrowserSession`, keeps the request/response/folder-resolution logic
@@ -158,7 +158,7 @@ regardless of cwd, so the console script runs the main checkout no matter where 
 For that, `cd` into the worktree and use
 `python -c "from exchange_mcp.server import main; main()" --transport http --port <port>` —
 `python -c` puts cwd first on `sys.path`, and importing `exchange_mcp.server` by its real name
-keeps the single `MCPServer` instance. Verify with a `list_tools` count of 61 before trusting a run.
+keeps the single `MCPServer` instance. Verify with a `list_tools` count of 62 before trusting a run.
 
 There is no credential setup step and no login CLI: the first start opens a browser
 window and you sign in there. See "Authentication" below.
@@ -366,7 +366,7 @@ thread that process exit kills outright.
 [PROJECT_STATUS.md](PROJECT_STATUS.md) tracks, per MCP tool: a permanent ID, automated-test coverage, and manual QA result (`Pending`/`OK`/`KO`). Keep it in sync as part of the same change, not as a follow-up:
 
 - **ID column and numbering rule**: every tool row's first column is a permanent ID of the form `<module number><2-digit sequence within that module>` — 3 digits for the single-digit modules, 4 from module 10 onward (`e.g. 208` = module 2 (Calendar), 8th tool assigned in that module; `1003` = module 10 (Tasks), 3rd tool there). Module numbers are fixed: 1 Email, 2 Calendar, 3 Categories, 4 Directory (`people.py`), 5 Folders, 6 Availability, 7 Analytics, 8 Auth, 9 Copilot, 10 Tasks, 11 Discovery — a brand-new module gets the next unused module number, never a reused or renumbered one, so once the single digits ran out (Tasks, 2026-09-11) the module part grew a digit rather than colliding. **An ID never changes once assigned**, even if the table is reordered or the tool is later removed — do not renumber existing rows to close a gap, and do not reuse a retired tool's ID for a different tool. Adding a tool to an existing module → give it the next unused 2-digit sequence number in that module (append at the end of that module's existing max, regardless of where the row is placed in the table). Removing a tool → delete its row; leave the gap in the sequence rather than shifting later IDs down.
-- Adding, removing, or renaming a tool → add/remove/update its row (and the module's tool count in its section header and in the "61 tools" totals here and in README.md).
+- Adding, removing, or renaming a tool → add/remove/update its row (and the module's tool count in its section header and in the "62 tools" totals here and in README.md).
 - Changing a tool's behavior (new params, different OWA action, altered response shape) → update its Description cell if it's no longer accurate, and reset its Manual QA status to `Pending` unless it's been re-verified.
 - Running or receiving the result of a manual test against a live OWA mailbox → update that tool's Manual QA / Status cell to `OK` or `KO` (with a one-line note for `KO`), don't leave it stale at `Pending`.
 - A tool becoming, or ceasing to be, a confirmed unfixable server-side failure (not merely `Pending`, and not a degraded-but-working case like `get_meeting_contacts`'s empty-result-plus-`warnings` behavior) → keep its Stability column cell (`Stable`/`Dev`) and `KNOWN_BUGGY_TOOLS` in `exchange_mcp/server.py` in sync with each other. `KNOWN_BUGGY_TOOLS` is what `--stable`/`EXCHANGE_MCP_STABLE` excludes from the MCP tool listing at startup.

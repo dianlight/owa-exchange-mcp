@@ -58,11 +58,11 @@ LOG_FILE = STATE_DIR / "server.log"
 
 START_TIMEOUT_SECONDS = 90
 
-# CLAUDE.md: "Verify with a list_tools count of 61 before trusting a run." A count
+# CLAUDE.md: "Verify with a list_tools count of 62 before trusting a run." A count
 # of 0 is the classic `python -m exchange_mcp.server` double-MCPServer mistake; any
 # other mismatch means the server is serving a tree with a different tool set than
 # this one -- which is precisely what a reused foreign server can silently be.
-EXPECTED_TOOL_COUNT = 61
+EXPECTED_TOOL_COUNT = 62
 
 IDENTITY_PROBE_TIMEOUT_SECONDS = 15
 
