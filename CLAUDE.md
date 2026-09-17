@@ -85,6 +85,7 @@ python -m tests.unit.test_meeting_response
 python -m tests.unit.test_availability_legacy_branch
 python -m tests.unit.test_header_invariants
 python -m tests.unit.test_identity_cache_generation
+python -m tests.unit.test_substrate_search_mapping
 
 # Live-mailbox smoke tests: one module per tool group, run individually.
 # The harness starts its own server on 127.0.0.1:8765 if nothing is listening

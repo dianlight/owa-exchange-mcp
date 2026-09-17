@@ -8,6 +8,7 @@ requests.Session replaying exported cookies can't replicate.
 
 import re
 import threading
+import uuid
 from datetime import datetime
 from typing import Iterator, NamedTuple
 from urllib.parse import quote
@@ -1158,6 +1159,94 @@ class OWAClient:
         for group in data.get("Groups", []):
             suggestions.extend(group.get("Suggestions", []))
         return suggestions
+
+    def search_conversations_substrate(self, query: str, *, from_: int = 0, size: int = 25) -> list[dict]:
+        """Mailbox-wide search via Substrate Search, the same backend OWA's own
+        search box calls (owa.react.people typeahead notwithstanding - this is
+        the "Cerca posta elettronica..." box). Captured 2026-09-17
+        (session 20260917-142611-4b65): EWS FindItem/QueryString only searches
+        one folder at a time and its AQS support on this tenant is unreliable
+        (PROJECT_STATUS.md #114), whereas this endpoint understands the same
+        operators across the whole mailbox in one request and is what actually
+        backs advanced-operator search in the modern web client.
+
+        Results are per-CONVERSATION (thread), not per-message - a materially
+        different shape from FindItem's message list. Each result's Source
+        carries ItemIds/GlobalItemIds for the whole thread; callers that want
+        one representative item should take the last one, same convention as
+        _extract_conversation_summary's "most recent message in this thread".
+
+        Only usable in bearer auth mode (modern Outlook) - raises
+        BearerModeRequiredError on classic canary-cookie OWA; callers must
+        fall back to the FindItem/local-scan path, the way find_person falls
+        back to resolve_names().
+
+        The only Filter shape seen on the wire scopes the whole mailbox
+        (msgfolderroot + DeletedItems) - there's no evidence here for how a
+        single custom folder would be expressed, so this method doesn't take
+        a folder argument. Scope to one folder client-side if needed.
+
+        Unlike find_people's /search/api/v1/suggestions (which tolerates an
+        all-zeros Cvid fine), this endpoint's backend (LocalShardSearch.Core)
+        validates Cvid server-side - it calls it "SessionId" in its own error
+        message - and rejects the all-zeros placeholder with HTTP 400
+        ErrorInvalidArgumentException. Confirmed live 2026-09-17: every call
+        with the placeholder "succeeded" (HTTP 200) with an {"error": {...}}
+        body that this method's own EntitySets-less-dict parsing silently
+        read as zero results. So Cvid/LogicalId here must be real per-call
+        GUIDs, and the response is checked for that error shape before being
+        treated as a result.
+        """
+        payload = {
+            "Cvid": str(uuid.uuid4()),
+            "Scenario": {"Name": "owa.react"},
+            "TimeZone": self.mailbox_timezone(),
+            "TextDecorations": "Off",
+            "EntityRequests": [{
+                "EntityType": "Conversation",
+                "ContentSources": ["Exchange"],
+                "Filter": {"Or": [
+                    {"Term": {"DistinguishedFolderName": "msgfolderroot"}},
+                    {"Term": {"DistinguishedFolderName": "DeletedItems"}},
+                ]},
+                "From": from_,
+                "Query": {"QueryString": query, "DisplayQueryString": ""},
+                "RefiningQueries": None,
+                "Size": size,
+                "Sort": [
+                    {"Field": "Score", "SortDirection": "Desc", "Count": 7},
+                    {"Field": "Time", "SortDirection": "Desc"},
+                ],
+                "EnableTopResults": True,
+                "TopResultsCount": 7,
+            }],
+            "QueryAlterationOptions": {
+                "EnableSuggestion": True,
+                "EnableAlteration": True,
+                "SupportedRecourseDisplayTypes": [
+                    "Suggestion", "NoResultModification", "NoResultFolderRefinerModification",
+                    "NoRequeryModification", "Modification",
+                ],
+            },
+            "LogicalId": str(uuid.uuid4()),
+        }
+        headers = {
+            "x-req-source": "Mail",
+            "prefer": 'IdType="ImmutableId", exchange.behavior="IncludeThirdPartyOnlineMeetingProviders"',
+        }
+        data = self.request_substrate("/searchservice/api/v2/query", headers, payload)
+        if isinstance(data, dict) and "error" in data:
+            error = data["error"]
+            message = error.get("message") if isinstance(error, dict) else error
+            raise RuntimeError(f"Substrate Search returned an error: {message}")
+        results: list[dict] = []
+        for entity_set in data.get("EntitySets", []):
+            for result_set in entity_set.get("ResultSets", []):
+                for result in result_set.get("Results", []):
+                    source = result.get("Source")
+                    if source:
+                        results.append(source)
+        return results
 
     # ------------------------------------------------------------------
     # Substrate GetSchedule (modern Outlook backend only - free/busy)
