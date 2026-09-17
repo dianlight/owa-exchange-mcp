@@ -11,7 +11,7 @@ import shlex
 from mcp.server.mcpserver import Context
 
 from exchange_mcp.server import mcp, AppContext
-from exchange_mcp.owa_client import OWAClient, SessionExpiredError
+from exchange_mcp.owa_client import BearerModeRequiredError, OWAClient, SessionExpiredError
 from exchange_mcp.utils import (
     ITEM_NOT_SERIALIZABLE,
     classify_item_error,
@@ -626,6 +626,60 @@ def _search_folder_aqs(client: OWAClient, parent_folder_id: dict, query: str, li
     return []
 
 
+def _search_mailbox_substrate(client: OWAClient, query: str, limit: int) -> list[dict] | None:
+    """Mailbox-wide search via Substrate Search (see OWAClient.search_conversations_substrate).
+
+    Returns None - never [] - when the substrate backend isn't usable at all
+    (classic OWA, or any other transport failure), so the caller can tell
+    "ran and found nothing" from "didn't run, fall back to FindItem/local
+    scan" the same way _search_folder_aqs's caller already does.
+
+    Results are per-conversation (thread), a different shape from
+    search_emails' normal per-message results - see its docstring.
+
+    ItemIds/GlobalItemIds entries are {"Id": ...} dicts, the same shape
+    FindConversation uses (_extract_conversation_summary, line ~108) -
+    confirmed live 2026-09-17; an earlier draft of this method assumed
+    plain strings, which would have handed callers a dict where they
+    expect an id string the moment ItemId was absent at the top level.
+    """
+    try:
+        sources = client.search_conversations_substrate(query, size=limit)
+    except BearerModeRequiredError:
+        return None
+    except SessionExpiredError:
+        raise
+    except Exception:
+        return None
+
+    results = []
+    for source in sources:
+        raw_item_ids = source.get("ItemIds") or source.get("GlobalItemIds") or []
+        item_ids = [i.get("Id", "") if isinstance(i, dict) else i for i in raw_item_ids]
+        unread = source.get("UnreadCount", 0)
+        results.append(
+            {
+                "conversation_id": source.get("ConversationId", {}).get("Id", ""),
+                "item_id": source.get("ItemId", {}).get("Id") or (item_ids[-1] if item_ids else ""),
+                "item_ids": item_ids,
+                "folder_id": source.get("ParentFolderId", {}).get("Id", ""),
+                "subject": source.get("ConversationTopic") or "(No subject)",
+                "from": source.get("SenderSMTPAddress", "") or source.get("From", {}).get("EmailAddress", ""),
+                "senders": source.get("UniqueSenders", []),
+                "date": source.get("LastDeliveryTime", ""),
+                "is_read": unread == 0,
+                "unread_count": unread,
+                "message_count": source.get("MessageCount", 0),
+                "has_attachments": source.get("HasAttachments", False),
+                "importance": source.get("Importance", "Normal"),
+                "preview": source.get("Preview", ""),
+                "categories": source.get("Categories", []),
+                "flag_status": source.get("FlagStatus", "NotFlagged"),
+            }
+        )
+    return results
+
+
 def _local_search_fallback(
     client: OWAClient,
     parent_folder_ids: list[dict],
@@ -1158,13 +1212,23 @@ def search_emails(
     received: (dates, e.g. received:>2026-01-01), size:>5000. Quote a phrase
     for an exact match (subject:"project plan"); bare words are prefix/
     substring matches. Results are individual messages, not threads - pass
-    an item_id to get_email for the full body.
+    an item_id to get_email for the full body - EXCEPT when search_all_folders
+    is True and the mailbox-wide Substrate Search backend answers (see
+    used_substrate_search in the response): those results are one row per
+    conversation/thread, with message_count/unread_count/item_ids covering
+    the whole thread rather than one message.
 
-    Some OWA backends accept the search but their content index never
-    actually runs it (zero results with no error), and some combinations
-    (e.g. search_all_folders) can fail outright on the same backends. Either
-    way, this tool transparently falls back to a client-side scan of the
-    target folder(s), matching a reduced subset of the same syntax (bare
+    With search_all_folders=True, this tool tries the modern Substrate Search
+    backend first (the same one behind OWA's own search box, understands the
+    full AQS operator set mailbox-wide in one request) - only on the classic
+    canary-cookie backend, or if that call fails outright, does it fall back
+    to the per-folder path below.
+
+    Some OWA backends accept the per-folder search but their content index
+    never actually runs it (zero results with no error), and some
+    combinations (e.g. search_all_folders) can fail outright on the same
+    backends. Either way, this tool transparently falls back to a client-side
+    scan of the target folder(s), matching a reduced subset of the same syntax (bare
     terms, subject:, from:, category:, isread:, hasattachment:) against each
     message's subject/preview/sender/categories - slower, and no real body
     search, but still returns something useful. When that fallback runs,
@@ -1192,6 +1256,17 @@ def search_emails(
             limit = max_limit
 
         if search_all_folders:
+            substrate_results = _search_mailbox_substrate(client, query, limit)
+            if substrate_results is not None:
+                return json.dumps(
+                    {
+                        "emails": substrate_results[:limit],
+                        "count": len(substrate_results[:limit]),
+                        "used_local_fallback": False,
+                        "used_substrate_search": True,
+                    }
+                )
+
             folder_ids = _list_all_folder_ids(client)
             # Many folders each potentially needing a full local scan is
             # expensive - cap each folder's fallback scan depth accordingly.
