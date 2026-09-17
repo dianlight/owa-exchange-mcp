@@ -1650,9 +1650,9 @@ what `tools/tasks.py`'s docstring already says to do for deletions.
   `--stable` CLI flag / `EXCHANGE_MCP_STABLE` env var excludes from the MCP tool listing at
   startup — keep the two in sync (see CLAUDE.md's "Maintaining PROJECT_STATUS.md" section).
 
-## 3. Tool inventory (60 tools across 11 modules)
+## 3. Tool inventory (61 tools across 11 modules)
 
-### Email — [exchange_mcp/tools/email.py](exchange_mcp/tools/email.py) (15)
+### Email — [exchange_mcp/tools/email.py](exchange_mcp/tools/email.py) (16)
 
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
@@ -1671,6 +1671,7 @@ what `tools/tasks.py`'s docstring already says to do for deletions.
 | 113 | `find_emails_by_category` | Find email conversations tagged with a given category. The match is client-side (FindConversation has no category restriction), so the folder is enumerated with a real server-side `Offset` until `limit` matches are found or it is exhausted — not just the newest 200 conversations, which is what it used to scan. Takes an `offset` counting *matching* conversations, and every response carries a `pagination` block (`has_more`/`next_offset`/`reached_end_of_folder`, plus `error_code` when the scan stopped early) so a short or empty result is never ambiguous | `tests/smoke/tests/test_email_category_tagging.py`, `tests/unit/test_conversation_paging.py`, `tests/smoke/tests/test_find_emails_by_category_pagination.py` (written, never run) | OK (2026-09-14) — deep-scan rewrite verified live on an isolated profile (own port; the production instance untouched) via `tests/smoke/tests/test_find_emails_by_category_pagination.py`: a category tagged on the Inbox conversation at **offset 250** was found, which settles the one assumption no fake could — `FindConversation` **does** report `Categories` on rows fetched at a deep server-side `Offset`. An absent category correctly reported `pagination_scan_limit_reached` ("stopped looking", not end of folder) and `offset=1` correctly skipped the single match; the borrowed message was untagged and independently re-checked as clean. Note this Inbox exceeds the 2000-conversation `_CONV_MAX_SCAN`, so any query not filling its `limit` early scans the full cap (~10 requests) and reports `pagination_scan_limit_reached` — honest, but it means `reached_end_of_folder` is effectively unreachable here and `search_emails`' server-side `category:<name>` is the right tool for a broad sweep. The earlier OK (2026-09-08) covered a *freshly tagged* message, i.e. only the newest-200 window that always worked. | Stable |
 | 114 | `search_emails` | Full-text search for emails, scoped to one folder or the whole mailbox. Tries EWS `FindItem`/`QueryString` (AQS syntax: `subject:`, `from:`, `body:`, `received:`, etc.) first, then transparently falls back to a client-side scan (reduced keyword subset: bare terms, `subject:`, `from:`, `category:`, `isread:`, `hasattachment:`) — this tenant's content index never returns AQS results, and `FindItem`'s `Traversal:"Deep"` is unsupported outright, so `search_all_folders` enumerates folders via `FindFolder`/`Deep` (like `get_folders`) and searches each one `Shallow` | `tests/smoke/tests/test_search_emails.py` | OK (2026-09-09) — single-folder AQS-empty + fallback, and `search_all_folders=True` across folders, both verified live; fixed `folder_id` always returning empty (`FindItem`'s `AdditionalProperties` needs the namespaced `item:ParentFolderId` FieldURI, not bare `ParentFolderId`) — re-verified non-empty `folder_id` live via the fallback path; re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change | Stable |
 | 115 | `set_email_flag` | Set the follow-up flag (`NotFlagged`/`Flagged`/`Complete`) on one or more emails, via `UpdateItem`/`SetItemField` on `item:Flag` | `tests/smoke/tests/test_email_flag.py` | OK (2026-09-10) — all three states written and read back successfully. The wire encoding is fussy: only `FieldURI: "item:Flag"` paired with `__type: "FlagType:#Exchange"` is accepted; `message:Flag` (either `__type`) returns "Invalid argument used to call method UpdateItem", and PidLidFlagStatus 0x8530 as an ExtendedFieldURI is rejected in every spelling tried. Invalid `flag_status` rejected client-side. | Stable |
+| 116 | `get_email_status` | Batch-read only `categories` and `flag_status` for a list of item_ids, via the same narrow `IdOnly` + named-`AdditionalProperties` (`Categories`, `item:Flag`) shape `assign_email_categories` already relies on — no body, recipients or attachments, and no `AllProperties` 500 on meeting invites. One `GetItem` per item_id (not yet batched into a single multi-`ItemId` request — see §4); per-item failures reported in `failed` with a stable `error_code`, same as `assign_email_categories` | — | OK (2026-09-17) — verified live on an isolated port/profile (own port 8768, throwaway profile, production instance on 8766 untouched): 3 real Inbox items returned correct `categories`/`flag_status` (including a flagged, categorized item), and a malformed id correctly landed in `failed` with `error_code: "item_read_failed"` rather than aborting the batch | Stable |
 
 ### Calendar — [exchange_mcp/tools/calendar.py](exchange_mcp/tools/calendar.py) (11)
 
@@ -2575,3 +2576,19 @@ hold a request open for.
   `__type` spellings literally, since a transposition there sends a *different RSVP than the
   user asked for* and still reports `{"success": true}`, a far worse failure than the wording
   bug that prompted the change.
+- **`get_email_status` #116 issues one `GetItem` per item_id, not one `GetItem` for the whole
+  batch.** Added 2026-09-17 to give a triage pass a way to read just `categories` +
+  `flag_status` (no body/recipients/attachments) instead of `get_email`'s `AllProperties` read
+  or `get_emails(include_body=True)`'s per-conversation `GetItem`. Every existing `GetItem` call
+  site in this file (`_get_item_categories`, `_get_item_details`, `get_email_links`) requests
+  exactly one `ItemId`; there is no precedent here for a single `GetItem` carrying several
+  `ItemIds` and getting back a positionally-matching `ResponseMessages` array, and this backend
+  has surprised this project before on things adjacent to it (`AllProperties` 500ing mid-response
+  serialization, `MaxEntriesReturned` not being honoured). Batching the read into one request per
+  call (instead of one per item) is the obvious next step and would turn the tool from "cheaper
+  per item" into "cheap regardless of batch size", but it wants a live check of whether a mixed
+  success/error batch really does come back in request order before trusting it to attribute
+  results to the right `item_id` — same caution as the identity/timezone caches' generation
+  counter, wrong attribution here would silently write a category read for one item onto another
+  in a caller that merges against it. Untested against a live mailbox (`Pending`), no automated
+  test yet.

@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/dianlight/owa-exchange-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/dianlight/owa-exchange-mcp/actions/workflows/ci.yml)
 
-MCP (Model Context Protocol) server for any Microsoft Exchange / OWA (Outlook Web Access) deployment. Gives LLM agents access to email, calendar, tasks (Microsoft To Do), directory search, folders, categories, availability, meeting analytics, and Copilot delegation via 60 tools, plus a capability-discovery module for mapping the OWA surface this server doesn't cover yet.
+MCP (Model Context Protocol) server for any Microsoft Exchange / OWA (Outlook Web Access) deployment. Gives LLM agents access to email, calendar, tasks (Microsoft To Do), directory search, folders, categories, availability, meeting analytics, and Copilot delegation via 61 tools, plus a capability-discovery module for mapping the OWA surface this server doesn't cover yet.
 
 Works with any on-premise or hosted Exchange server that exposes OWA.
 
@@ -198,13 +198,14 @@ Note that this is *diagnosis only*. The login window never aborts early on an
 error message: you're sitting in front of it, so a mistyped password or an
 accidentally denied push is something you just retry there.
 
-## Tools (60)
+## Tools (61)
 
-### Email (15)
+### Email (16)
 | Tool | Description |
 |---|---|
 | `get_emails` | List emails from a folder with filtering |
 | `get_email` | Get full email content by ID |
+| `get_email_status` | Batch-read only categories + flag_status for a list of emails (no body) |
 | `search_emails` | Full-text search emails using AQS query syntax |
 | `send_email` | Send a new email |
 | `reply_email` | Reply to an email |

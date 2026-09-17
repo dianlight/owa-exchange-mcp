@@ -358,6 +358,53 @@ def _get_item_categories(client: OWAClient, item_id: str) -> list[str]:
     raise RuntimeError("GetItem returned no item for this ItemId.")
 
 
+def _get_item_status(client: OWAClient, item_id: str) -> dict:
+    """Read *only* the Categories and follow-up flag of one item.
+
+    Same narrow shape as `_get_item_categories` and for the same reason: it's
+    what lets a MeetingRequestMessage be read at all without OWA's own
+    serialiser 500ing on the full `AllProperties` set (see that function's
+    docstring). `item:Flag` is the one FieldURI spelling `_build_flag_update`
+    found this backend accepts for the flag on the *write* side; reused here
+    rather than guessing a bare "Flag" for the read side, since this backend
+    has already been fussy about that field's exact wire encoding once.
+
+    Raises for a real read failure so the caller can report it per-item
+    instead of guessing a status for an item it never actually read.
+    """
+    payload = {
+        "__type": "GetItemJsonRequest:#Exchange",
+        "Header": {
+            "__type": "JsonRequestHeaders:#Exchange",
+            "RequestServerVersion": "Exchange2013",
+        },
+        "Body": {
+            "__type": "GetItemRequest:#Exchange",
+            "ItemShape": {
+                "__type": "ItemResponseShape:#Exchange",
+                "BaseShape": "IdOnly",
+                "AdditionalProperties": [
+                    {"__type": "PropertyUri:#Exchange", "FieldURI": "Categories"},
+                    {"__type": "PropertyUri:#Exchange", "FieldURI": "item:Flag"},
+                ],
+            },
+            "ItemIds": [{"__type": "ItemId:#Exchange", "Id": item_id}],
+        },
+    }
+
+    data = client.request("GetItem", payload)
+    for msg in client.extract_items(data):
+        if msg.get("ResponseClass") == "Error":
+            raise RuntimeError(msg.get("MessageText", "GetItem failed."))
+        for item in msg.get("Items", []):
+            return {
+                "categories": list(item.get("Categories") or []),
+                "flag_status": (item.get("Flag") or {}).get("FlagStatus", "NotFlagged"),
+            }
+
+    raise RuntimeError("GetItem returned no item for this ItemId.")
+
+
 def _bulk_result(action: str, updated: list[str], failed: list[dict], requested: int) -> dict:
     """Summarise a per-item bulk write, naming what actually changed.
 
@@ -1211,6 +1258,67 @@ def get_email(item_id: str, ctx: Context = None) -> str:
                 "work on it normally."
             )
         return json.dumps(error)
+
+
+@mcp.tool()
+def get_email_status(item_ids: list[str], ctx: Context = None) -> str:
+    """Get only categories and flag_status for a batch of emails.
+
+    For a triage pass that just needs to know "did this item already get
+    categorized/flagged", this is the cheap alternative to get_email or
+    get_emails(include_body=True): it never reads a body, recipients or
+    attachments. It uses the same narrow IdOnly shape
+    assign_email_categories relies on internally to merge categories, so it
+    also works on MeetingRequestMessage items, which fault OWA's serialiser
+    at BaseShape: AllProperties (see get_email's item_not_serializable hint).
+
+    Unlike get_emails' flag_status - populated from FindConversation and
+    documented there as unverified against this tenant - the value returned
+    here comes from the same per-item GetItem read get_emails itself points
+    to for a confirmed value, just without the body that read also used to
+    carry.
+
+    Args:
+        item_ids: List of Exchange ItemIds to read.
+
+    Per-item failures never abort the batch: each is reported in `failed`
+    with a stable `error_code` (see assign_email_categories), so a caller
+    can tell "this item has no categories" from "this item couldn't be
+    read" instead of treating both as absence.
+    """
+    try:
+        client = _get_client(ctx)
+        items, failed = [], []
+        for iid in item_ids:
+            try:
+                status = _get_item_status(client, iid)
+            except SessionExpiredError:
+                raise
+            except Exception as e:
+                failed.append(item_error(iid, str(e)))
+                continue
+            items.append(
+                {
+                    "item_id": iid,
+                    "categories": status["categories"],
+                    "flag_status": status["flag_status"],
+                }
+            )
+
+        result = {"items": items, "count": len(items)}
+        if failed:
+            codes = list(
+                dict.fromkeys(f.get("error_code", "") for f in failed if f.get("error_code"))
+            )
+            result["failed"] = failed
+            result["failed_count"] = len(failed)
+            if codes:
+                result["failed_codes"] = codes
+        return json.dumps(result)
+    except SessionExpiredError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        return json.dumps({"error": f"Failed to get email status: {e}"})
 
 
 @mcp.tool()
