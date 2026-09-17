@@ -358,6 +358,53 @@ def _get_item_categories(client: OWAClient, item_id: str) -> list[str]:
     raise RuntimeError("GetItem returned no item for this ItemId.")
 
 
+def _get_item_status(client: OWAClient, item_id: str) -> dict:
+    """Read *only* the Categories and follow-up flag of one item.
+
+    Same narrow shape as `_get_item_categories` and for the same reason: it's
+    what lets a MeetingRequestMessage be read at all without OWA's own
+    serialiser 500ing on the full `AllProperties` set (see that function's
+    docstring). `item:Flag` is the one FieldURI spelling `_build_flag_update`
+    found this backend accepts for the flag on the *write* side; reused here
+    rather than guessing a bare "Flag" for the read side, since this backend
+    has already been fussy about that field's exact wire encoding once.
+
+    Raises for a real read failure so the caller can report it per-item
+    instead of guessing a status for an item it never actually read.
+    """
+    payload = {
+        "__type": "GetItemJsonRequest:#Exchange",
+        "Header": {
+            "__type": "JsonRequestHeaders:#Exchange",
+            "RequestServerVersion": "Exchange2013",
+        },
+        "Body": {
+            "__type": "GetItemRequest:#Exchange",
+            "ItemShape": {
+                "__type": "ItemResponseShape:#Exchange",
+                "BaseShape": "IdOnly",
+                "AdditionalProperties": [
+                    {"__type": "PropertyUri:#Exchange", "FieldURI": "Categories"},
+                    {"__type": "PropertyUri:#Exchange", "FieldURI": "item:Flag"},
+                ],
+            },
+            "ItemIds": [{"__type": "ItemId:#Exchange", "Id": item_id}],
+        },
+    }
+
+    data = client.request("GetItem", payload)
+    for msg in client.extract_items(data):
+        if msg.get("ResponseClass") == "Error":
+            raise RuntimeError(msg.get("MessageText", "GetItem failed."))
+        for item in msg.get("Items", []):
+            return {
+                "categories": list(item.get("Categories") or []),
+                "flag_status": (item.get("Flag") or {}).get("FlagStatus", "NotFlagged"),
+            }
+
+    raise RuntimeError("GetItem returned no item for this ItemId.")
+
+
 def _bulk_result(action: str, updated: list[str], failed: list[dict], requested: int) -> dict:
     """Summarise a per-item bulk write, naming what actually changed.
 
@@ -1277,6 +1324,188 @@ def get_email(item_id: str, ctx: Context = None) -> str:
                 "work on it normally."
             )
         return json.dumps(error)
+
+
+@mcp.tool()
+def get_email_status(item_ids: list[str], ctx: Context = None) -> str:
+    """Get only categories and flag_status for a batch of emails.
+
+    For a triage pass that just needs to know "did this item already get
+    categorized/flagged", this is the cheap alternative to get_email or
+    get_emails(include_body=True): it never reads a body, recipients or
+    attachments. It uses the same narrow IdOnly shape
+    assign_email_categories relies on internally to merge categories, so it
+    also works on MeetingRequestMessage items, which fault OWA's serialiser
+    at BaseShape: AllProperties (see get_email's item_not_serializable hint).
+
+    Unlike get_emails' flag_status - populated from FindConversation and
+    documented there as unverified against this tenant - the value returned
+    here comes from the same per-item GetItem read get_emails itself points
+    to for a confirmed value, just without the body that read also used to
+    carry.
+
+    Args:
+        item_ids: List of Exchange ItemIds to read.
+
+    Per-item failures never abort the batch: each is reported in `failed`
+    with a stable `error_code` (see assign_email_categories), so a caller
+    can tell "this item has no categories" from "this item couldn't be
+    read" instead of treating both as absence.
+    """
+    try:
+        client = _get_client(ctx)
+        items, failed = [], []
+        for iid in item_ids:
+            try:
+                status = _get_item_status(client, iid)
+            except SessionExpiredError:
+                raise
+            except Exception as e:
+                failed.append(item_error(iid, str(e)))
+                continue
+            items.append(
+                {
+                    "item_id": iid,
+                    "categories": status["categories"],
+                    "flag_status": status["flag_status"],
+                }
+            )
+
+        result = {"items": items, "count": len(items)}
+        if failed:
+            codes = list(
+                dict.fromkeys(f.get("error_code", "") for f in failed if f.get("error_code"))
+            )
+            result["failed"] = failed
+            result["failed_count"] = len(failed)
+            if codes:
+                result["failed_codes"] = codes
+        return json.dumps(result)
+    except SessionExpiredError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        return json.dumps({"error": f"Failed to get email status: {e}"})
+
+
+@mcp.tool()
+def sync_folder_items(
+    folder: str = "inbox",
+    sync_state: str | None = None,
+    max_changes: int = 100,
+    ctx: Context = None,
+) -> str:
+    """Delta-sync a folder's items instead of re-listing it from scratch.
+
+    Wraps EWS SyncFolderItems (confirmed live on this tenant 2026-09-17 --
+    a clean NoError/Success envelope with real Create changes, i.e. this is
+    Exchange's own change tracking, not something built out of get_emails
+    calls). The first call (sync_state omitted) reports every item
+    currently in the folder as a "created" change plus an opaque
+    sync_state; a later call passes that token back and gets only what
+    changed since -- the point being that a Pass1/Cleanup pass that runs
+    repeatedly no longer has to re-list the whole folder window every time.
+
+    Args:
+        folder: Folder name, `/`-path, or id (see resolve_folder()).
+        sync_state: Opaque token from a previous call. Omit for the
+            initial full sync.
+        max_changes: Cap on changes returned in this call (1-512, EWS's
+            own ceiling).
+
+    This backend did not send `IncludesLastItemInRange` on a full page in
+    testing -- present in the EWS spec, absent on the wire here, the same
+    shape of gap get_emails hit with server-side paging (see
+    PROJECT_STATUS.md §4). So this follows the same rule as every other
+    paging tool in this codebase: `more_changes` is a best-effort hint
+    (the page came back exactly `max_changes` long), never a guarantee --
+    keep calling with the returned `sync_state` until `count` comes back
+    genuinely 0, which is the only trustworthy "caught up" signal.
+
+    Only the Create path has been exercised live. Update/Delete/
+    ReadFlagChange are parsed per the EWS spec's documented shape (Update
+    mirrors Create's Item/ItemId nesting; Delete and ReadFlagChange carry
+    ItemId directly, no Item) but have not yet been observed on the wire
+    against this tenant.
+    """
+    try:
+        client = _get_client(ctx)
+
+        folder_id, error_json, _ = _resolve_folder_or_error(client, folder, "folder")
+        if error_json:
+            return error_json
+
+        max_changes = max(1, min(max_changes, 512))
+
+        body = {
+            "__type": "SyncFolderItemsRequest:#Exchange",
+            "ItemShape": {
+                "__type": "ItemResponseShape:#Exchange",
+                "BaseShape": "IdOnly",
+            },
+            "SyncFolderId": {
+                "__type": "TargetFolderId:#Exchange",
+                "BaseFolderId": OWAClient.folder_id_dict(folder_id),
+            },
+            "MaxChangesReturned": max_changes,
+        }
+        if sync_state:
+            body["SyncState"] = sync_state
+
+        payload = {
+            "__type": "SyncFolderItemsJsonRequest:#Exchange",
+            "Header": client.request_header("Exchange2013"),
+            "Body": body,
+        }
+
+        data = client.request("SyncFolderItems", payload)
+        messages = data.get("Body", {}).get("ResponseMessages", {}).get("Items", [])
+        if not messages:
+            return json.dumps({"error": "SyncFolderItems returned no response message."})
+        message = messages[0]
+        if message.get("ResponseClass") != "Success":
+            return json.dumps({
+                "error": message.get("MessageText", "SyncFolderItems failed."),
+                "response_code": message.get("ResponseCode", ""),
+            })
+
+        created, updated, deleted, read_flag_changed = [], [], [], []
+        buckets = {
+            "Create": created,
+            "Update": updated,
+            "Delete": deleted,
+            "ReadFlagChange": read_flag_changed,
+        }
+        for change in message.get("Changes", {}).get("Changes", []):
+            change_type = change.get("ChangeType", "")
+            bucket = buckets.get(change_type)
+            if bucket is None:
+                continue
+            item = change.get("Item")
+            item_id_block = (item or change).get("ItemId", {})
+            entry = {
+                "item_id": item_id_block.get("Id", ""),
+                "change_key": item_id_block.get("ChangeKey", ""),
+            }
+            if item:
+                entry["item_class"] = str(item.get("__type", "")).split(":", 1)[0]
+            if change_type == "ReadFlagChange":
+                entry["is_read"] = change.get("IsRead")
+            bucket.append(entry)
+
+        total_changes = len(created) + len(updated) + len(deleted) + len(read_flag_changed)
+        return json.dumps({
+            "sync_state": message.get("SyncState", ""),
+            "created": created,
+            "updated": updated,
+            "deleted": deleted,
+            "read_flag_changed": read_flag_changed,
+            "count": total_changes,
+            "more_changes": total_changes >= max_changes,
+        })
+    except SessionExpiredError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        return json.dumps({"error": f"Failed to sync folder items: {e}"})
 
 
 @mcp.tool()
