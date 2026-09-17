@@ -1608,6 +1608,41 @@ Same shape as the bug this whole issue is about: a call that looks like it worke
 read the answer. Caught by listing the folder afterwards rather than trusting the delete, which is
 what `tools/tasks.py`'s docstring already says to do for deletions.
 
+**Update 2026-09-17 — `search_emails`'s local fallback silently guaranteed zero
+results for date-only queries, and probably for `body:`/`to:`/`cc:`/`bcc:`/
+`participants:`/`size:`/`importance:` too.** Reported from real usage:
+`search_emails(query="received:>2026-01-01")` — a filter that should match
+almost the entire Inbox — returned zero results, in the same folder
+`get_emails` was showing same-day mail in at that moment. Root cause was in
+`_parse_aqs_lite` ([email.py](exchange_mcp/tools/email.py)), not in the
+already-documented tenant-side content-index failure: when the server-side
+`FindItem`/`QueryString` search comes back empty (expected on this tenant,
+see the 2026-09-09 entry above) and `search_emails` falls back to a
+client-side scan, any `keyword:value` token whose keyword wasn't one of the
+five the fallback actually checks (`subject:`, `from:`, `category:`,
+`isread:`, `hasattachment:`) fell through to the *free-text* branch and was
+searched for as a literal substring of subject/preview/sender. A string like
+`"received:>2026-01-01"` can never appear there, so the fallback was
+guaranteed to match nothing — not a tenant limitation, a client-side bug that
+turned "this filter isn't supported locally" into an indistinguishable false
+"no matching emails." Fixed: `_AQS_KNOWN_UNSUPPORTED_KEYWORDS` now lists every
+keyword the docstring documents as valid AQS syntax but the fallback has no
+field for (`body:`, `to:`, `cc:`, `bcc:`, `participants:`, `sent:`,
+`received:`, `size:`, `importance:`); a token using one of them is dropped
+from the match entirely (search on whatever else is in the query, or every
+item in the scanned page if nothing else was given) rather than corrupted
+into an unmatchable term, and the tool's response now names the dropped
+keyword(s) in `fallback_unsupported_filters` plus a `warning`, so a caller
+can tell "genuinely zero matches" apart from "this filter couldn't be
+checked locally." Covered by
+[test_aqs_lite_fallback.py](tests/unit/test_aqs_lite_fallback.py) (new unit
+suite — pure logic, no mailbox); re-verified live the same day on an isolated
+profile (own port, production instance untouched) with the exact reported
+query, `search_emails(query="received:>2026-01-01", folder="inbox")`: 25
+matches returned (previously 0), `used_local_fallback: true`,
+`fallback_unsupported_filters: ["received"]`, and the expected `warning`
+text — matching what `get_emails` on the same folder showed independently.
+
 ## 2. How to read the table
 
 - **ID** — a permanent identifier, `<module number><2-digit sequence within that module>`:
@@ -1669,7 +1704,7 @@ what `tools/tasks.py`'s docstring already says to do for deletions.
 | 111 | `assign_email_categories` | Add one or more categories to emails (any mail-class item, meeting invites/responses included), keeping any already present; reports `updated_count`/`failed_count`/`failed`/`failed_codes`, each failure carrying a stable `error_code` | `tests/smoke/tests/test_email_category_tagging.py`, `tests/smoke/tests/test_meeting_request_categories.py`, `tests/unit/test_item_errors.py` | OK (2026-09-11) — re-verified after the meeting-invite fix: tags a real `MeetingRequestMessage` and reads it back server-side; ordinary mail unaffected. See "Update 2026-09-11 (continued) — category writes on meeting invites" below | Stable |
 | 112 | `remove_email_categories` | Remove one or more categories from emails (any mail-class item, meeting invites/responses included), keeping any others present; reports `updated_count`/`failed_count`/`failed`/`failed_codes`, each failure carrying a stable `error_code` | `tests/smoke/tests/test_email_category_tagging.py`, `tests/smoke/tests/test_meeting_request_categories.py`, `tests/unit/test_item_errors.py` | OK (2026-09-11) — same fix as `assign_email_categories` above (shares `_get_item_categories`); untag verified on both a meeting invite and ordinary mail | Stable |
 | 113 | `find_emails_by_category` | Find email conversations tagged with a given category. The match is client-side (FindConversation has no category restriction), so the folder is enumerated with a real server-side `Offset` until `limit` matches are found or it is exhausted — not just the newest 200 conversations, which is what it used to scan. Takes an `offset` counting *matching* conversations, and every response carries a `pagination` block (`has_more`/`next_offset`/`reached_end_of_folder`, plus `error_code` when the scan stopped early) so a short or empty result is never ambiguous | `tests/smoke/tests/test_email_category_tagging.py`, `tests/unit/test_conversation_paging.py`, `tests/smoke/tests/test_find_emails_by_category_pagination.py` (written, never run) | OK (2026-09-14) — deep-scan rewrite verified live on an isolated profile (own port; the production instance untouched) via `tests/smoke/tests/test_find_emails_by_category_pagination.py`: a category tagged on the Inbox conversation at **offset 250** was found, which settles the one assumption no fake could — `FindConversation` **does** report `Categories` on rows fetched at a deep server-side `Offset`. An absent category correctly reported `pagination_scan_limit_reached` ("stopped looking", not end of folder) and `offset=1` correctly skipped the single match; the borrowed message was untagged and independently re-checked as clean. Note this Inbox exceeds the 2000-conversation `_CONV_MAX_SCAN`, so any query not filling its `limit` early scans the full cap (~10 requests) and reports `pagination_scan_limit_reached` — honest, but it means `reached_end_of_folder` is effectively unreachable here and `search_emails`' server-side `category:<name>` is the right tool for a broad sweep. The earlier OK (2026-09-08) covered a *freshly tagged* message, i.e. only the newest-200 window that always worked. | Stable |
-| 114 | `search_emails` | Full-text search for emails, scoped to one folder or the whole mailbox. Tries EWS `FindItem`/`QueryString` (AQS syntax: `subject:`, `from:`, `body:`, `received:`, etc.) first, then transparently falls back to a client-side scan (reduced keyword subset: bare terms, `subject:`, `from:`, `category:`, `isread:`, `hasattachment:`) — this tenant's content index never returns AQS results, and `FindItem`'s `Traversal:"Deep"` is unsupported outright, so `search_all_folders` enumerates folders via `FindFolder`/`Deep` (like `get_folders`) and searches each one `Shallow` | `tests/smoke/tests/test_search_emails.py` | OK (2026-09-09) — single-folder AQS-empty + fallback, and `search_all_folders=True` across folders, both verified live; fixed `folder_id` always returning empty (`FindItem`'s `AdditionalProperties` needs the namespaced `item:ParentFolderId` FieldURI, not bare `ParentFolderId`) — re-verified non-empty `folder_id` live via the fallback path; re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change | Stable |
+| 114 | `search_emails` | Full-text search for emails, scoped to one folder or the whole mailbox. Tries EWS `FindItem`/`QueryString` (AQS syntax: `subject:`, `from:`, `body:`, `received:`, etc.) first, then transparently falls back to a client-side scan (reduced keyword subset: bare terms, `subject:`, `from:`, `category:`, `isread:`, `hasattachment:`) — this tenant's content index never returns AQS results, and `FindItem`'s `Traversal:"Deep"` is unsupported outright, so `search_all_folders` enumerates folders via `FindFolder`/`Deep` (like `get_folders`) and searches each one `Shallow`. A keyword the fallback can't check locally (`body:`/`to:`/`cc:`/`bcc:`/`participants:`/`sent:`/`received:`/`size:`/`importance:`) is dropped from the match rather than corrupting it, and named in the response's `fallback_unsupported_filters` (see "Update 2026-09-17" above) | `tests/smoke/tests/test_search_emails.py`, `tests/unit/test_aqs_lite_fallback.py` | OK (2026-09-09) — single-folder AQS-empty + fallback, and `search_all_folders=True` across folders, both verified live; fixed `folder_id` always returning empty (`FindItem`'s `AdditionalProperties` needs the namespaced `item:ParentFolderId` FieldURI, not bare `ParentFolderId`) — re-verified non-empty `folder_id` live via the fallback path; re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change. **OK (2026-09-17)** — the fallback-keyword fix re-verified live on an isolated profile/port: `search_emails(query="received:>2026-01-01", folder="inbox")` returned 25 matches (was 0) with `used_local_fallback: true`, `fallback_unsupported_filters: ["received"]` and a `warning`, matching `get_emails` on the same folder | Stable |
 | 115 | `set_email_flag` | Set the follow-up flag (`NotFlagged`/`Flagged`/`Complete`) on one or more emails, via `UpdateItem`/`SetItemField` on `item:Flag` | `tests/smoke/tests/test_email_flag.py` | OK (2026-09-10) — all three states written and read back successfully. The wire encoding is fussy: only `FieldURI: "item:Flag"` paired with `__type: "FlagType:#Exchange"` is accepted; `message:Flag` (either `__type`) returns "Invalid argument used to call method UpdateItem", and PidLidFlagStatus 0x8530 as an ExtendedFieldURI is rejected in every spelling tried. Invalid `flag_status` rejected client-side. | Stable |
 
 ### Calendar — [exchange_mcp/tools/calendar.py](exchange_mcp/tools/calendar.py) (11)

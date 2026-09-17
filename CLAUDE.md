@@ -67,6 +67,7 @@ python -m tests.unit
 
 # ...or one suite at a time, while working on it
 python -m tests.unit.test_auth_errors
+python -m tests.unit.test_aqs_lite_fallback
 python -m tests.unit.test_availability_frame
 python -m tests.unit.test_profile_lock
 python -m tests.unit.test_mailbox_timezone

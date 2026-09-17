@@ -410,10 +410,30 @@ def _build_recipient_list(emails: str) -> list[dict]:
 
 _AQS_LITE_KEYWORDS = {"subject", "from", "category", "isread", "hasattachment"}
 
+# Keywords the search_emails docstring advertises as valid AQS syntax (because
+# the server-side QueryString search - when it works - does support them) but
+# that _local_search_matches has no field to check locally. A token using one
+# of these must never fall through to the free-text branch: "received:>2026-
+# 01-01" as a literal substring will never appear in a subject/preview/sender,
+# so treating it as a search term silently guarantees zero matches whenever
+# the fallback runs - indistinguishable from "no emails matched" unless it is
+# reported. Dropping the token (searching everything else in the query, unfiltered
+# on this field) is what the docstring already promises: "reduced subset".
+_AQS_KNOWN_UNSUPPORTED_KEYWORDS = {
+    "body", "to", "cc", "bcc", "participants", "sent", "received", "size", "importance",
+}
 
-def _parse_aqs_lite(query: str) -> tuple[list[str], dict[str, list[str]]]:
-    """Split an AQS query into free-text terms and a subset of recognized
-    keyword:value filters, for the client-side fallback in search_emails.
+
+def _parse_aqs_lite(query: str) -> tuple[list[str], dict[str, list[str]], list[str]]:
+    """Split an AQS query into free-text terms, a subset of recognized
+    keyword:value filters, and any known-but-unsupported keywords found, for
+    the client-side fallback in search_emails.
+
+    A keyword:value token is classified one of three ways: a recognized
+    filter (checked by _local_search_matches), a known-but-locally-unsupported
+    AQS field (dropped - see _AQS_KNOWN_UNSUPPORTED_KEYWORDS above), or - if
+    the word before ":" isn't a recognized AQS field at all - ordinary free
+    text that happens to contain a colon (e.g. a URL), which is kept verbatim.
     """
     try:
         tokens = shlex.split(query)
@@ -422,13 +442,18 @@ def _parse_aqs_lite(query: str) -> tuple[list[str], dict[str, list[str]]]:
 
     terms: list[str] = []
     filters: dict[str, list[str]] = {}
+    dropped: list[str] = []
     for token in tokens:
         match = re.match(r"^(\w+):(.+)$", token)
-        if match and match.group(1).lower() in _AQS_LITE_KEYWORDS:
-            filters.setdefault(match.group(1).lower(), []).append(match.group(2))
+        keyword = match.group(1).lower() if match else None
+        if keyword in _AQS_LITE_KEYWORDS:
+            filters.setdefault(keyword, []).append(match.group(2))
+        elif keyword in _AQS_KNOWN_UNSUPPORTED_KEYWORDS:
+            if keyword not in dropped:
+                dropped.append(keyword)
         else:
             terms.append(token)
-    return terms, filters
+    return terms, filters, dropped
 
 
 def _local_search_matches(item: dict, terms: list[str], filters: dict[str, list[str]]) -> bool:
@@ -561,14 +586,20 @@ def _local_search_fallback(
     query: str,
     limit: int,
     max_scan: int = 1000,
-) -> list[dict]:
+) -> tuple[list[dict], list[str]]:
     """Page through items structurally (no QueryString) and filter client-side.
 
     Used when the server accepts QueryString but silently returns zero
     results for it - observed on at least one tenant's OWA backend, where
     FindItem's content-index search never actually runs.
+
+    Returns (matches, dropped_keywords) - the second element lists any AQS
+    keywords in `query` that this fallback recognizes but cannot check
+    locally (see _AQS_KNOWN_UNSUPPORTED_KEYWORDS), so the caller can tell a
+    caller-visible "matched everything, that filter wasn't applied" apart
+    from a genuine zero-match search.
     """
-    terms, filters = _parse_aqs_lite(query)
+    terms, filters, dropped = _parse_aqs_lite(query)
     matches: list[dict] = []
     offset = 0
     page_size = 200
@@ -626,7 +657,7 @@ def _local_search_fallback(
             break
         offset += page_size
 
-    return matches
+    return matches, dropped
 
 
 # ------------------------------------------------------------------
@@ -1089,7 +1120,14 @@ def search_emails(
     target folder(s), matching a reduced subset of the same syntax (bare
     terms, subject:, from:, category:, isread:, hasattachment:) against each
     message's subject/preview/sender/categories - slower, and no real body
-    search, but still returns something useful.
+    search, but still returns something useful. When that fallback runs,
+    keywords the server-side syntax supports but the fallback cannot check
+    locally (body:, to:, cc:, bcc:, participants:, sent:, received:, size:,
+    importance:) are dropped rather than matched literally, and named in the
+    response's fallback_unsupported_filters - so a date-only query like
+    "received:>2026-01-01" on a tenant whose content index is broken returns
+    an unfiltered scan of the folder (with a warning), not a guaranteed,
+    silent zero.
 
     Args:
         query: AQS query string, e.g. "budget report", 'from:alice subject:"Q3 plan"'.
@@ -1120,6 +1158,7 @@ def search_emails(
 
         found_items: list[dict] = []
         used_fallback = False
+        dropped_filters: list[str] = []
 
         for fid in folder_ids:
             remaining = limit - len(found_items)
@@ -1129,12 +1168,20 @@ def search_emails(
 
             items = _search_folder_aqs(client, parent_folder_id, query, remaining)
             if not items:
-                items = _local_search_fallback(
+                # Fallback ran regardless of whether it matched anything -
+                # used_fallback has to reflect that a text-only scan happened,
+                # not just that it happened to find something, or a query
+                # whose only filters are ones the fallback drops (see below)
+                # would report used_local_fallback: false for a result that
+                # in fact came from an unfiltered scan.
+                used_fallback = True
+                items, dropped = _local_search_fallback(
                     client, [parent_folder_id], "Shallow", query, remaining,
                     max_scan=fallback_max_scan,
                 )
-                if items:
-                    used_fallback = True
+                for kw in dropped:
+                    if kw not in dropped_filters:
+                        dropped_filters.append(kw)
             found_items.extend(items)
 
         results = []
@@ -1162,11 +1209,30 @@ def search_emails(
                 }
             )
 
-        return json.dumps({
+        response = {
             "emails": results,
             "count": len(results),
             "used_local_fallback": used_fallback,
-        })
+        }
+        if dropped_filters:
+            # These are not "wrong" in the sense of a caller error - they are
+            # exactly what the docstring documents as valid AQS - but the
+            # local fallback (used because the server-side content-index
+            # search failed or was disabled) has no field to check them
+            # against, so it drops them rather than turning them into a
+            # free-text term that could only ever match zero items. Report
+            # it: results are the *unfiltered* (on these fields) fallback
+            # scan, not a true match, and count can be non-zero even though
+            # the requested filter was never actually applied.
+            response["fallback_unsupported_filters"] = dropped_filters
+            response["warning"] = (
+                f"The local fallback search does not support the "
+                f"{', '.join(sorted(dropped_filters))}: filter(s) in this "
+                f"query, so they were ignored rather than applied - results "
+                f"reflect the rest of the query only (or, if there was no "
+                f"other filter/term, an unfiltered scan of the folder(s))."
+            )
+        return json.dumps(response)
 
     except SessionExpiredError as e:
         return json.dumps({"error": str(e)})
