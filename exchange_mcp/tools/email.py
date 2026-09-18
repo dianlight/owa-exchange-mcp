@@ -7,6 +7,7 @@ emails via the OWA Exchange API.
 import json
 import re
 import shlex
+from datetime import datetime
 
 from mcp.server.mcpserver import Context
 
@@ -18,6 +19,8 @@ from exchange_mcp.utils import (
     extract_links_from_html,
     html_to_text,
     item_error,
+    parse_date,
+    parse_iso_datetime,
 )
 
 
@@ -358,20 +361,40 @@ def _get_item_categories(client: OWAClient, item_id: str) -> list[str]:
     raise RuntimeError("GetItem returned no item for this ItemId.")
 
 
-def _get_item_status(client: OWAClient, item_id: str) -> dict:
-    """Read *only* the Categories and follow-up flag of one item.
+def _get_items_status(
+    client: OWAClient, item_ids: list[str]
+) -> tuple[dict[str, dict], dict[str, str]]:
+    """Read Categories/flag/IsRead/HasAttachments/Importance for a *batch* of
+    items in one GetItem call, not one call per item.
 
-    Same narrow shape as `_get_item_categories` and for the same reason: it's
-    what lets a MeetingRequestMessage be read at all without OWA's own
-    serialiser 500ing on the full `AllProperties` set (see that function's
-    docstring). `item:Flag` is the one FieldURI spelling `_build_flag_update`
-    found this backend accepts for the flag on the *write* side; reused here
-    rather than guessing a bare "Flag" for the read side, since this backend
-    has already been fussy about that field's exact wire encoding once.
+    Same narrow IdOnly shape `_get_item_categories` uses and for the same
+    reason: it's what lets a MeetingRequestMessage be read at all without
+    OWA's own serialiser 500ing on the full `AllProperties` set (see that
+    function's docstring). `item:Flag` is the one FieldURI spelling
+    `_build_flag_update` found this backend accepts for the flag on the
+    *write* side; reused here rather than guessing a bare "Flag" for the read
+    side. `IsRead`/`HasAttachments`/`Importance` are bare names by
+    extrapolation from that same precedent - unverified against a live
+    mailbox (see get_email_status's docstring).
 
-    Raises for a real read failure so the caller can report it per-item
-    instead of guessing a status for an item it never actually read.
+    A single GetItem request carrying several ItemIds returns one
+    ResponseMessage per requested id, in request order
+    (`Body.ResponseMessages.Items` - see `OWAClient.extract_items`), unlike
+    every other GetItem call site in this file, which asks for exactly one
+    ItemId. Response messages are matched back to item_ids *positionally*,
+    not by any id echoed on them, because an Error ResponseMessage carries no
+    Item and therefore no id to match against - request order is the only
+    thing either outcome carries.
+
+    Returns (statuses, errors): `statuses` maps a successfully read item_id to
+    its status dict, `errors` maps a failed item_id to the server's message
+    text. Neither raises for a per-item failure - only a transport/session
+    problem (e.g. SessionExpiredError from `client.request` itself) escapes,
+    same split every other batch tool in this file makes.
     """
+    if not item_ids:
+        return {}, {}
+
     payload = {
         "__type": "GetItemJsonRequest:#Exchange",
         "Header": {
@@ -386,23 +409,46 @@ def _get_item_status(client: OWAClient, item_id: str) -> dict:
                 "AdditionalProperties": [
                     {"__type": "PropertyUri:#Exchange", "FieldURI": "Categories"},
                     {"__type": "PropertyUri:#Exchange", "FieldURI": "item:Flag"},
+                    {"__type": "PropertyUri:#Exchange", "FieldURI": "IsRead"},
+                    {"__type": "PropertyUri:#Exchange", "FieldURI": "HasAttachments"},
+                    {"__type": "PropertyUri:#Exchange", "FieldURI": "Importance"},
                 ],
             },
-            "ItemIds": [{"__type": "ItemId:#Exchange", "Id": item_id}],
+            "ItemIds": [
+                {"__type": "ItemId:#Exchange", "Id": iid} for iid in item_ids
+            ],
         },
     }
 
     data = client.request("GetItem", payload)
-    for msg in client.extract_items(data):
-        if msg.get("ResponseClass") == "Error":
-            raise RuntimeError(msg.get("MessageText", "GetItem failed."))
-        for item in msg.get("Items", []):
-            return {
-                "categories": list(item.get("Categories") or []),
-                "flag_status": (item.get("Flag") or {}).get("FlagStatus", "NotFlagged"),
-            }
+    messages = client.extract_items(data)
 
-    raise RuntimeError("GetItem returned no item for this ItemId.")
+    statuses: dict[str, dict] = {}
+    errors: dict[str, str] = {}
+    for iid, msg in zip(item_ids, messages):
+        if msg.get("ResponseClass") == "Error":
+            errors[iid] = msg.get("MessageText", "GetItem failed.")
+            continue
+        item = next(iter(msg.get("Items", [])), None)
+        if item is None:
+            errors[iid] = "GetItem returned no item for this ItemId."
+            continue
+        statuses[iid] = {
+            "categories": list(item.get("Categories") or []),
+            "flag_status": (item.get("Flag") or {}).get("FlagStatus", "NotFlagged"),
+            "is_read": bool(item.get("IsRead", False)),
+            "has_attachments": bool(item.get("HasAttachments", False)),
+            "importance": item.get("Importance", "Normal"),
+        }
+
+    # A response shorter than the request means the ids off the end never got
+    # a ResponseMessage at all - a shape not yet observed on this backend, but
+    # zip() alone would otherwise just silently drop them rather than report
+    # a failure for each.
+    for iid in item_ids[len(messages):]:
+        errors[iid] = "GetItem returned no ResponseMessage for this ItemId."
+
+    return statuses, errors
 
 
 def _bulk_result(action: str, updated: list[str], failed: list[dict], requested: int) -> dict:
@@ -455,20 +501,101 @@ def _build_recipient_list(emails: str) -> list[dict]:
     return recipients
 
 
-_AQS_LITE_KEYWORDS = {"subject", "from", "category", "isread", "hasattachment"}
+_AQS_LITE_KEYWORDS = {
+    "subject", "from", "category", "isread", "hasattachment", "received", "sent",
+}
+
+# Fields the client-side fallback's FindItem/Default read actually carries for
+# each of the two date keywords above (see _local_search_matches).
+_AQS_DATE_FIELDS = {"received": "DateTimeReceived", "sent": "DateTimeSent"}
 
 # Keywords the search_emails docstring advertises as valid AQS syntax (because
 # the server-side QueryString search - when it works - does support them) but
 # that _local_search_matches has no field to check locally. A token using one
-# of these must never fall through to the free-text branch: "received:>2026-
-# 01-01" as a literal substring will never appear in a subject/preview/sender,
-# so treating it as a search term silently guarantees zero matches whenever
-# the fallback runs - indistinguishable from "no emails matched" unless it is
-# reported. Dropping the token (searching everything else in the query, unfiltered
-# on this field) is what the docstring already promises: "reduced subset".
+# of these must never fall through to the free-text branch: "size:>5000" as a
+# literal substring will never appear in a subject/preview/sender, so treating
+# it as a search term silently guarantees zero matches whenever the fallback
+# runs - indistinguishable from "no emails matched" unless it is reported.
+# Dropping the token (searching everything else in the query, unfiltered on
+# this field) is what the docstring already promises: "reduced subset".
+# received/sent used to be here too - promoted above once _local_search_matches
+# grew a real date comparison (see PROJECT_STATUS.md §4, "search_emails' date
+# filters don't filter").
 _AQS_KNOWN_UNSUPPORTED_KEYWORDS = {
-    "body", "to", "cc", "bcc", "participants", "sent", "received", "size", "importance",
+    "body", "to", "cc", "bcc", "participants", "size", "importance",
 }
+
+
+def _parse_date_filter_value(raw: str) -> tuple[str, datetime] | None:
+    """Parse a received:/sent: filter value into (operator, date).
+
+    The value is whatever followed the keyword's ":" verbatim, e.g. the
+    ">2026-01-01" in "received:>2026-01-01". Recognizes >, <, >=, <= ; a bare
+    date with no operator is treated as "=" (matches that calendar day).
+    Returns None for a value that doesn't parse as a date at all (any
+    supported format from utils.parse_date), so the caller degrades this one
+    filter out of the match rather than raising out of the whole search.
+    """
+    match = re.match(r"^(>=|<=|>|<)?\s*(.+)$", raw.strip())
+    if not match:
+        return None
+    op = match.group(1) or "="
+    try:
+        return op, parse_date(match.group(2).strip())
+    except ValueError:
+        return None
+
+
+def _parse_item_wire_date(raw: str) -> datetime | None:
+    """Parse an item's DateTimeReceived/DateTimeSent wire value to a naive
+    datetime (this codebase's naive-UTC convention for Exchange timestamps -
+    see owa_client._parse_schedule_dt), tolerating a fractional-seconds
+    suffix utils.parse_iso_datetime doesn't strip (e.g.
+    "2026-09-17T08:00:00.123Z"). Returns None rather than raising - one
+    unparseable item must not take down the whole scan.
+    """
+    if not raw:
+        return None
+    try:
+        return parse_iso_datetime(raw)
+    except ValueError:
+        pass
+    cleaned = raw.split("Z")[0].split("+")[0].split(".")[0]
+    try:
+        return datetime.strptime(cleaned, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+
+
+def _item_date_matches(item: dict, keyword: str, values: list[str]) -> bool:
+    """Check a received:/sent: filter's date bound(s) against one item.
+
+    A date-only bound denotes midnight of that date; > / < compare against
+    that instant (so "received:>2026-08-18" includes the rest of the 18th,
+    not just the 19th onward), "=" (no operator given) compares calendar
+    days. An item whose date field is missing or unparseable, or a filter
+    value that doesn't parse as a date, is treated as a non-match for *that*
+    bound - dropping the whole search silently on a parse hiccup would be the
+    same failure mode this fix exists to close, but so would matching
+    everything through an unenforceable filter.
+    """
+    item_dt = _parse_item_wire_date(item.get(_AQS_DATE_FIELDS[keyword], ""))
+    for raw_value in values:
+        parsed = _parse_date_filter_value(raw_value)
+        if item_dt is None or parsed is None:
+            return False
+        op, bound = parsed
+        if op == ">" and not item_dt > bound:
+            return False
+        if op == "<" and not item_dt < bound:
+            return False
+        if op == ">=" and not item_dt >= bound:
+            return False
+        if op == "<=" and not item_dt <= bound:
+            return False
+        if op == "=" and item_dt.date() != bound.date():
+            return False
+    return True
 
 
 def _parse_aqs_lite(query: str) -> tuple[list[str], dict[str, list[str]], list[str]]:
@@ -529,6 +656,10 @@ def _local_search_matches(item: dict, terms: list[str], filters: dict[str, list[
             return False
     for val in filters.get("hasattachment", []):
         if item.get("HasAttachments", False) != (val.lower() in ("true", "1", "yes")):
+            return False
+    for keyword in ("received", "sent"):
+        values = filters.get(keyword, [])
+        if values and not _item_date_matches(item, keyword, values):
             return False
 
     haystack = f"{subject} {preview} {from_name} {from_email}"
@@ -1014,6 +1145,17 @@ def _page_conversations(
     indistinguishable from an honoured one. Not worth trading this function's
     one guarantee for a faster rare path; if you revisit it, the probe has to
     be decisive, not merely usually right.
+
+    A server that ignores `Offset` altogether (`_PAGINATION_OFFSET_UNSUPPORTED`,
+    detected by `_scan_conversations`'s anchor check) used to just get reported,
+    with the caller's data unreachable at any depth - a real regression, not a
+    documented limitation: `get_emails(offset=80)` returned `[]` in a folder
+    that had a hundred more conversations. Fixed 2026-09-17 by falling back to
+    exactly the technique `unread_only` already uses - scan from folder row 0
+    and skip client-side - the moment the honoured-offset attempt reports that
+    error. Costs a full scan instead of one indexed page, bounded by
+    _CONV_MAX_SCAN like every other client-side path here, but it reaches the
+    data the first attempt could not.
     """
     server_offset = 0 if unread_only else offset
     skip = offset if unread_only else 0
@@ -1024,6 +1166,13 @@ def _page_conversations(
     kept, raw_seen, stop_reason = _scan_conversations(
         client, folder_id, server_offset, skip + limit + 1, keep
     )
+
+    if stop_reason == _PAGINATION_OFFSET_UNSUPPORTED and not unread_only:
+        skip = offset
+        kept, raw_seen, stop_reason = _scan_conversations(
+            client, folder_id, 0, skip + limit + 1, keep
+        )
+
     return _conversation_page(kept, offset, skip, limit, raw_seen, stop_reason)
 
 
@@ -1075,6 +1224,34 @@ def _page_conversations_by_category(
 # ------------------------------------------------------------------
 
 
+_IDS_ONLY_FIELDS = ("item_id", "conversation_id", "date", "subject")
+
+
+def _resolve_ids_only_fields(
+    fields: str, ids_only: bool
+) -> tuple[tuple[str, ...], str | None, str | None]:
+    """Parse get_emails' `fields` argument into the tuple of row keys to keep.
+
+    Returns (selected_fields, warning, error). `error` set means the caller
+    asked for a name that isn't one of `_IDS_ONLY_FIELDS` - reported rather
+    than silently dropped, same reasoning as the AQS-lite fallback's dropped
+    keywords. `warning` set means `fields` was given without `ids_only=True`,
+    where it has nothing to narrow; the call still proceeds unnarrowed rather
+    than failing over an argument combination that just doesn't apply.
+    Selected fields keep `_IDS_ONLY_FIELDS`' canonical order regardless of the
+    order requested, so the response shape doesn't depend on argument order.
+    """
+    if not fields.strip():
+        return _IDS_ONLY_FIELDS, None, None
+    if not ids_only:
+        return _IDS_ONLY_FIELDS, "fields is ignored when ids_only is False.", None
+    requested = [f.strip() for f in fields.split(",") if f.strip()]
+    unknown = [f for f in requested if f not in _IDS_ONLY_FIELDS]
+    if unknown:
+        return (), None, f"Unknown fields: {unknown}. Valid fields: {list(_IDS_ONLY_FIELDS)}."
+    return tuple(f for f in _IDS_ONLY_FIELDS if f in requested), None, None
+
+
 @mcp.tool()
 def get_emails(
     folder: str = "Inbox",
@@ -1083,6 +1260,7 @@ def get_emails(
     include_body: bool = False,
     unread_only: bool = False,
     ids_only: bool = False,
+    fields: str = "",
     ctx: Context = None,
 ) -> str:
     """Get emails from a mailbox folder, grouped by conversation/thread.
@@ -1106,6 +1284,14 @@ def get_emails(
             enumerate the folder from the start and can hit the scan cap.
         ids_only: If True, return only conversation/item IDs and dates
             (compact, for bulk ops). Max limit raised to 500 in this mode.
+        fields: Only meaningful with ids_only=True. Comma-separated subset of
+            "item_id", "conversation_id", "date", "subject" to include per
+            row - e.g. "item_id" alone for a batch that only needs ids to feed
+            into another tool. Default "" keeps all four. ids_only(limit=500)
+            with every field returns a payload large enough to exceed some
+            hosts' own response-size limit; narrowing to just the field(s)
+            actually needed is the fix, not lowering limit. Ignored (with a
+            warning) when ids_only=False - there is nothing to narrow there.
 
     Every response carries a `pagination` object, so an empty page is never
     ambiguous: `reached_end_of_folder` true means the folder really has no
@@ -1129,6 +1315,10 @@ def get_emails(
             limit = 1
         offset = max(0, offset)
 
+        selected_fields, fields_warning, fields_error = _resolve_ids_only_fields(fields, ids_only)
+        if fields_error:
+            return json.dumps({"error": fields_error})
+
         # Resolve folder name/path/id to ID
         folder_id, error_json, _ = _resolve_folder_or_error(client, folder, "folder")
         if error_json:
@@ -1148,17 +1338,21 @@ def get_emails(
             result = []
             for conv in conversations:
                 item_ids = conv.get("ItemIds") or conv.get("GlobalItemIds") or []
-                result.append({
+                row = {
                     "conversation_id": conv.get("ConversationId", {}).get("Id", ""),
                     "item_id": item_ids[-1].get("Id", "") if item_ids else "",
                     "date": conv.get("LastDeliveryTime", ""),
                     "subject": conv.get("ConversationTopic", ""),
-                })
-            return json.dumps({
+                }
+                result.append({field: row[field] for field in selected_fields})
+            response = {
                 "item_ids": result,
                 "count": len(result),
                 "pagination": pagination,
-            })
+            }
+            if fields_warning:
+                response["warning"] = fields_warning
+            return json.dumps(response)
 
         emails = []
         for conv in conversations:
@@ -1228,17 +1422,20 @@ def search_emails(
     never actually runs it (zero results with no error), and some
     combinations (e.g. search_all_folders) can fail outright on the same
     backends. Either way, this tool transparently falls back to a client-side
-    scan of the target folder(s), matching a reduced subset of the same syntax (bare
-    terms, subject:, from:, category:, isread:, hasattachment:) against each
-    message's subject/preview/sender/categories - slower, and no real body
-    search, but still returns something useful. When that fallback runs,
-    keywords the server-side syntax supports but the fallback cannot check
-    locally (body:, to:, cc:, bcc:, participants:, sent:, received:, size:,
+    scan of the target folder(s), matching a reduced subset of the same syntax
+    (bare terms, subject:, from:, category:, isread:, hasattachment:,
+    received:, sent:) against each message's subject/preview/sender/
+    categories/receive-and-sent timestamps - slower, and no real body search,
+    but still returns something useful, and genuinely applies received:/sent:
+    as a real date comparison rather than ignoring them (fixed 2026-09-17; see
+    PROJECT_STATUS.md §4 - they used to be silently dropped, and before that,
+    silently misread as free text that could never match). When that fallback
+    runs, keywords the server-side syntax supports but the fallback still
+    cannot check locally (body:, to:, cc:, bcc:, participants:, size:,
     importance:) are dropped rather than matched literally, and named in the
-    response's fallback_unsupported_filters - so a date-only query like
-    "received:>2026-01-01" on a tenant whose content index is broken returns
-    an unfiltered scan of the folder (with a warning), not a guaranteed,
-    silent zero.
+    response's fallback_unsupported_filters - so e.g. a size:-only query on a
+    tenant whose content index is broken returns an unfiltered scan of the
+    folder (with a warning), not a guaranteed, silent zero.
 
     Args:
         query: AQS query string, e.g. "budget report", 'from:alice subject:"Q3 plan"'.
@@ -1403,21 +1600,28 @@ def get_email(item_id: str, ctx: Context = None) -> str:
 
 @mcp.tool()
 def get_email_status(item_ids: list[str], ctx: Context = None) -> str:
-    """Get only categories and flag_status for a batch of emails.
+    """Get categories, flag_status, is_read, has_attachments and importance
+    for a batch of emails - one request regardless of batch size.
 
-    For a triage pass that just needs to know "did this item already get
-    categorized/flagged", this is the cheap alternative to get_email or
-    get_emails(include_body=True): it never reads a body, recipients or
-    attachments. It uses the same narrow IdOnly shape
+    For a triage pass that just needs to know an item's filing status -
+    already categorized/flagged/read, has attachments, its importance - this
+    is the cheap alternative to get_email or get_emails(include_body=True):
+    it never reads a body, recipients or attachments, and it costs exactly
+    one GetItem request no matter how many item_ids are passed (a single
+    request carrying every ItemId, not one request per item - previously this
+    tool issued one GetItem per item_id, see PROJECT_STATUS.md's #116 gap
+    note, now closed). It uses the same narrow IdOnly shape
     assign_email_categories relies on internally to merge categories, so it
     also works on MeetingRequestMessage items, which fault OWA's serialiser
     at BaseShape: AllProperties (see get_email's item_not_serializable hint).
 
-    Unlike get_emails' flag_status - populated from FindConversation and
-    documented there as unverified against this tenant - the value returned
-    here comes from the same per-item GetItem read get_emails itself points
-    to for a confirmed value, just without the body that read also used to
-    carry.
+    categories/flag_status come from the same per-item GetItem read
+    get_emails' flag_status field itself points to for a confirmed value (that
+    field is populated from FindConversation instead, and documented there as
+    unverified against this tenant), just without the body that read also
+    used to carry. is_read/has_attachments/importance are read via the same
+    GetItem call but with FieldURI spellings not yet confirmed against a live
+    mailbox - Pending in PROJECT_STATUS.md until verified.
 
     Args:
         item_ids: List of Exchange ItemIds to read.
@@ -1429,22 +1633,21 @@ def get_email_status(item_ids: list[str], ctx: Context = None) -> str:
     """
     try:
         client = _get_client(ctx)
-        items, failed = [], []
-        for iid in item_ids:
-            try:
-                status = _get_item_status(client, iid)
-            except SessionExpiredError:
-                raise
-            except Exception as e:
-                failed.append(item_error(iid, str(e)))
-                continue
-            items.append(
-                {
-                    "item_id": iid,
-                    "categories": status["categories"],
-                    "flag_status": status["flag_status"],
-                }
-            )
+        statuses, errors = _get_items_status(client, item_ids)
+
+        items = [
+            {
+                "item_id": iid,
+                "categories": statuses[iid]["categories"],
+                "flag_status": statuses[iid]["flag_status"],
+                "is_read": statuses[iid]["is_read"],
+                "has_attachments": statuses[iid]["has_attachments"],
+                "importance": statuses[iid]["importance"],
+            }
+            for iid in item_ids
+            if iid in statuses
+        ]
+        failed = [item_error(iid, errors[iid]) for iid in item_ids if iid in errors]
 
         result = {"items": items, "count": len(items)}
         if failed:
