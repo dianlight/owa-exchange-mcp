@@ -77,6 +77,7 @@ python -m tests.unit.test_capability_classify
 python -m tests.unit.test_mailbox_identity
 python -m tests.unit.test_item_errors
 python -m tests.unit.test_conversation_paging
+python -m tests.unit.test_ids_only_fields
 python -m tests.unit.test_copilot_answer_text
 python -m tests.unit.test_recipient_list
 python -m tests.unit.test_folder_id_dict

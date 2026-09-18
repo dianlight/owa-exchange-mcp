@@ -16,9 +16,13 @@ FindConversation at Offset 0, MaxEntriesReturned 200, filtered client-side, so
 a category applied to anything older than the newest 200 conversations could
 never match and nothing said so (issue #5).
 
-These cases pin the replacement's two guarantees, neither of which a live smoke
-test can provoke on demand: any offset resolves to a real folder position, and
-an empty page always says *why* it is empty.
+These cases pin the replacement's three guarantees, none of which a live smoke
+test can provoke on demand: any offset resolves to a real folder position, an
+empty page always says *why* it is empty, and a server that ignores `Offset`
+outright is recovered via a scan-from-zero-skip-client-side fallback rather
+than leaving the caller's data permanently unreachable (fixed 2026-09-17,
+after that fallback itself was found still bounded by _CONV_MAX_SCAN rather
+than silently answering wrong past the cap).
 
 Run:
     python -m tests.unit.test_conversation_paging
@@ -59,7 +63,14 @@ def conv(index: int, unread: int = 0, categories=None) -> dict:
 class FakeClient:
     """Serves a synthetic folder, with the backend quirks worth simulating.
 
-    honour_offset=False models a backend that ignores IndexedPageView.Offset.
+    honour_offset=False models a backend that ignores IndexedPageView.Offset
+    unconditionally, on every request - the worst case, where no client-side
+    technique can reach anything past its first response.
+    offset_cap models a milder, more common quirk: the server serves any
+    Offset up to its own cached window correctly, but a single request that
+    jumps past that window gets silently reset to position 0. That is what
+    lets a from-zero scan (which only ever asks for the *next* contiguous
+    slice) reach data a direct deep jump cannot.
     max_per_call caps a response below MaxEntriesReturned, which this backend
     is already known to do (the reason a short page must not end the folder).
     honour_unread_filter=False models one that accepts ViewFilter: Unread and
@@ -67,11 +78,12 @@ class FakeClient:
     """
 
     def __init__(self, folder, honour_offset=True, max_per_call=None,
-                 honour_unread_filter=False):
+                 honour_unread_filter=False, offset_cap=None):
         self.folder = folder
         self.honour_offset = honour_offset
         self.max_per_call = max_per_call
         self.honour_unread_filter = honour_unread_filter
+        self.offset_cap = offset_cap
         self.calls: list[tuple[int, int, str]] = []
 
     def request(self, action, payload):
@@ -86,7 +98,10 @@ class FakeClient:
         if view_filter == "Unread" and self.honour_unread_filter:
             source = [c for c in self.folder if c.get("UnreadCount", 0) > 0]
 
-        start = offset if self.honour_offset else 0
+        if self.offset_cap is not None:
+            start = 0 if offset > self.offset_cap else offset
+        else:
+            start = offset if self.honour_offset else 0
         if self.max_per_call is not None:
             count = min(count, self.max_per_call)
         rows = source[start:start + count]
@@ -199,21 +214,60 @@ def test_short_page_does_not_end_the_folder():
     check("short-page deep error", deep_meta.get("error_code"), None)
 
 
-def test_server_ignoring_offset_is_reported_not_silently_wrong():
+def test_server_ignoring_offset_recovers_via_scan_and_skip_fallback():
+    """A milder, more common quirk than total Offset-blindness: the server
+    serves any Offset within its own cached window correctly, but a single
+    request that jumps past that window resets to position 0. A direct
+    request for offset=240 fails against a 200-row window - but the same
+    from-zero-scan-and-skip technique unread_only already uses only ever asks
+    for the *next* contiguous slice, so it never takes that jump and recovers
+    the real page instead of leaving it permanently unreachable. Fixed
+    2026-09-17.
+    """
+    client = FakeClient([conv(i) for i in range(300)], offset_cap=200)
+    page, meta = _page_conversations(client, "inbox", offset=240, limit=20,
+                                     unread_only=False)
+    check("recovered ids", ids(page), [f"conv-{i}" for i in range(240, 260)])
+    check("recovered error", meta.get("error_code"), None)
+    check("recovered not ended", meta["reached_end_of_folder"], False)
+    check("recovered has_more", meta["has_more"], True)
+    check("recovered next_offset", meta["next_offset"], 260)
+
+
+def test_offset_unsupported_fallback_still_bounded_by_scan_limit():
+    """The fallback is a real scan, not a magic escape hatch: if even a
+    from-zero scan can't reach the requested depth within _CONV_MAX_SCAN,
+    that must still be named rather than silently answered wrong."""
+    folder = [conv(i) for i in range(_CONV_MAX_SCAN + 500)]
+    client = FakeClient(folder, offset_cap=_CONV_MAX_SCAN)
+    page, meta = _page_conversations(client, "inbox",
+                                     offset=_CONV_MAX_SCAN + 100, limit=20,
+                                     unread_only=False)
+    check("still-unreachable page", page, [])
+    check("still-unreachable code", meta.get("error_code"),
+          _PAGINATION_SCAN_LIMIT)
+    check("still-unreachable not ended", meta["reached_end_of_folder"], False)
+    check("still-unreachable has_more", meta["has_more"], True)
+
+
+def test_totally_offset_blind_server_still_reported_not_silently_wrong():
     """The one failure mode worse than an empty page: page 1 labelled page 13.
 
-    A single response cannot reveal it, which is why a deep page identifies
-    row 0 first and compares.
+    A backend that ignores Offset on *every* request, including the
+    fallback's own from-zero scan, leaves no client-side technique able to
+    reach anything past its first response - that must stay reported, not
+    guessed at, and the retry must not turn into an infinite loop or a wrong
+    answer.
     """
     client = FakeClient([conv(i) for i in range(300)], honour_offset=False)
     page, meta = _page_conversations(client, "inbox", offset=240, limit=20,
                                      unread_only=False)
-    check("ignored-offset page", page, [])
-    check("ignored-offset code", meta.get("error_code"),
+    check("still-blind page", page, [])
+    check("still-blind code", meta.get("error_code"),
           _PAGINATION_OFFSET_UNSUPPORTED)
-    check("ignored-offset not ended", meta["reached_end_of_folder"], False)
-    check("ignored-offset has_more", meta["has_more"], True)
-    check("ignored-offset has remediation", bool(meta.get("error")), True)
+    check("still-blind not ended", meta["reached_end_of_folder"], False)
+    check("still-blind has_more", meta["has_more"], True)
+    check("still-blind has remediation", bool(meta.get("error")), True)
 
 
 def test_scan_limit_is_reported_not_silently_truncated():
@@ -423,7 +477,9 @@ TESTS = [
     test_last_partial_page_is_the_end,
     test_empty_folder_is_the_end_not_an_error,
     test_short_page_does_not_end_the_folder,
-    test_server_ignoring_offset_is_reported_not_silently_wrong,
+    test_server_ignoring_offset_recovers_via_scan_and_skip_fallback,
+    test_offset_unsupported_fallback_still_bounded_by_scan_limit,
+    test_totally_offset_blind_server_still_reported_not_silently_wrong,
     test_scan_limit_is_reported_not_silently_truncated,
     test_unread_offset_counts_filtered_rows,
     test_unread_offset_starts_scan_at_zero,
