@@ -8,6 +8,7 @@ requests.Session replaying exported cookies can't replicate.
 
 import re
 import threading
+import time
 import uuid
 from datetime import datetime
 from typing import Iterator, NamedTuple
@@ -117,6 +118,21 @@ class FolderResolution(NamedTuple):
     matched_by: str
     candidates: tuple[dict, ...] = ()
     error_code: str | None = None
+
+
+# Substrate Search has been observed (2026-09-18, issue brief item 9) to
+# answer a query with a confident, unflagged, empty result on one call and
+# the correct non-empty result on an *identical* immediate retry - no
+# parameters changed, so this isn't a query problem, it's the backend
+# occasionally not being ready yet (an indexing-lag/session-warmup race, going
+# by the "self-corrects with no code change" symptom). Same asymmetry as
+# BrowserSession._SESSION_PROBE_ATTEMPTS: a false "empty" is expensive for the
+# caller (indistinguishable from a true zero-match search) while a false
+# "non-empty" cannot happen here - any result this method returns already
+# came from the server, so a non-empty answer is trusted on the first try and
+# only a *bare* empty pays for a second look.
+_SUBSTRATE_EMPTY_RETRY_ATTEMPTS = 2
+_SUBSTRATE_EMPTY_RETRY_SETTLE_SECONDS = 1.5
 
 
 class OWAClient:
@@ -1196,7 +1212,21 @@ class OWAClient:
         read as zero results. So Cvid/LogicalId here must be real per-call
         GUIDs, and the response is checked for that error shape before being
         treated as a result.
+
+        A bare empty result is retried up to _SUBSTRATE_EMPTY_RETRY_ATTEMPTS
+        times (see that constant) before being trusted, because this backend
+        has been observed answering an identical query with zero results on
+        one call and the correct non-empty results on an immediate retry -
+        every non-empty result is still trusted on the first try.
         """
+        for attempt in range(1, _SUBSTRATE_EMPTY_RETRY_ATTEMPTS + 1):
+            results = self._search_conversations_substrate_once(query, from_=from_, size=size)
+            if results or attempt >= _SUBSTRATE_EMPTY_RETRY_ATTEMPTS:
+                return results
+            time.sleep(_SUBSTRATE_EMPTY_RETRY_SETTLE_SECONDS)
+
+    def _search_conversations_substrate_once(self, query: str, *, from_: int = 0, size: int = 25) -> list[dict]:
+        """One Substrate Search request/parse, no retry - see search_conversations_substrate."""
         payload = {
             "Cvid": str(uuid.uuid4()),
             "Scenario": {"Name": "owa.react"},
