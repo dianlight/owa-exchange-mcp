@@ -1692,7 +1692,7 @@ text — matching what `get_emails` on the same folder showed independently.
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
 | 101 | `get_emails` | List emails from a folder, grouped by conversation/thread, with unread/pagination filters; each row includes `flag_status`, and `body_error` when `include_body=True` could not fetch that row. `offset` is a real folder position at any depth, and every response carries a `pagination` block (`has_more`/`next_offset`/`reached_end_of_folder`, plus `error_code` when paging stopped early) so an empty page is never ambiguous. If a direct-offset request reports the server ignored `Offset` outright (`error_code: "pagination_offset_unsupported"`), the same call now retries via a from-zero scan-and-skip before giving up (§4) — recovers a server that resets to row 0 for a cold jump past its own cached window, still bounded by `_CONV_MAX_SCAN`, and still reports the same error if the server ignores `Offset` on every request, not just deep ones. `ids_only=True` also takes a `fields` param (comma-separated subset of `item_id`/`conversation_id`/`date`/`subject`) to shrink the ~150KB `limit=500` payload down to just the field(s) a caller actually needs | `tests/smoke/tests/test_get_emails.py`, `tests/smoke/tests/test_email_flag.py`, `tests/smoke/tests/test_unfetchable_item_resilience.py`, `tests/smoke/tests/test_get_emails_pagination.py`, `tests/unit/test_conversation_paging.py`, `tests/unit/test_ids_only_fields.py` | Pending (2026-09-17) — the offset-unsupported fallback and the `fields` param are new and unverified against a live mailbox; the fallback's fake-transport test models a plausible but unconfirmed server quirk (bounded cached window, cold-jump reset), not an observed one. Earlier OK (2026-09-11) — deep-offset pagination rewritten and verified live: server-side `Offset` honoured and aligned with a from-zero enumeration, offsets 0/60/100/120/140/240 all return full pages with monotonically older dates, `ids_only limit=500` no longer capped at 200, empty pages self-describing (see §4). Earlier OK (2026-09-10) for `flag_status` on every row and per-row `include_body` degradation still holds; re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change | Stable |
-| 102 | `get_email` | Get a single email's full body, recipients, attachments, and `flag_status` (follow-up flag) | `tests/smoke/tests/test_get_email_detail.py`, `tests/smoke/tests/test_email_flag.py`, `tests/smoke/tests/test_unfetchable_item_resilience.py`, `tests/unit/test_item_errors.py` | OK (2026-09-11) — `flag_status` verified round-tripping all three states. Still fails on the messages OWA cannot serialise at full property shape (this tool asks for all of them by design); now returns `error_code: "item_not_serializable"` plus a `hint` naming the narrow reads that *do* work on the same item, see §4. `test_get_email_detail` is flaky when it happens to pick one. | Stable |
+| 102 | `get_email` | Get a single email's full body, recipients, attachments, and `flag_status` (follow-up flag) | `tests/smoke/tests/test_get_email_detail.py`, `tests/smoke/tests/test_email_flag.py`, `tests/smoke/tests/test_unfetchable_item_resilience.py`, `tests/unit/test_item_errors.py` | OK (2026-09-11) — `flag_status` verified round-tripping all three states. Still fails on the messages OWA cannot serialise at full property shape (this tool asks for all of them by design); now returns `error_code: "item_not_serializable"` plus a `hint` naming the narrow reads that *do* work on the same item, see §4. `test_get_email_detail` is flaky when it happens to pick one. Bisect attempted 2026-09-17/18 (issue #12) to isolate the culprit `FieldURI`: no reproducing item found live across 332 `MeetingRequestMessage` candidates sampled from Inbox/Deleted Items/Sent Items, so the bisect couldn't run — see §4. | Stable |
 | 103 | `send_email` | Send a new email (to/cc/bcc, HTML or plain text) | `tests/smoke/tests/test_email_lifecycle.py`, `tests/unit/test_recipient_list.py` | OK (2026-09-07) | Stable |
 | 104 | `reply_email` | Reply (or reply-all) to an email | `tests/smoke/tests/test_email_lifecycle.py`, `tests/unit/test_recipient_list.py` | OK (2026-09-07) | Stable |
 | 105 | `forward_email` | Forward an email to new recipients | `tests/smoke/tests/test_email_lifecycle.py`, `tests/unit/test_recipient_list.py` | OK (2026-09-07) | Stable |
@@ -1987,9 +1987,27 @@ hold a request open for.
   work. Guarded by `tests/smoke/tests/test_unfetchable_item_resilience.py`,
   `tests/smoke/tests/test_meeting_request_categories.py` and
   `tests/unit/test_item_errors.py`.
-  Still open: *which* property in the `AllProperties` set OWA can't render is unidentified
-  (a one-property-at-a-time bisect on a known-bad item would settle it, and would tell us
-  whether `get_email` can degrade to a near-complete narrow shape instead of failing).
+  **Bisect attempted, inconclusive (2026-09-17/18, issue #12)**: the plan was to find a
+  currently-failing item live, then bisect its `AllProperties` set one `FieldURI` at a time
+  via explicit `AdditionalProperties` to isolate the culprit. It could not get past step one:
+  a live scan of 332 `MeetingRequestMessage`-class items — 50 from Inbox (of 21237 total in
+  the folder), 215 from Deleted Items across offsets 0-2200 (of 10127 total), and 83 from
+  Sent Items across offsets 0-1800 (of 9503 total) — each tested with the real
+  `BaseShape: "AllProperties"` shape this bug report describes, reproduced **zero** failures
+  on this mailbox as it stands today. That sample is a small fraction of what's in the
+  mailbox (the three folders combined hold ~41000 items), so this does not prove the fault is
+  gone, only that it is too sparse or too specific to catch with a few hundred probes; an
+  exhaustive scan was not attempted because each `AllProperties` probe is a real browser-tab
+  round trip and the item counts make that cost prohibitive for a search with no signal on
+  where to look. The fault is real (this section's own history, and the three items it names
+  above, are the record of it) but is tied to specific item content that is not present in
+  the sampled data, not to the `MeetingRequestMessage` class as a whole — so a bisect needs a
+  reproducing item *at the time it's run*, and one could not be produced on demand. Nobody
+  should repeat this same blind scan expecting a different outcome; the useful next step if
+  this recurs is to bisect the *specific* item on the spot,
+  before it's deleted, moved, or otherwise changed, rather than searching for a fresh one.
+  `get_email`'s `error_code`/`hint` degradation (above) remains the right mitigation until
+  then. Still open: *which* property in the `AllProperties` set OWA can't render.
 - **`get_emails` deep pagination silently truncated (#101). Fixed and verified live
   2026-09-11.** Reported by a client skill doing backlog processing: past
   a certain `offset`, `get_emails` returned `{"emails": [], "count": 0}` — a normal
