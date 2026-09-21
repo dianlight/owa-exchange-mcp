@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/dianlight/owa-exchange-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/dianlight/owa-exchange-mcp/actions/workflows/ci.yml)
 
-MCP (Model Context Protocol) server for any Microsoft Exchange / OWA (Outlook Web Access) deployment. Gives LLM agents access to email, calendar, tasks (Microsoft To Do), directory search, folders, categories, availability, meeting analytics, and Copilot delegation via 62 tools, plus a capability-discovery module for mapping the OWA surface this server doesn't cover yet.
+MCP (Model Context Protocol) server for any Microsoft Exchange / OWA (Outlook Web Access) deployment. Gives LLM agents access to email, calendar, tasks (Microsoft To Do), directory search, folders, categories, availability, meeting analytics, and Copilot delegation via 63 tools, plus a capability-discovery module for mapping the OWA surface this server doesn't cover yet.
 
 Works with any on-premise or hosted Exchange server that exposes OWA.
 
@@ -198,9 +198,9 @@ Note that this is *diagnosis only*. The login window never aborts early on an
 error message: you're sitting in front of it, so a mistyped password or an
 accidentally denied push is something you just retry there.
 
-## Tools (62)
+## Tools (63)
 
-### Email (17)
+### Email (18)
 | Tool | Description |
 |---|---|
 | `get_emails` | List emails from a folder with filtering |
@@ -220,6 +220,7 @@ accidentally denied push is something you just retry there.
 | `assign_email_categories` | Tag emails with one or more categories |
 | `remove_email_categories` | Remove categories from emails |
 | `find_emails_by_category` | Find emails tagged with a given category |
+| `triage_emails` | Combined batch triage: mark_read, add/remove categories, flag, and move to a folder in one call |
 
 ### Calendar (11)
 | Tool | Description |
