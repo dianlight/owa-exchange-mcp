@@ -9,6 +9,7 @@ across all tool invocations.
 import argparse
 import asyncio
 import atexit
+import json
 import os
 import sys
 import threading
@@ -17,9 +18,10 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 
 from exchange_mcp import auth_errors
+from exchange_mcp import hot_reload
 from exchange_mcp import mailbox_timezone
 from exchange_mcp import profile_lock
 from exchange_mcp import __version__
@@ -359,15 +361,35 @@ import exchange_mcp.tools.discovery      # noqa: E402, F401
 # Microsoft can restyle without notice; the smoke test is the tripwire.
 KNOWN_BUGGY_TOOLS: dict[str, str] = {}
 
+_stable_mode_active = False
+
 
 def _apply_stable_mode() -> None:
     """Remove known-buggy tools from the MCP tool listing so --stable clients can't call them."""
+    global _stable_mode_active
+    _stable_mode_active = True
     for name, reason in KNOWN_BUGGY_TOOLS.items():
         try:
             mcp.remove_tool(name)
             _log(f"--stable: excluded buggy tool '{name}' ({reason})")
         except Exception as exc:
             _log(f"--stable: could not exclude '{name}': {exc}")
+
+
+async def dev_reload_tool_modules(modules: list[str] | None = None, ctx: Context = None) -> str:
+    """DEV ONLY (EXCHANGE_MCP_DEV_RELOAD / --dev-reload): re-import one or more
+    exchange_mcp.tools.* modules in-process so edits to a tool's source take effect on this
+    running server without restarting it (which would drop the port and this process's
+    persistent browser session / OWA login). Scope is exactly the 11 domain tool modules —
+    nothing else is reloadable this way; changes to owa_client.py, browser_session.py,
+    server.py itself, etc. still need a real restart.
+    """
+    result = hot_reload.reload_modules(
+        mcp, modules, stable_mode_active=_stable_mode_active, known_buggy_tools=KNOWN_BUGGY_TOOLS,
+    )
+    if result["changed"] and ctx is not None:
+        await ctx.notify_tools_changed()
+    return json.dumps(result)
 
 
 def main():
@@ -406,10 +428,21 @@ def main():
         help="Exclude tools with a known, unfixable server-side bug (see PROJECT_STATUS.md) "
              "from the MCP tool listing, instead of exposing them to fail at call time.",
     )
+    parser.add_argument(
+        "--dev-reload",
+        action="store_true",
+        default=os.environ.get("EXCHANGE_MCP_DEV_RELOAD", "").strip().lower() in ("true", "1", "yes"),
+        help="Register dev_reload_tool_modules, letting a client re-import "
+             "exchange_mcp/tools/*.py in-process without restarting this server. "
+             "Off by default — dev-only, not for a shared prod instance.",
+    )
     args = parser.parse_args()
 
     if args.stable:
         _apply_stable_mode()
+
+    if args.dev_reload:
+        mcp.add_tool(dev_reload_tool_modules)
 
     # Launch the browser and check/establish the OWA session now, at process
     # start, rather than leaving it to app_lifespan. Under --transport http the
