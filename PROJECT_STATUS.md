@@ -1692,7 +1692,7 @@ text — matching what `get_emails` on the same folder showed independently.
 | ID | Tool | Description | Automated test | Manual QA / Status | Stability |
 |---|---|---|---|---|---|
 | 101 | `get_emails` | List emails from a folder, grouped by conversation/thread, with unread/pagination filters; each row includes `flag_status`, and `body_error` when `include_body=True` could not fetch that row. `offset` is a real folder position at any depth, and every response carries a `pagination` block (`has_more`/`next_offset`/`reached_end_of_folder`, plus `error_code` when paging stopped early) so an empty page is never ambiguous. If a direct-offset request reports the server ignored `Offset` outright (`error_code: "pagination_offset_unsupported"`), the same call now retries via a from-zero scan-and-skip before giving up (§4) — recovers a server that resets to row 0 for a cold jump past its own cached window, still bounded by `_CONV_MAX_SCAN`, and still reports the same error if the server ignores `Offset` on every request, not just deep ones. `ids_only=True` also takes a `fields` param (comma-separated subset of `item_id`/`conversation_id`/`date`/`subject`) to shrink the ~150KB `limit=500` payload down to just the field(s) a caller actually needs | `tests/smoke/tests/test_get_emails.py`, `tests/smoke/tests/test_email_flag.py`, `tests/smoke/tests/test_unfetchable_item_resilience.py`, `tests/smoke/tests/test_get_emails_pagination.py`, `tests/unit/test_conversation_paging.py`, `tests/unit/test_ids_only_fields.py` | Pending (2026-09-17) — the offset-unsupported fallback and the `fields` param are new and unverified against a live mailbox; the fallback's fake-transport test models a plausible but unconfirmed server quirk (bounded cached window, cold-jump reset), not an observed one. Earlier OK (2026-09-11) — deep-offset pagination rewritten and verified live: server-side `Offset` honoured and aligned with a from-zero enumeration, offsets 0/60/100/120/140/240 all return full pages with monotonically older dates, `ids_only limit=500` no longer capped at 200, empty pages self-describing (see §4). Earlier OK (2026-09-10) for `flag_status` on every row and per-row `include_body` degradation still holds; re-verified live 2026-09-14 on the mcp **v2** SDK (2.2.0, streamable-http, 60 tools listed) with no behaviour change | Stable |
-| 102 | `get_email` | Get a single email's full body, recipients, attachments, and `flag_status` (follow-up flag) | `tests/smoke/tests/test_get_email_detail.py`, `tests/smoke/tests/test_email_flag.py`, `tests/smoke/tests/test_unfetchable_item_resilience.py`, `tests/unit/test_item_errors.py` | OK (2026-09-11) — `flag_status` verified round-tripping all three states. Still fails on the messages OWA cannot serialise at full property shape (this tool asks for all of them by design); now returns `error_code: "item_not_serializable"` plus a `hint` naming the narrow reads that *do* work on the same item, see §4. `test_get_email_detail` is flaky when it happens to pick one. Bisect attempted 2026-09-17/18 (issue #12) to isolate the culprit `FieldURI`: no reproducing item found live across 332 `MeetingRequestMessage` candidates sampled from Inbox/Deleted Items/Sent Items, so the bisect couldn't run — see §4. | Stable |
+| 102 | `get_email` | Get a single email's full body, recipients, attachments, and `flag_status` (follow-up flag) | `tests/smoke/tests/test_get_email_detail.py`, `tests/smoke/tests/test_email_flag.py`, `tests/smoke/tests/test_unfetchable_item_resilience.py`, `tests/unit/test_item_errors.py` | OK (2026-09-11) — `flag_status` verified round-tripping all three states. Still fails on the messages OWA cannot serialise at full property shape (this tool asks for all of them by design); now returns `error_code: "item_not_serializable"` plus a `hint` naming the narrow reads that *do* work on the same item, see §4. `test_get_email_detail` is flaky when it happens to pick one. Bisect attempted 2026-09-17/18 and re-attempted exhaustively 2026-09-21 (issue #12) to isolate the culprit `FieldURI`: no reproducing item found live across every meeting-class item currently in Inbox, top-level Deleted Items, and Sent Items (11150 items total 2026-09-21), so the bisect still couldn't run — see §4. | Stable |
 | 103 | `send_email` | Send a new email (to/cc/bcc, HTML or plain text) | `tests/smoke/tests/test_email_lifecycle.py`, `tests/unit/test_recipient_list.py` | OK (2026-09-07) | Stable |
 | 104 | `reply_email` | Reply (or reply-all) to an email | `tests/smoke/tests/test_email_lifecycle.py`, `tests/unit/test_recipient_list.py` | OK (2026-09-07) | Stable |
 | 105 | `forward_email` | Forward an email to new recipients | `tests/smoke/tests/test_email_lifecycle.py`, `tests/unit/test_recipient_list.py` | OK (2026-09-07) | Stable |
@@ -2012,6 +2012,29 @@ hold a request open for.
   before it's deleted, moved, or otherwise changed, rather than searching for a fresh one.
   `get_email`'s `error_code`/`hint` degradation (above) remains the right mitigation until
   then. Still open: *which* property in the `AllProperties` set OWA can't render.
+  **Re-attempted exhaustively, still no reproduction (2026-09-21, issue #12).** The
+  2026-09-17/18 pass above sampled 332 items; this pass scanned every meeting-class item
+  currently sitting in three folders, to end-of-folder rather than a fixed offset window:
+  638 candidates across the full Inbox (20746 items), 4723 across the full top-level Deleted
+  Items (9109 items — its ~68 subfolders were not descended into; `sync_folder_items` takes
+  one folder id at a time and each subfolder holds far fewer items than the parent, so this
+  is a real scope boundary, not an oversight), and 5789 across the full Sent Items (9509
+  items) — 11150 `AllProperties` probes with zero non-timeout failures. Getting a clean
+  answer needed fixing a real gap in the *method*, not just widening the sample: a `GetItem`
+  batch near ~250 items reliably exceeds this codebase's default 30s request timeout and
+  raises a plain `TimeoutError`, which naive bisection (binary halving + leave-one-out)
+  cannot tell apart from a genuine `SerializationException` — every subset of a too-slow
+  batch is *also* too slow, so both "halves passed" and "every leave-one-out failed" are
+  simultaneously true and mean nothing. Reproduced live against Deleted Items' second page
+  (a 256-item batch) before the fix landed. The fix was mechanical: chunk probes to 15 items,
+  raise the per-probe budget to 60-90s, and never treat `exception_type == "TimeoutError"` as
+  fault evidence. Calendar was checked too and correctly found nothing — it holds
+  `CalendarItem`, not `MeetingRequestMessageType`, so an empty result there is the expected
+  class mismatch, not a third clean folder. **Do not repeat a blind folder scan a third
+  time** — three folders and over eleven thousand items is not a sampling problem anymore,
+  it is evidence the fault needs specific item content this mailbox doesn't currently hold.
+  If `item_not_serializable` fires again in the wild, bisect that exact item on the spot,
+  before it is moved, deleted, or otherwise changed.
 - **`get_emails` deep pagination silently truncated (#101). Fixed and verified live
   2026-09-11.** Reported by a client skill doing backlog processing: past
   a certain `offset`, `get_emails` returned `{"emails": [], "count": 0}` — a normal
