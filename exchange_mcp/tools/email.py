@@ -818,25 +818,44 @@ def _local_search_fallback(
     query: str,
     limit: int,
     max_scan: int = 1000,
-) -> tuple[list[dict], list[str]]:
+) -> tuple[list[dict], list[str], bool]:
     """Page through items structurally (no QueryString) and filter client-side.
 
     Used when the server accepts QueryString but silently returns zero
     results for it - observed on at least one tenant's OWA backend, where
     FindItem's content-index search never actually runs.
 
-    Returns (matches, dropped_keywords) - the second element lists any AQS
-    keywords in `query` that this fallback recognizes but cannot check
-    locally (see _AQS_KNOWN_UNSUPPORTED_KEYWORDS), so the caller can tell a
-    caller-visible "matched everything, that filter wasn't applied" apart
-    from a genuine zero-match search.
+    Returns (matches, dropped_keywords, scan_limit_reached). `dropped_keywords`
+    lists any AQS keywords in `query` that this fallback recognizes but cannot
+    check locally (see _AQS_KNOWN_UNSUPPORTED_KEYWORDS), so the caller can tell
+    a caller-visible "matched everything, that filter wasn't applied" apart
+    from a genuine zero-match search. `scan_limit_reached` is True when
+    `max_scan` was hit before either `limit` matches were found or the folder
+    genuinely ran out of items - i.e. there may be matches beyond what was
+    scanned, which a caller-visible filter (received:/sent: in particular)
+    otherwise looks identical to "genuinely nothing matched".
+
+    Only a genuinely *empty* page ends the scan - this backend's own
+    IncludesLastItemInRange is documented elsewhere in this codebase as
+    unreliable (see sync_folder_items), and trusting it here used to stop a
+    date-filtered scan after one 200-item page whenever that page happened to
+    claim it was the last one, silently hiding every match past it with no
+    signal anywhere in the response (issue brief item 10, 2026-09-18). The
+    offset advances by however many items the page actually returned, not by
+    the requested page size, so a short-but-nonempty page doesn't skip
+    anything between it and the next request.
     """
     terms, filters, dropped = _parse_aqs_lite(query)
     matches: list[dict] = []
     offset = 0
     page_size = 200
+    scan_limit_reached = False
 
-    while offset < max_scan and len(matches) < limit:
+    while len(matches) < limit:
+        if offset >= max_scan:
+            scan_limit_reached = True
+            break
+
         payload = {
             "__type": "FindItemJsonRequest:#Exchange",
             "Header": {
@@ -858,7 +877,7 @@ def _local_search_fallback(
                     "__type": "IndexedPageView:#Exchange",
                     "BasePoint": "Beginning",
                     "Offset": offset,
-                    "MaxEntriesReturned": page_size,
+                    "MaxEntriesReturned": min(page_size, max_scan - offset),
                 },
             },
         }
@@ -866,16 +885,16 @@ def _local_search_fallback(
         data = client.request("FindItem", payload)
 
         page_items: list[dict] = []
-        includes_last = True
         for msg in client.extract_items(data):
             if msg.get("ResponseClass") == "Error":
                 raise RuntimeError(msg.get("MessageText", "Search failed."))
             if "RootFolder" in msg:
-                root = msg["RootFolder"]
-                page_items = root.get("Items", [])
-                includes_last = root.get("IncludesLastItemInRange", True)
+                page_items = msg["RootFolder"].get("Items", [])
                 break
 
+        # Only an empty page means the folder is genuinely exhausted - see the
+        # docstring above for why IncludesLastItemInRange can't be trusted for
+        # that instead.
         if not page_items:
             break
 
@@ -885,11 +904,9 @@ def _local_search_fallback(
                 if len(matches) >= limit:
                     break
 
-        if includes_last:
-            break
-        offset += page_size
+        offset += len(page_items)
 
-    return matches, dropped
+    return matches, dropped, scan_limit_reached
 
 
 # ------------------------------------------------------------------
@@ -1435,7 +1452,22 @@ def search_emails(
     importance:) are dropped rather than matched literally, and named in the
     response's fallback_unsupported_filters - so e.g. a size:-only query on a
     tenant whose content index is broken returns an unfiltered scan of the
-    folder (with a warning), not a guaranteed, silent zero.
+    folder (with a warning), not a guaranteed, silent zero. The fallback scan
+    only ever stops on a genuinely empty page or its own scan budget
+    (fallback_max_scan) - never on a short page - because this backend does
+    not reliably send IncludesLastItemInRange; if the budget is what stopped
+    it, the response sets fallback_scan_limit_reached and adds a warning, so
+    a low or zero count from the fallback is never silently indistinguishable
+    from "scanned the whole folder and nothing matched" (fixed 2026-09-18).
+
+    Substrate Search itself (the search_all_folders=True path above) has
+    also been observed answering an identical query with a confident, empty
+    result on one call and the correct non-empty result on an immediate
+    retry - this tool now retries a bare empty Substrate Search result once
+    before trusting it (fixed 2026-09-18), so a used_substrate_search result
+    is more reliable than before, but a genuine zero-match search still
+    returns count: 0 with no warning - that case is indistinguishable from
+    the transient one by design (see OWAClient.search_conversations_substrate).
 
     Args:
         query: AQS query string, e.g. "budget report", 'from:alice subject:"Q3 plan"'.
@@ -1478,6 +1510,7 @@ def search_emails(
         found_items: list[dict] = []
         used_fallback = False
         dropped_filters: list[str] = []
+        fallback_scan_limit_reached = False
 
         for fid in folder_ids:
             remaining = limit - len(found_items)
@@ -1494,13 +1527,14 @@ def search_emails(
                 # would report used_local_fallback: false for a result that
                 # in fact came from an unfiltered scan.
                 used_fallback = True
-                items, dropped = _local_search_fallback(
+                items, dropped, scan_limit_reached = _local_search_fallback(
                     client, [parent_folder_id], "Shallow", query, remaining,
                     max_scan=fallback_max_scan,
                 )
                 for kw in dropped:
                     if kw not in dropped_filters:
                         dropped_filters.append(kw)
+                fallback_scan_limit_reached = fallback_scan_limit_reached or scan_limit_reached
             found_items.extend(items)
 
         results = []
@@ -1533,6 +1567,7 @@ def search_emails(
             "count": len(results),
             "used_local_fallback": used_fallback,
         }
+        warnings = []
         if dropped_filters:
             # These are not "wrong" in the sense of a caller error - they are
             # exactly what the docstring documents as valid AQS - but the
@@ -1544,13 +1579,30 @@ def search_emails(
             # scan, not a true match, and count can be non-zero even though
             # the requested filter was never actually applied.
             response["fallback_unsupported_filters"] = dropped_filters
-            response["warning"] = (
+            warnings.append(
                 f"The local fallback search does not support the "
                 f"{', '.join(sorted(dropped_filters))}: filter(s) in this "
                 f"query, so they were ignored rather than applied - results "
                 f"reflect the rest of the query only (or, if there was no "
                 f"other filter/term, an unfiltered scan of the folder(s))."
             )
+        if fallback_scan_limit_reached:
+            # The fallback stopped because it ran out of scan budget, not
+            # because the folder ran out of items - a filter it *does* check
+            # locally (received:/sent: in particular) can still be silently
+            # under-matched if the qualifying items sit past this scan window,
+            # so this must never look identical to "genuinely nothing
+            # matched" (issue brief item 10, 2026-09-18).
+            response["fallback_scan_limit_reached"] = True
+            warnings.append(
+                "The local fallback search stopped after its scan budget "
+                "without reaching the end of the folder(s), so a low or zero "
+                "count here does not mean nothing matches - only that nothing "
+                "matched within the items scanned. Narrow the query or use "
+                "get_emails with an offset past what search_emails could scan."
+            )
+        if warnings:
+            response["warning"] = " ".join(warnings)
         return json.dumps(response)
 
     except SessionExpiredError as e:
@@ -1663,6 +1715,244 @@ def get_email_status(item_ids: list[str], ctx: Context = None) -> str:
         return json.dumps({"error": str(e)})
     except Exception as e:
         return json.dumps({"error": f"Failed to get email status: {e}"})
+
+
+@mcp.tool()
+def triage_emails(
+    item_ids: list[str],
+    mark_read: bool | None = None,
+    add_categories: list[str] | None = None,
+    remove_categories: list[str] | None = None,
+    flag_status: str | None = None,
+    move_to_folder: str | None = None,
+    ctx: Context = None,
+) -> str:
+    """Apply one or more triage actions to a batch of emails in a single call.
+
+    A common triage pass - list a folder, check each item's status via
+    get_email_status, then act on some of them - otherwise needs one
+    separate tool call per action per batch: mark_email_read, set_email_flag,
+    assign_email_categories/remove_email_categories, move_email. This tool
+    takes any combination of those actions and applies all of them requested
+    for a given item_id together, so a caller doing "mark read, tag Prj-Foo,
+    move to Processed" on 20 items makes one call instead of three.
+
+    Args:
+        item_ids: List of Exchange ItemIds to triage.
+        mark_read: If set, mark each item read (True) or unread (False).
+            Omit to leave read state untouched.
+        add_categories: Category names to add, keeping any already present -
+            same semantics as assign_email_categories. Combines with
+            remove_categories in one write (e.g. move an item from one
+            project category to another in one round trip).
+        remove_categories: Category names to remove, keeping any others
+            present - same semantics as remove_email_categories.
+        flag_status: One of "NotFlagged", "Flagged", "Complete", or omit to
+            leave the follow-up flag untouched.
+        move_to_folder: Destination folder (id, "/"-delimited path, or
+            display name - same resolution as move_email's target_folder).
+            Applied last, after every other requested action, since a move
+            does not itself invalidate the ids the other actions already
+            used. Omit to leave the item in place.
+
+    At least one action must be given. mark_read/flag_status write in the
+    same UpdateItem request as any category change (one write per item
+    instead of up to three), so this is not just fewer tool calls but fewer
+    round trips too; move_to_folder is necessarily a separate MoveItem
+    request, since EWS has no combined write+move action.
+
+    Per-item failures never abort the batch: each is reported in `failed`
+    with a stable `error_code` (see assign_email_categories) rather than
+    aborting the remaining items. An item that fails its field update is
+    not also attempted for the move - it is reported once, not twice.
+    On success, `resolved_folder_id`/`matched_by` report which folder a
+    move actually landed in, same as move_email.
+    """
+    if flag_status is not None and flag_status not in _VALID_FLAG_STATUSES:
+        return json.dumps(
+            {
+                "error": f"Invalid flag_status: {flag_status}. Must be one of "
+                f"{sorted(_VALID_FLAG_STATUSES)}."
+            }
+        )
+
+    wants_field_update = (
+        mark_read is not None
+        or add_categories
+        or remove_categories
+        or flag_status is not None
+    )
+    if not wants_field_update and not move_to_folder:
+        return json.dumps(
+            {
+                "error": "No action requested: pass at least one of mark_read, "
+                "add_categories, remove_categories, flag_status, move_to_folder."
+            }
+        )
+
+    try:
+        client = _get_client(ctx)
+
+        resolved_folder_id = None
+        matched_by = None
+        if move_to_folder:
+            resolved_folder_id, error_json, matched_by = _resolve_folder_or_error(
+                client, move_to_folder, "move_to_folder"
+            )
+            if error_json:
+                return error_json
+
+        succeeded, failed = _triage_emails_apply(
+            client,
+            item_ids,
+            mark_read=mark_read,
+            add_categories=add_categories,
+            remove_categories=remove_categories,
+            flag_status=flag_status,
+            resolved_folder_id=resolved_folder_id,
+        )
+
+        result = _bulk_result("Triaged", succeeded, failed, len(item_ids))
+        if move_to_folder:
+            result["resolved_folder_id"] = resolved_folder_id
+            result["matched_by"] = matched_by
+        return json.dumps(result)
+
+    except SessionExpiredError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        return json.dumps({"error": f"Failed to triage emails: {e}"})
+
+
+def _triage_emails_apply(
+    client: OWAClient,
+    item_ids: list[str],
+    *,
+    mark_read: bool | None,
+    add_categories: list[str] | None,
+    remove_categories: list[str] | None,
+    flag_status: str | None,
+    resolved_folder_id: str | None,
+) -> tuple[list[str], list[dict]]:
+    """Per-item core of triage_emails: apply the requested field update (if
+    any) then the move (if any), isolating one item's failure from the rest.
+
+    Split out from the @mcp.tool() wrapper so the write logic is unit-testable
+    against a fake client, the same way _local_search_fallback and
+    _set_email_categories are - the wrapper itself only handles validation,
+    folder resolution and JSON shaping, none of which needs a live transport.
+    """
+    wants_field_update = (
+        mark_read is not None
+        or add_categories
+        or remove_categories
+        or flag_status is not None
+    )
+
+    succeeded: list[str] = []
+    failed: list[dict] = []
+
+    for iid in item_ids:
+        try:
+            if wants_field_update:
+                updates = []
+                if mark_read is not None:
+                    updates.append(
+                        {
+                            "__type": "SetItemField:#Exchange",
+                            "Path": {
+                                "__type": "PropertyUri:#Exchange",
+                                "FieldURI": "IsRead",
+                            },
+                            "Item": {
+                                "__type": "Message:#Exchange",
+                                "IsRead": mark_read,
+                            },
+                        }
+                    )
+                if flag_status is not None:
+                    updates.append(_build_flag_update(flag_status))
+                if add_categories or remove_categories:
+                    merged = list(
+                        dict.fromkeys(
+                            _get_item_categories(client, iid) + list(add_categories or [])
+                        )
+                    )
+                    if remove_categories:
+                        drop = set(remove_categories)
+                        merged = [c for c in merged if c not in drop]
+                    updates.append(
+                        {
+                            "__type": "SetItemField:#Exchange",
+                            "Path": {
+                                "__type": "PropertyUri:#Exchange",
+                                "FieldURI": "Categories",
+                            },
+                            "Item": {
+                                "__type": "Message:#Exchange",
+                                "Categories": merged,
+                            },
+                        }
+                    )
+
+                change_key = _get_change_key(client, iid)
+                item_id_dict = {"__type": "ItemId:#Exchange", "Id": iid}
+                if change_key:
+                    item_id_dict["ChangeKey"] = change_key
+
+                payload = {
+                    "__type": "UpdateItemJsonRequest:#Exchange",
+                    "Header": {
+                        "__type": "JsonRequestHeaders:#Exchange",
+                        "RequestServerVersion": "V2017_08_18",
+                    },
+                    "Body": {
+                        "__type": "UpdateItemRequest:#Exchange",
+                        "ItemChanges": [
+                            {
+                                "__type": "ItemChange:#Exchange",
+                                "ItemId": item_id_dict,
+                                "Updates": updates,
+                            }
+                        ],
+                        "ConflictResolution": "AutoResolve",
+                        "MessageDisposition": "SaveOnly",
+                    },
+                }
+                data = client.request("UpdateItem", payload)
+                for msg in client.extract_items(data):
+                    if msg.get("ResponseClass") == "Error":
+                        raise RuntimeError(msg.get("MessageText", "UpdateItem failed."))
+
+            if resolved_folder_id:
+                move_payload = {
+                    "__type": "MoveItemJsonRequest:#Exchange",
+                    "Header": {
+                        "__type": "JsonRequestHeaders:#Exchange",
+                        "RequestServerVersion": "V2017_08_18",
+                    },
+                    "Body": {
+                        "__type": "MoveItemRequest:#Exchange",
+                        "ItemIds": [{"__type": "ItemId:#Exchange", "Id": iid}],
+                        "ToFolderId": {
+                            "__type": "TargetFolderId:#Exchange",
+                            "BaseFolderId": OWAClient.folder_id_dict(resolved_folder_id),
+                        },
+                    },
+                }
+                move_data = client.request("MoveItem", move_payload)
+                for msg in client.extract_items(move_data):
+                    if msg.get("ResponseClass") == "Error":
+                        raise RuntimeError(msg.get("MessageText", "MoveItem failed."))
+
+        except SessionExpiredError:
+            raise
+        except Exception as e:
+            failed.append(item_error(iid, str(e)))
+            continue
+        succeeded.append(iid)
+
+    return succeeded, failed
 
 
 @mcp.tool()
